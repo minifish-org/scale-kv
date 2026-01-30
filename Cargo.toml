@@ -1,0 +1,22 @@
+[package]
+name = "scale_kv"
+version = "0.1.0"
+edition = "2024"
+authors = ["scale-kv developers"]
+
+[dependencies]
+bincode = { version = "2", features = ["serde"] }
+dashmap = "6"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
+sled = "0.34"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+
+[[bench]]
+name = "ycsb"
+harness = false
