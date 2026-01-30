@@ -14,4 +14,5 @@ interface Storage {
   put @1 (key :Text, value :Data) -> ();
   delete @2 (key :Text) -> (found :Bool);
   stream @3 () -> (stream :Stream);
+  batchPut @4 (items :List(KeyValue)) -> ();
 }

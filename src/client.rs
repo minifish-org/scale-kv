@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpStream;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+
 pub struct StorageClientPool {
     clients: Vec<StorageClient>,
     next: AtomicUsize,
@@ -46,6 +47,10 @@ impl StorageClientPool {
 
     pub async fn open_stream(&self) -> Result<StreamClient> {
         self.pick().open_stream().await
+    }
+
+    pub async fn batch_put(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
+        self.pick().batch_put(items).await
     }
 
 }
@@ -97,9 +102,9 @@ impl ComputeNode {
 
     pub async fn get(&self, key: impl AsRef<str>) -> Result<Option<Value>> {
         self.operations.fetch_add(1, Ordering::Relaxed);
-        let key_str = key.as_ref().to_string();
+        let key_ref = key.as_ref();
 
-        if let Some(value) = self.cache.get(key_str.as_str()) {
+        if let Some(value) = self.cache.get(key_ref) {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(value.clone()));
         }
@@ -111,22 +116,25 @@ impl ComputeNode {
             None => return Ok(None),
         };
 
-        let value = storage.get(&key_str).await?;
-        if let Some(value) = value.clone() {
-            self.cache.insert(key_str, value.clone());
+        let value = storage.get(key_ref).await?;
+        if let Some(value) = value {
+            let key_string = key_ref.to_string();
+            self.cache.insert(key_string, value.clone());
+            return Ok(Some(value));
         }
-        Ok(value)
+        Ok(None)
     }
 
     pub async fn put(&self, key: impl AsRef<str>, value: &[u8]) -> Result<()> {
         self.operations.fetch_add(1, Ordering::Relaxed);
-        let key_str = key.as_ref().to_string();
+        let key_ref = key.as_ref();
+        let key_string = key_ref.to_string();
         let value_vec = value.to_vec();
 
-        self.cache.insert(key_str.clone(), value_vec);
+        self.cache.insert(key_string, value_vec);
 
         if let Some(storage) = &self.storage {
-            storage.put(&key_str, value).await?;
+            storage.put(key_ref, value).await?;
         }
 
         Ok(())
@@ -134,12 +142,27 @@ impl ComputeNode {
 
     pub async fn delete(&self, key: impl AsRef<str>) -> Result<()> {
         self.operations.fetch_add(1, Ordering::Relaxed);
-        let key_str = key.as_ref().to_string();
+        let key_ref = key.as_ref();
 
-        self.cache.remove(&key_str);
+        self.cache.remove(key_ref);
 
         if let Some(storage) = &self.storage {
-            storage.delete(&key_str).await?;
+            storage.delete(key_ref).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn batch_put(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
+        let storage = match &self.storage {
+            Some(storage) => storage,
+            None => return Err(crate::Error::Capnp("no storage configured".to_string())),
+        };
+
+        storage.batch_put(items).await?;
+
+        for (key, value) in items {
+            self.cache.insert(key.clone(), value.clone());
         }
 
         Ok(())
@@ -212,7 +235,10 @@ impl StorageClient {
         let client: storage::Client = rpc_system.bootstrap(Side::Server);
         let task = tokio::task::spawn_local(rpc_system.map(|_| ()));
 
-        Ok(Self { client, _task: task })
+        Ok(Self {
+            client,
+            _task: task,
+        })
     }
 
     pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -249,7 +275,21 @@ impl StorageClient {
         let stream = response.get()?.get_stream()?;
         Ok(StreamClient { stream })
     }
+
+    pub async fn batch_put(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
+        let mut request = self.client.batch_put_request();
+        let params = request.get();
+        let mut list = params.init_items(items.len() as u32);
+        for (index, (key, value)) in items.iter().enumerate() {
+            let mut slot = list.reborrow().get(index as u32);
+            slot.set_key(key.as_str().into());
+            slot.set_value(value);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
 }
+
 
 pub struct StreamClient {
     stream: storage_stream::Client,

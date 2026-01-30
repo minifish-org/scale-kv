@@ -90,3 +90,26 @@ async fn test_streaming() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_batch_put() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start(addr).await.unwrap();
+            let compute = ComputeNode::with_storage(&server.addr().to_string())
+                .await
+                .unwrap();
+
+            let items = vec![
+                ("b1".to_string(), b"v1".to_vec()),
+                ("b2".to_string(), b"v2".to_vec()),
+            ];
+            compute.batch_put(&items).await.unwrap();
+
+            assert_eq!(compute.get("b1").await.unwrap(), Some(b"v1".to_vec()));
+            assert_eq!(compute.get("b2").await.unwrap(), Some(b"v2".to_vec()));
+        })
+        .await;
+}

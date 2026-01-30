@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+
 pub struct StorageServer {
     data: Arc<StorageNode>,
     addr: SocketAddr,
@@ -106,6 +107,39 @@ impl storage::Server for StorageService {
         results.get().set_stream(client);
         Promise::ok(())
     }
+
+    fn batch_put(
+        &mut self,
+        params: storage::BatchPutParams,
+        _results: storage::BatchPutResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(err) => return Promise::err(err),
+        };
+        let items = match params.get_items() {
+            Ok(items) => items,
+            Err(err) => return Promise::err(err),
+        };
+
+        for item in items.iter() {
+            let key = match item.get_key() {
+                Ok(key) => match key.to_str() {
+                    Ok(key) => key.to_string(),
+                    Err(err) => return Promise::err(capnp::Error::failed(err.to_string())),
+                },
+                Err(err) => return Promise::err(err),
+            };
+            let value = match item.get_value() {
+                Ok(value) => value.to_vec(),
+                Err(err) => return Promise::err(err),
+            };
+            self.data.put(&key, &value);
+        }
+
+        Promise::ok(())
+    }
+
 }
 
 impl stream::Server for StreamService {
