@@ -3,20 +3,24 @@ name = "scale_kv"
 version = "0.1.0"
 edition = "2024"
 authors = ["scale-kv developers"]
+build = "build.rs"
 
 [dependencies]
-bincode = { version = "2", features = ["serde"] }
+capnp = "0.18"
+capnp-rpc = "0.18"
 dashmap = "6"
-serde = { version = "1", features = ["derive"] }
+futures = "0.3"
 thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 
 [dev-dependencies]
 criterion = "0.5"
 rand = "0.8"
-sled = "0.34"
-tempfile = "3"
-tokio = { version = "1", features = ["full"] }
 
 [[bench]]
 name = "ycsb"
 harness = false
+
+[build-dependencies]
+capnpc = "0.18"

@@ -14,3 +14,5 @@ pub use client::{ComputeNode, StorageClient};
 
 pub mod server;
 pub use server::StorageServer;
+
+pub mod storage_capnp;
