@@ -1,4 +1,4 @@
-use crate::storage_capnp::storage;
+use crate::storage_capnp::{storage, stream};
 use crate::{Result, StorageNode};
 use capnp::capability::Promise;
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -16,6 +16,12 @@ pub struct StorageServer {
 
 struct StorageService {
     data: Arc<StorageNode>,
+}
+
+struct StreamService {
+    data: Arc<StorageNode>,
+    keys: Vec<String>,
+    position: usize,
 }
 
 impl storage::Server for StorageService {
@@ -83,6 +89,51 @@ impl storage::Server for StorageService {
         let existed = self.data.get(&key).is_some();
         self.data.delete(&key);
         results.get().set_found(existed);
+        Promise::ok(())
+    }
+
+    fn stream(
+        &mut self,
+        _params: storage::StreamParams,
+        mut results: storage::StreamResults,
+    ) -> Promise<(), capnp::Error> {
+        let keys = self.data.keys();
+        let client: stream::Client = capnp_rpc::new_client(StreamService {
+            data: self.data.clone(),
+            keys,
+            position: 0,
+        });
+        results.get().set_stream(client);
+        Promise::ok(())
+    }
+}
+
+impl stream::Server for StreamService {
+    fn next(
+        &mut self,
+        params: stream::NextParams,
+        mut results: stream::NextResults,
+    ) -> Promise<(), capnp::Error> {
+        let max = match params.get() {
+            Ok(params) => params.get_max() as usize,
+            Err(err) => return Promise::err(err),
+        };
+        let remaining = self.keys.len().saturating_sub(self.position);
+        let count = remaining.min(max);
+        let mut batch = Vec::with_capacity(count);
+        for key in self.keys[self.position..self.position + count].iter() {
+            if let Some(value) = self.data.get(key) {
+                batch.push((key.clone(), value));
+            }
+        }
+        self.position += count;
+        let mut list = results.get().init_items(batch.len() as u32);
+        for (i, (key, value)) in batch.into_iter().enumerate() {
+            let mut item = list.reborrow().get(i as u32);
+            item.set_key(key.as_str().into());
+            item.set_value(&value);
+        }
+        results.get().set_done(self.position >= self.keys.len());
         Promise::ok(())
     }
 }

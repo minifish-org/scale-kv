@@ -43,6 +43,10 @@ impl StorageNode {
     pub fn contains(&self, key: impl AsRef<str>) -> bool {
         self.data.contains_key(key.as_ref())
     }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.data.iter().map(|entry| entry.key().clone()).collect()
+    }
 }
 
 impl Default for StorageNode {

@@ -1,4 +1,4 @@
-use crate::storage_capnp::storage;
+use crate::storage_capnp::{storage, stream as storage_stream};
 use crate::{Result, Value};
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
@@ -9,12 +9,53 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpStream;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
+pub struct StorageClientPool {
+    clients: Vec<StorageClient>,
+    next: AtomicUsize,
+}
+
+impl StorageClientPool {
+    pub async fn connect(addr: &str, size: usize) -> Result<Self> {
+        let size = size.max(1);
+        let mut clients = Vec::with_capacity(size);
+        for _ in 0..size {
+            clients.push(StorageClient::connect(addr).await?);
+        }
+        Ok(Self {
+            clients,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    fn pick(&self) -> &StorageClient {
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        &self.clients[index % self.clients.len()]
+    }
+
+    pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.pick().get(key).await
+    }
+
+    pub async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.pick().put(key, value).await
+    }
+
+    pub async fn delete(&self, key: &str) -> Result<bool> {
+        self.pick().delete(key).await
+    }
+
+    pub async fn open_stream(&self) -> Result<StreamClient> {
+        self.pick().open_stream().await
+    }
+
+}
+
 pub struct ComputeNode {
     cache: DashMap<String, Value>,
     cache_hits: AtomicUsize,
     cache_misses: AtomicUsize,
     operations: AtomicUsize,
-    storage: Option<StorageClient>,
+    storage: Option<StorageClientPool>,
 }
 
 impl ComputeNode {
@@ -29,7 +70,7 @@ impl ComputeNode {
     }
 
     pub async fn with_storage(addr: &str) -> Result<Self> {
-        let storage = StorageClient::connect(addr).await?;
+        let storage = StorageClientPool::connect(addr, 1).await?;
         Ok(Self {
             cache: DashMap::new(),
             cache_hits: AtomicUsize::new(0),
@@ -37,6 +78,21 @@ impl ComputeNode {
             operations: AtomicUsize::new(0),
             storage: Some(storage),
         })
+    }
+
+    pub async fn with_storage_workers(addr: &str, workers: usize) -> Result<Self> {
+        let storage = StorageClientPool::connect(addr, workers).await?;
+        Ok(Self {
+            cache: DashMap::new(),
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            storage: Some(storage),
+        })
+    }
+
+    pub async fn with_storage_pool(addr: &str, size: usize) -> Result<Self> {
+        Self::with_storage_workers(addr, size).await
     }
 
     pub async fn get(&self, key: impl AsRef<str>) -> Result<Option<Value>> {
@@ -121,6 +177,16 @@ impl ComputeNode {
         self.cache_misses.store(0, Ordering::Relaxed);
         self.operations.store(0, Ordering::Relaxed);
     }
+
+
+    pub async fn open_stream(&self) -> Result<StreamClient> {
+        let storage = match &self.storage {
+            Some(storage) => storage,
+            None => return Err(crate::Error::Capnp("no storage configured".to_string())),
+        };
+        storage.open_stream().await
+    }
+
 }
 
 impl Default for ComputeNode {
@@ -175,5 +241,35 @@ impl StorageClient {
         request.get().set_key(key.into());
         let response = request.send().promise.await?;
         Ok(response.get()?.get_found())
+    }
+
+    pub async fn open_stream(&self) -> Result<StreamClient> {
+        let request = self.client.stream_request();
+        let response = request.send().promise.await?;
+        let stream = response.get()?.get_stream()?;
+        Ok(StreamClient { stream })
+    }
+}
+
+pub struct StreamClient {
+    stream: storage_stream::Client,
+}
+
+impl StreamClient {
+    pub async fn next(&self, max: u32) -> Result<(Vec<(String, Vec<u8>)>, bool)> {
+        let mut request = self.stream.next_request();
+        request.get().set_max(max);
+        let response = request.send().promise.await?;
+        let response = response.get()?;
+        let items = response.get_items()?;
+        let mut out = Vec::with_capacity(items.len() as usize);
+        for item in items.iter() {
+            let key = item.get_key()?.to_str().map_err(|err| {
+                crate::Error::Capnp(err.to_string())
+            })?;
+            let value = item.get_value()?.to_vec();
+            out.push((key.to_string(), value));
+        }
+        Ok((out, response.get_done()))
     }
 }
