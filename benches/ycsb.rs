@@ -1,8 +1,10 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rand::RngCore;
 use scale_kv::{ComputeNode, StorageServer};
+use sled::Config;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::env;
 use tokio::runtime::Builder;
 use tokio::task::LocalSet;
 
@@ -29,11 +31,11 @@ impl ZipfianGenerator {
     }
 }
 
-fn setup(rt: &tokio::runtime::Runtime, local: &LocalSet) -> Arc<ComputeNode> {
+fn setup(rt: &tokio::runtime::Runtime, local: &LocalSet, workers: usize) -> Arc<ComputeNode> {
     local.block_on(rt, async {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let server = StorageServer::start(addr).await.unwrap();
-        let compute = ComputeNode::with_storage(&server.addr().to_string())
+        let compute = ComputeNode::with_storage_workers(&server.addr().to_string(), workers)
             .await
             .unwrap();
         let value = vec![0u8; VALUE_SIZE];
@@ -45,11 +47,59 @@ fn setup(rt: &tokio::runtime::Runtime, local: &LocalSet) -> Arc<ComputeNode> {
     })
 }
 
+fn setup_sled() -> sled::Db {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Config::new().path(dir.path()).open().unwrap();
+    let value = vec![0u8; VALUE_SIZE];
+    for i in 0..NUM_RECORDS {
+        let key = format!("user{:06}", i);
+        let _ = db.insert(key.as_bytes(), value.as_slice());
+    }
+    db
+}
+
+fn concurrency_levels() -> Vec<usize> {
+    let raw = env::var("SCALE_KV_CONCURRENCY").unwrap_or_default();
+    if raw.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut levels = Vec::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(value) = trimmed.parse::<usize>() {
+            if value > 0 {
+                levels.push(value);
+            }
+        }
+    }
+    levels
+}
+
+fn rpc_workers() -> usize {
+    env::var("SCALE_KV_RPC_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
+
+fn sled_enabled() -> bool {
+    matches!(
+        env::var("SCALE_KV_RUN_SLED").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
 fn bench_ycsb_a(c: &mut Criterion) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
-    let compute = setup(&rt, &local);
-    let mut group = c.benchmark_group("ycsb_network");
+    let workers = rpc_workers();
+    let compute = setup(&rt, &local, workers);
+    let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
     group.bench_function("workload_a", |b| {
         let compute = compute.clone();
         b.iter(|| {
@@ -79,8 +129,9 @@ fn bench_ycsb_a(c: &mut Criterion) {
 fn bench_ycsb_b(c: &mut Criterion) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
-    let compute = setup(&rt, &local);
-    let mut group = c.benchmark_group("ycsb_network");
+    let workers = rpc_workers();
+    let compute = setup(&rt, &local, workers);
+    let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
     group.bench_function("workload_b", |b| {
         let compute = compute.clone();
         b.iter(|| {
@@ -111,8 +162,9 @@ fn bench_ycsb_b(c: &mut Criterion) {
 fn bench_ycsb_c(c: &mut Criterion) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
-    let compute = setup(&rt, &local);
-    let mut group = c.benchmark_group("ycsb_network");
+    let workers = rpc_workers();
+    let compute = setup(&rt, &local, workers);
+    let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
     group.bench_function("workload_c", |b| {
         let compute = compute.clone();
         b.iter(|| {
@@ -134,8 +186,9 @@ fn bench_ycsb_c(c: &mut Criterion) {
 fn bench_throughput_put(c: &mut Criterion) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
-    let compute = setup(&rt, &local);
-    let mut group = c.benchmark_group("ycsb_network");
+    let workers = rpc_workers();
+    let compute = setup(&rt, &local, workers);
+    let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
     group.bench_function("throughput_put", |b| {
         let compute = compute.clone();
         b.iter(|| {
@@ -155,8 +208,9 @@ fn bench_throughput_put(c: &mut Criterion) {
 fn bench_throughput_get(c: &mut Criterion) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
-    let compute = setup(&rt, &local);
-    let mut group = c.benchmark_group("ycsb_network");
+    let workers = rpc_workers();
+    let compute = setup(&rt, &local, workers);
+    let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
     group.bench_function("throughput_get", |b| {
         let compute = compute.clone();
         b.iter(|| {
@@ -172,12 +226,205 @@ fn bench_throughput_get(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_streaming_full(c: &mut Criterion) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    let local = LocalSet::new();
+    let workers = rpc_workers();
+    let compute = setup(&rt, &local, workers);
+    let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
+    group.bench_function("streaming_full", |b| {
+        let compute = compute.clone();
+        b.iter(|| {
+            let compute = compute.clone();
+            local.block_on(&rt, async move {
+                let stream = compute.open_stream().await.unwrap();
+                let mut total = 0usize;
+                loop {
+                    let (items, done) = stream.next(256).await.unwrap();
+                    total += items.len();
+                    if done {
+                        break;
+                    }
+                }
+                black_box(total);
+            })
+        })
+    });
+    group.finish();
+}
+
+fn bench_concurrency_workload_a(c: &mut Criterion) {
+    let levels = concurrency_levels();
+    if levels.is_empty() {
+        return;
+    }
+    let workers = rpc_workers();
+    for level in levels {
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let local = LocalSet::new();
+        let compute = setup(&rt, &local, workers);
+        let mut group = c.benchmark_group("ycsb_network_concurrency");
+        group.bench_function(format!("workload_a_conc{}", level), |b| {
+            let compute = compute.clone();
+            b.iter(|| {
+                let compute = compute.clone();
+                local.block_on(&rt, async move {
+                    let per_worker = (OPERATIONS + level - 1) / level;
+                    let mut tasks = Vec::with_capacity(level);
+                    for _ in 0..level {
+                        let compute = compute.clone();
+                        tasks.push(tokio::task::spawn_local(async move {
+                            let mut rng = rand::thread_rng();
+                            let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
+                            for _ in 0..per_worker {
+                                let mut bool_buf = [0u8; 1];
+                                rng.fill_bytes(&mut bool_buf);
+                                let key_num = zipf.next(&mut rng);
+                                let key = format!("user{:06}", key_num);
+                                if bool_buf[0] & 1 == 0 {
+                                    let _ = compute.get(&key).await.unwrap();
+                                } else {
+                                    let mut new_value = vec![0u8; VALUE_SIZE];
+                                    rng.fill_bytes(&mut new_value);
+                                    compute.put(&key, &new_value).await.unwrap();
+                                }
+                            }
+                        }));
+                    }
+                    let _ = futures::future::join_all(tasks).await;
+                })
+            })
+        });
+        group.finish();
+    }
+}
+
+fn bench_sled_workload_a(c: &mut Criterion) {
+    if !sled_enabled() {
+        return;
+    }
+    let db = setup_sled();
+    let mut group = c.benchmark_group("sled_local");
+    group.bench_function("workload_a", |b| {
+        b.iter(|| {
+            let mut rng = rand::thread_rng();
+            let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
+            for _ in 0..OPERATIONS {
+                let mut bool_buf = [0u8; 1];
+                rng.fill_bytes(&mut bool_buf);
+                let key_num = zipf.next(&mut rng);
+                let key = format!("user{:06}", key_num);
+                if bool_buf[0] & 1 == 0 {
+                    let _ = black_box(db.get(key.as_bytes()));
+                } else {
+                    let mut new_value = vec![0u8; VALUE_SIZE];
+                    rng.fill_bytes(&mut new_value);
+                    let _ = db.insert(key.as_bytes(), new_value.as_slice());
+                }
+            }
+        })
+    });
+    group.finish();
+}
+
+fn bench_sled_workload_b(c: &mut Criterion) {
+    if !sled_enabled() {
+        return;
+    }
+    let db = setup_sled();
+    let mut group = c.benchmark_group("sled_local");
+    group.bench_function("workload_b", |b| {
+        b.iter(|| {
+            let mut rng = rand::thread_rng();
+            let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
+            for _ in 0..OPERATIONS {
+                let mut float_buf = [0u8; 8];
+                rng.fill_bytes(&mut float_buf);
+                let r: f64 = f64::from_le_bytes(float_buf).abs() % 1.0;
+                let key_num = zipf.next(&mut rng);
+                let key = format!("user{:06}", key_num);
+                if r < 0.95 {
+                    let _ = black_box(db.get(key.as_bytes()));
+                } else {
+                    let mut new_value = vec![0u8; VALUE_SIZE];
+                    rng.fill_bytes(&mut new_value);
+                    let _ = db.insert(key.as_bytes(), new_value.as_slice());
+                }
+            }
+        })
+    });
+    group.finish();
+}
+
+fn bench_sled_workload_c(c: &mut Criterion) {
+    if !sled_enabled() {
+        return;
+    }
+    let db = setup_sled();
+    let mut group = c.benchmark_group("sled_local");
+    group.bench_function("workload_c", |b| {
+        b.iter(|| {
+            let mut rng = rand::thread_rng();
+            let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
+            for _ in 0..OPERATIONS {
+                let key_num = zipf.next(&mut rng);
+                let key = format!("user{:06}", key_num);
+                let _ = black_box(db.get(key.as_bytes()));
+            }
+        })
+    });
+    group.finish();
+}
+
+fn bench_sled_throughput_put(c: &mut Criterion) {
+    if !sled_enabled() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Config::new().path(dir.path()).open().unwrap();
+    let mut group = c.benchmark_group("sled_local");
+    group.bench_function("throughput_put", |b| {
+        b.iter(|| {
+            let value = vec![0u8; VALUE_SIZE];
+            for i in 0..OPERATIONS {
+                let key = format!("key{:08}", i);
+                let _ = db.insert(key.as_bytes(), value.as_slice());
+            }
+        })
+    });
+    group.finish();
+}
+
+fn bench_sled_throughput_get(c: &mut Criterion) {
+    if !sled_enabled() {
+        return;
+    }
+    let db = setup_sled();
+    let mut group = c.benchmark_group("sled_local");
+    group.bench_function("throughput_get", |b| {
+        b.iter(|| {
+            for i in 0..OPERATIONS {
+                let key = format!("user{:06}", i);
+                let _ = black_box(db.get(key.as_bytes()));
+            }
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_ycsb_a,
     bench_ycsb_b,
     bench_ycsb_c,
     bench_throughput_put,
-    bench_throughput_get
+    bench_throughput_get,
+    bench_streaming_full,
+    bench_sled_workload_a,
+    bench_sled_workload_b,
+    bench_sled_workload_c,
+    bench_sled_throughput_put,
+    bench_sled_throughput_get,
+    bench_concurrency_workload_a
 );
 criterion_main!(benches);

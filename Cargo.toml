@@ -17,6 +17,8 @@ tokio-util = { version = "0.7", features = ["compat"] }
 [dev-dependencies]
 criterion = "0.5"
 rand = "0.8"
+sled = "0.34"
+tempfile = "3"
 
 [[bench]]
 name = "ycsb"
