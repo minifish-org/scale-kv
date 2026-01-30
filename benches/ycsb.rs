@@ -11,6 +11,7 @@ use tokio::task::LocalSet;
 const NUM_RECORDS: usize = 10_000;
 const OPERATIONS: usize = 1_000;
 const VALUE_SIZE: usize = 1024;
+const BATCH_SIZE: usize = 16_384;
 
 struct ZipfianGenerator {
     items: u64,
@@ -85,6 +86,7 @@ fn rpc_workers() -> usize {
         .filter(|value| *value > 0)
         .unwrap_or(1)
 }
+
 
 
 fn sled_enabled() -> bool {
@@ -253,6 +255,30 @@ fn bench_streaming_full(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_batch_put(c: &mut Criterion) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    let local = LocalSet::new();
+    let workers = rpc_workers();
+    let compute = setup(&rt, &local, workers);
+    let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
+    group.bench_function("batch_put_16k", |b| {
+        let compute = compute.clone();
+        b.iter(|| {
+            let compute = compute.clone();
+            local.block_on(&rt, async move {
+                let mut items = Vec::with_capacity(BATCH_SIZE);
+                for i in 0..BATCH_SIZE {
+                    let key = format!("batch{:08}", i);
+                    let value = vec![0u8; VALUE_SIZE];
+                    items.push((key, value));
+                }
+                compute.batch_put(&items).await.unwrap();
+            })
+        })
+    });
+    group.finish();
+}
+
 fn bench_concurrency_workload_a(c: &mut Criterion) {
     let levels = concurrency_levels();
     if levels.is_empty() {
@@ -412,6 +438,27 @@ fn bench_sled_throughput_get(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_sled_batch_put(c: &mut Criterion) {
+    if !sled_enabled() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = Config::new().path(dir.path()).open().unwrap();
+    let mut group = c.benchmark_group("sled_local");
+    group.bench_function("batch_put_16k", |b| {
+        b.iter(|| {
+            let mut batch = sled::Batch::default();
+            for i in 0..BATCH_SIZE {
+                let key = format!("batch{:08}", i);
+                let value = vec![0u8; VALUE_SIZE];
+                batch.insert(key.as_bytes(), value);
+            }
+            let _ = db.apply_batch(batch);
+        })
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_ycsb_a,
@@ -420,11 +467,13 @@ criterion_group!(
     bench_throughput_put,
     bench_throughput_get,
     bench_streaming_full,
+    bench_batch_put,
     bench_sled_workload_a,
     bench_sled_workload_b,
     bench_sled_workload_c,
     bench_sled_throughput_put,
     bench_sled_throughput_get,
+    bench_sled_batch_put,
     bench_concurrency_workload_a
 );
 criterion_main!(benches);
