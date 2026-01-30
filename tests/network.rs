@@ -65,3 +65,28 @@ async fn test_multiple_clients() {
         })
         .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_streaming() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start(addr).await.unwrap();
+            let compute = ComputeNode::with_storage(&server.addr().to_string())
+                .await
+                .unwrap();
+
+            compute.put("k1", b"v1").await.unwrap();
+            compute.put("k2", b"v2").await.unwrap();
+
+            let stream = compute.open_stream().await.unwrap();
+            let (items, done) = stream.next(10).await.unwrap();
+            let keys: std::collections::HashSet<_> =
+                items.into_iter().map(|(k, _)| k).collect();
+            assert!(keys.contains("k1"));
+            assert!(keys.contains("k2"));
+            assert!(done);
+        })
+        .await;
+}
