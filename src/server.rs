@@ -1,97 +1,133 @@
-use crate::{Op, Request, Response};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use crate::storage_capnp::storage;
+use crate::{Result, StorageNode};
+use capnp::capability::Promise;
+use capnp_rpc::rpc_twoparty_capnp::Side;
+use capnp_rpc::twoparty::VatNetwork;
+use capnp_rpc::RpcSystem;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use std::thread;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-/// A running storage node server.
 pub struct StorageServer {
-    data: Arc<super::StorageNode>,
+    data: Arc<StorageNode>,
+    addr: SocketAddr,
+}
+
+struct StorageService {
+    data: Arc<StorageNode>,
+}
+
+impl storage::Server for StorageService {
+    fn get(
+        &mut self,
+        params: storage::GetParams,
+        mut results: storage::GetResults,
+    ) -> Promise<(), capnp::Error> {
+        let key = match params.get().and_then(|p| p.get_key()) {
+            Ok(key) => match key.to_str() {
+                Ok(key) => key.to_string(),
+                Err(err) => return Promise::err(capnp::Error::failed(err.to_string())),
+            },
+            Err(err) => return Promise::err(err),
+        };
+
+        if let Some(value) = self.data.get(&key) {
+            let mut res = results.get();
+            res.set_found(true);
+            res.set_value(&value);
+        } else {
+            results.get().set_found(false);
+        }
+
+        Promise::ok(())
+    }
+
+    fn put(
+        &mut self,
+        params: storage::PutParams,
+        _results: storage::PutResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(err) => return Promise::err(err),
+        };
+        let key = match params.get_key() {
+            Ok(key) => match key.to_str() {
+                Ok(key) => key.to_string(),
+                Err(err) => return Promise::err(capnp::Error::failed(err.to_string())),
+            },
+            Err(err) => return Promise::err(err),
+        };
+        let value = match params.get_value() {
+            Ok(value) => value.to_vec(),
+            Err(err) => return Promise::err(err),
+        };
+
+        self.data.put(&key, &value);
+        Promise::ok(())
+    }
+
+    fn delete(
+        &mut self,
+        params: storage::DeleteParams,
+        mut results: storage::DeleteResults,
+    ) -> Promise<(), capnp::Error> {
+        let key = match params.get().and_then(|p| p.get_key()) {
+            Ok(key) => match key.to_str() {
+                Ok(key) => key.to_string(),
+                Err(err) => return Promise::err(capnp::Error::failed(err.to_string())),
+            },
+            Err(err) => return Promise::err(err),
+        };
+        let existed = self.data.get(&key).is_some();
+        self.data.delete(&key);
+        results.get().set_found(existed);
+        Promise::ok(())
+    }
 }
 
 impl StorageServer {
-    /// Start a new storage node server.
-    pub fn start<A: ToSocketAddrs>(addr: A) -> std::io::Result<Self> {
-        let listener = TcpListener::bind(addr)?;
-        let data = Arc::new(super::StorageNode::new());
-        let data_clone = data.clone();
+    pub async fn start(addr: SocketAddr) -> Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
+        let addr = listener.local_addr()?;
+        let data = Arc::new(StorageNode::new());
 
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(stream) = stream {
-                    let _ = handle_connection(stream, data_clone.clone());
-                }
+        let data_clone = data.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                let accept = listener.accept().await;
+                let (stream, _) = match accept {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let data = data_clone.clone();
+                tokio::task::spawn_local(async move {
+                    let _ = handle_connection(stream, data).await;
+                });
             }
         });
 
-        Ok(Self { data })
+        Ok(Self { data, addr })
     }
 
-    /// Get a handle to the underlying storage node.
-    pub fn data(&self) -> &super::StorageNode {
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn data(&self) -> &StorageNode {
         &self.data
     }
 }
 
-/// Handle a single client connection.
-pub fn handle_connection(
-    mut stream: TcpStream,
-    data: Arc<super::StorageNode>,
-) -> std::io::Result<()> {
-    loop {
-        let mut len_buf = [0u8; 4];
-        match stream.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(_) => return Ok(()), // Client disconnected
-        }
+pub async fn handle_connection(stream: TcpStream, data: Arc<StorageNode>) -> Result<()> {
+    let (reader, writer) = stream.into_split();
+    let reader = reader.compat();
+    let writer = writer.compat_write();
 
-        let req_len = u32::from_le_bytes(len_buf) as usize;
-        let mut req_buf = vec![0u8; req_len];
-        stream.read_exact(&mut req_buf)?;
+    let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
+    let client: storage::Client = capnp_rpc::new_client(StorageService { data });
+    let rpc_system = RpcSystem::new(Box::new(network), Some(client.client));
 
-        let request: Request =
-            match bincode::decode_from_slice(&req_buf, bincode::config::standard()) {
-                Ok((req, _)) => req,
-                Err(_) => return Ok(()),
-            };
-
-        let response = match request.op {
-            Op::Get => {
-                if let Some(value) = data.get(&request.key) {
-                    Response {
-                        found: true,
-                        value: Some(value),
-                    }
-                } else {
-                    Response {
-                        found: false,
-                        value: None,
-                    }
-                }
-            }
-            Op::Put => {
-                if let Some(value) = request.value {
-                    data.put(&request.key, &value);
-                }
-                Response {
-                    found: true,
-                    value: None,
-                }
-            }
-            Op::Delete => {
-                data.delete(&request.key);
-                Response {
-                    found: true,
-                    value: None,
-                }
-            }
-        };
-
-        let resp_data = bincode::encode_to_vec(&response, bincode::config::standard())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-        stream.write_all(&(resp_data.len() as u32).to_le_bytes())?;
-        stream.write_all(&resp_data)?;
-        stream.flush()?;
-    }
+    rpc_system.await.map_err(|err| err.into())
 }
