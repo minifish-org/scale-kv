@@ -5,6 +5,7 @@ use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -177,6 +178,29 @@ impl StorageServer {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         let data = Arc::new(StorageNode::new());
+
+        let data_clone = data.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                let accept = listener.accept().await;
+                let (stream, _) = match accept {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let data = data_clone.clone();
+                tokio::task::spawn_local(async move {
+                    let _ = handle_connection(stream, data).await;
+                });
+            }
+        });
+
+        Ok(Self { data, addr })
+    }
+
+    pub async fn start_with_dir(addr: SocketAddr, dir: PathBuf) -> Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
+        let addr = listener.local_addr()?;
+        let data = Arc::new(StorageNode::open(dir)?);
 
         let data_clone = data.clone();
         tokio::task::spawn_local(async move {

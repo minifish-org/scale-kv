@@ -1,13 +1,34 @@
 use scale_kv::{ComputeNode, StorageServer};
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{fs, process};
+
+static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn temp_dir() -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    dir.push(format!("scale-kv-net-test-{}-{}", process::id(), id));
+    fs::create_dir_all(&dir).expect("failed to create temp dir");
+    dir
+}
+
+fn cleanup_dir(dir: &PathBuf) {
+    let _ = fs::remove_dir_all(dir);
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_network_operations() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start(addr).await.unwrap();
+    let dir = temp_dir();
+    {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let server = StorageServer::start_with_dir(addr, dir.clone())
+                    .await
+                    .unwrap();
 
             let compute = ComputeNode::with_storage(&server.addr().to_string())
                 .await
@@ -27,17 +48,23 @@ async fn test_network_operations() {
 
             compute.delete("network_key").await.unwrap();
             assert_eq!(compute.get("network_key").await.unwrap(), None);
-        })
-        .await;
+            })
+            .await;
+    }
+    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_multiple_clients() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start(addr).await.unwrap();
+    let dir = temp_dir();
+    {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let server = StorageServer::start_with_dir(addr, dir.clone())
+                    .await
+                    .unwrap();
 
             let compute1 = ComputeNode::with_storage(&server.addr().to_string())
                 .await
@@ -62,20 +89,26 @@ async fn test_multiple_clients() {
                 compute2.get("shared_key").await.unwrap(),
                 Some(b"from_client2".to_vec())
             );
-        })
-        .await;
+            })
+            .await;
+    }
+    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_streaming() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start(addr).await.unwrap();
-            let compute = ComputeNode::with_storage(&server.addr().to_string())
-                .await
-                .unwrap();
+    let dir = temp_dir();
+    {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let server = StorageServer::start_with_dir(addr, dir.clone())
+                    .await
+                    .unwrap();
+                let compute = ComputeNode::with_storage(&server.addr().to_string())
+                    .await
+                    .unwrap();
 
             compute.put("k1", b"v1").await.unwrap();
             compute.put("k2", b"v2").await.unwrap();
@@ -87,20 +120,26 @@ async fn test_streaming() {
             assert!(keys.contains("k1"));
             assert!(keys.contains("k2"));
             assert!(done);
-        })
-        .await;
+            })
+            .await;
+    }
+    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_batch_put() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start(addr).await.unwrap();
-            let compute = ComputeNode::with_storage(&server.addr().to_string())
-                .await
-                .unwrap();
+    let dir = temp_dir();
+    {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let server = StorageServer::start_with_dir(addr, dir.clone())
+                    .await
+                    .unwrap();
+                let compute = ComputeNode::with_storage(&server.addr().to_string())
+                    .await
+                    .unwrap();
 
             let items = vec![
                 ("b1".to_string(), b"v1".to_vec()),
@@ -110,6 +149,8 @@ async fn test_batch_put() {
 
             assert_eq!(compute.get("b1").await.unwrap(), Some(b"v1".to_vec()));
             assert_eq!(compute.get("b2").await.unwrap(), Some(b"v2".to_vec()));
-        })
-        .await;
+            })
+            .await;
+    }
+    cleanup_dir(&dir);
 }
