@@ -570,6 +570,19 @@ fn insert_record(page: &mut [u8], key: &[u8], value: &[u8]) -> Result<Option<u16
     }
     let free_bytes = free_end.saturating_sub(free_start) as usize;
     if free_bytes < needed {
+        if slots > 0 {
+            defragment_page(page);
+            let (s, fs, fe) = read_header(page);
+            slots = s;
+            free_start = fs;
+            free_end = fe;
+        } else {
+            return Ok(None);
+        }
+    }
+
+    let free_bytes = free_end.saturating_sub(free_start) as usize;
+    if free_bytes < needed {
         return Ok(None);
     }
 
@@ -598,6 +611,35 @@ fn clear_slot(page: &mut [u8], slot_id: u16) {
         return;
     }
     write_slot(page, slot_id, 0, 0);
+}
+
+fn defragment_page(page: &mut [u8]) {
+    let (slots, _, _) = read_header(page);
+    let mut entries: Vec<(u16, u16, u16)> = Vec::new();
+    for slot_id in 0..slots {
+        let (offset, len) = read_slot(page, slot_id);
+        if len != 0 {
+            entries.push((slot_id, offset, len));
+        }
+    }
+    entries.sort_by_key(|(_, offset, _)| *offset);
+
+    let mut new_free_end = PAGE_SIZE as u16;
+    for (slot_id, offset, len) in entries.into_iter().rev() {
+        let new_offset = new_free_end.saturating_sub(len);
+        if offset != new_offset {
+            let src_start = offset as usize;
+            let src_end = src_start + len as usize;
+            let dst_start = new_offset as usize;
+            let _dst_end = dst_start + len as usize;
+            page.copy_within(src_start..src_end, dst_start);
+        }
+        write_slot(page, slot_id, new_offset, len);
+        new_free_end = new_offset;
+    }
+
+    let new_free_start = PAGE_HEADER_SIZE as u16 + slots * SLOT_ENTRY_SIZE as u16;
+    write_header(page, slots, new_free_start, new_free_end);
 }
 
 fn read_value(page: &[u8], slot_id: u16, key: &[u8]) -> Option<Value> {
@@ -635,4 +677,33 @@ fn read_u16(page: &[u8], offset: usize) -> u16 {
 fn write_u16(page: &mut [u8], offset: usize, value: u16) {
     let bytes = value.to_le_bytes();
     page[offset..offset + 2].copy_from_slice(&bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_defragment_page_reclaims_space() {
+        let mut page = new_page();
+        let key1 = b"k1";
+        let key2 = b"k2";
+        let value = vec![b'x'; 4000];
+
+        let slot1 = insert_record(&mut page, key1, &value).unwrap().unwrap();
+        let _slot2 = insert_record(&mut page, key2, &value).unwrap().unwrap();
+        clear_slot(&mut page, slot1);
+
+        let (_slots_before, free_start_before, free_end_before) = read_header(&page);
+        let free_bytes_before = free_end_before.saturating_sub(free_start_before) as usize;
+
+        let large_value = vec![b'y'; 9000];
+        let needed = payload_len(b"k3", &large_value).unwrap();
+        assert!(free_bytes_before < needed);
+
+        let slot3 = insert_record(&mut page, b"k3", &large_value)
+            .unwrap()
+            .unwrap();
+        assert!(read_value(&page, slot3, b"k3").is_some());
+    }
 }

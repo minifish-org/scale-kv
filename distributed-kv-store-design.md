@@ -51,13 +51,13 @@
 - 选择：**自研 B+tree + 全树 RwLock（并发读、写串行）**
 - Page 管理：**HashMap + RwLock**
 - Free Space Map：**Vec<VecDeque<PageId>> 分桶**（单写线程访问）
-- 状态：**已完成**（B+tree 入口、页缓存、FSM、PageId/16KB 页模型）
+- 状态：**已完成**（B+tree 入口、页缓存、FSM、Slotted Page + defrag）
 
 #### 5.1.1 计算层页式模型（决定）
-- KV 对应 Page：**一个 KV = 一个 Page**
-- Key：**page_id**
-- Value：**固定 16KB 页内容**
-- 说明：buffer 与存储对齐，天然按页批量写入
+- KV 对应 Page：**一个 Page 可容纳多个 KV**（slotted page）
+- B+tree：**key -> (page_id, slot_id)**
+- Value：**写入 page payload（key/value 记录）**
+- 说明：页内碎片在写入失败且空间足够时触发 defrag
 
 ### 5.2 Storage 端（批量写为主）
 - 选择：**Bitcask 风格**（多文件 append‑only）
