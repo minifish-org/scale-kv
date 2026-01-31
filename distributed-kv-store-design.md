@@ -118,6 +118,41 @@ record {
 - **page_id/slot_id 由 Compute 单写者生成**（必须全局唯一/有序）
 - Storage 按 **lsn 顺序重放**，需要幂等处理（避免重试重复 apply）
 
+#### 5.4 页式 B+tree（索引即 page）方案
+- 目标：索引节点本身就是固定 16KB page，root page_id 持久化
+- Storage 仅提供 `page_id -> page bytes`（可复用 Bitcask）
+- Compute 维护 buffer pool（页缓存 + dirty flush）
+
+**页头建议：**
+```
+PageHeader {
+  page_id: u64
+  page_type: u8    // INTERNAL=1, LEAF=2
+  level: u8        // 0=leaf
+  key_count: u16
+  free_start: u16
+  free_end: u16
+  lsn: u64         // redo 顺序
+}
+```
+
+**Leaf Page：**
+- 记录 `(key, value)` 或 `(key, slot_ref)`
+
+**Internal Page：**
+- `keys[]` + `child_page_id[]`（数量 = key_count + 1）
+
+**WAL（必须）：**
+- page 修改写 redo
+- commit 时 WAL durable，再刷脏页
+
+**最小实现路径：**
+1) page 格式 + 序列化
+2) leaf‑only B+tree（无 internal）
+3) internal + split
+4) buffer pool + dirty flush
+5) WAL redo + recovery
+
 #### 约束
 - **存储为单写者模型**（append‑only log），写入串行
 - 内存索引为 HashMap（无锁），由单写者线程更新
