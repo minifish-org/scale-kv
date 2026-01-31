@@ -14,6 +14,7 @@ async fn test_smoke() {
                 compute.get("key1").await.unwrap(),
                 Some(value1.clone())
             );
+            assert!(compute.exists("key1"));
 
             compute.put("key1", &value2).await.unwrap();
             assert_eq!(
@@ -21,8 +22,9 @@ async fn test_smoke() {
                 Some(value2.clone())
             );
 
-            compute.delete("key1").await.unwrap();
+            assert!(compute.delete("key1").await.unwrap());
             assert_eq!(compute.get("key1").await.unwrap(), None);
+            assert!(!compute.delete("key1").await.unwrap());
         })
         .await;
 }

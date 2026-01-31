@@ -63,6 +63,18 @@ impl<K: Ord + Clone> BPlusTree<K> {
             }
         }
     }
+
+    pub fn len(&self) -> usize {
+        let root = self.root.read().unwrap();
+        root.len()
+    }
+
+    pub fn keys_in_range(&self, start: &K, end: &K) -> Vec<K> {
+        let root = self.root.read().unwrap();
+        let mut out = Vec::new();
+        root.collect_range(start, end, &mut out);
+        out
+    }
 }
 
 impl<K: Ord + Clone> Node<K> {
@@ -142,6 +154,41 @@ impl<K: Ord + Clone> Node<K> {
             }
         }
     }
+
+    fn len(&self) -> usize {
+        match self {
+            Node::Leaf { keys } => keys.len(),
+            Node::Internal { children, .. } => children.iter().map(|child| child.len()).sum(),
+        }
+    }
+
+    fn collect_range(&self, start: &K, end: &K, out: &mut Vec<K>) {
+        match self {
+            Node::Leaf { keys } => {
+                for key in keys {
+                    if key < start {
+                        continue;
+                    }
+                    if key > end {
+                        break;
+                    }
+                    out.push(key.clone());
+                }
+            }
+            Node::Internal { keys, children } => {
+                let mut idx = child_index(keys, start);
+                while idx < children.len() {
+                    children[idx].collect_range(start, end, out);
+                    if let Some(boundary) = keys.get(idx) {
+                        if boundary > end {
+                            break;
+                        }
+                    }
+                    idx += 1;
+                }
+            }
+        }
+    }
 }
 
 fn child_index<K: Ord + Clone>(keys: &[K], key: &K) -> usize {
@@ -183,5 +230,15 @@ mod tests {
             let expected = key % 2 == 0;
             assert_eq!(tree.contains(&key), expected);
         }
+    }
+
+    #[test]
+    fn test_keys_in_range() {
+        let tree = BPlusTree::new();
+        for key in 1..=20u64 {
+            tree.insert(key);
+        }
+        let keys = tree.keys_in_range(&5, &10);
+        assert_eq!(keys, vec![5, 6, 7, 8, 9, 10]);
     }
 }

@@ -72,6 +72,15 @@ pub struct ComputeNode {
     storage: Option<StorageClientPool>,
 }
 
+pub struct ComputeStats {
+    pub keys: usize,
+    pub pages: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub operations: usize,
+    pub cache_hit_rate: f64,
+}
+
 #[derive(Clone, Copy)]
 struct SlotRef {
     page_id: PageId,
@@ -282,7 +291,7 @@ impl ComputeNode {
         Ok(())
     }
 
-    pub async fn delete(&self, key: impl AsRef<str>) -> Result<()> {
+    pub async fn delete(&self, key: impl AsRef<str>) -> Result<bool> {
         self.operations.fetch_add(1, Ordering::Relaxed);
         let key = key.as_ref().to_string();
         let slot_ref = {
@@ -310,16 +319,14 @@ impl ComputeNode {
                 storage.put(slot_ref.page_id, &page).await?;
             }
             self.tree.remove(&key);
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     pub async fn batch_put(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
-        for (key, value) in items {
-            self.put(key, value).await?;
-        }
-        Ok(())
+        self.put_multi(items).await
     }
 
     pub fn cache_hits(&self) -> usize {
@@ -362,6 +369,52 @@ impl ComputeNode {
             None => return Err(crate::Error::Capnp("no storage configured".to_string())),
         };
         storage.open_stream().await
+    }
+
+    pub fn exists(&self, key: impl AsRef<str>) -> bool {
+        let key = key.as_ref().to_string();
+        self.tree.contains(&key)
+    }
+
+    pub async fn get_multi(&self, keys: &[String]) -> Result<Vec<Option<Value>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(self.get(key).await?);
+        }
+        Ok(out)
+    }
+
+    pub async fn put_multi(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
+        for (key, value) in items {
+            self.put(key, value).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn range(&self, start: &str, end: &str) -> Result<Vec<(String, Value)>> {
+        let keys = self.tree.keys_in_range(&start.to_string(), &end.to_string());
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = self.get(&key).await? {
+                out.push((key, value));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn stats(&self) -> ComputeStats {
+        let cache_hits = self.cache_hits();
+        let cache_misses = self.cache_misses();
+        let operations = self.operations();
+        let cache_hit_rate = self.cache_hit_rate();
+        ComputeStats {
+            keys: self.tree.len(),
+            pages: self.page_cache.read().unwrap().len(),
+            cache_hits,
+            cache_misses,
+            operations,
+            cache_hit_rate,
+        }
     }
 
     async fn fetch_page(&self, page_id: PageId) -> Result<Option<Page>> {

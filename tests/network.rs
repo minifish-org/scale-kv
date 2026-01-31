@@ -41,6 +41,7 @@ async fn test_network_operations() {
                 compute.get("network_key").await.unwrap(),
                 Some(value1.clone())
             );
+            assert!(compute.exists("network_key"));
 
             compute.put("network_key", &value2).await.unwrap();
             assert_eq!(
@@ -48,7 +49,7 @@ async fn test_network_operations() {
                 Some(value2.clone())
             );
 
-            compute.delete("network_key").await.unwrap();
+            assert!(compute.delete("network_key").await.unwrap());
             assert_eq!(compute.get("network_key").await.unwrap(), None);
             })
             .await;
