@@ -118,6 +118,85 @@ record {
 - **page_id/slot_id 由 Compute 单写者生成**（必须全局唯一/有序）
 - Storage 按 **lsn 顺序重放**，需要幂等处理（避免重试重复 apply）
 
+#### 5.3.5 滑动窗口攒批方案（2026-02-01）
+- **目标**：降低平均延迟，避免 Group Commit 的"等待攒批"问题
+- **核心洞察**：不是"等攒够再发"，而是"流水线化"
+
+**原理对比**：
+
+| 方案 | 发送时机 | 平均延迟 |
+|------|---------|---------|
+| 传统 Group Commit | 攒满 256KB 才发 | 可能等几十 ms |
+| 滑动窗口 | 窗口有空就发 | ≈ 1 个 RTT |
+
+**滑动窗口工作方式**：
+```
+控制参数：窗口大小 N（例如 16 或 32）
+
+时间线示例（窗口=4）：
+T1: 发送 Req1 Req2 Req3 Req4 （窗口满）
+T2: Req1 完成 → 发送 Req5
+T3: Req2 完成 → 发送 Req6
+T4: Req3 完成 → 发送 Req7
+...
+```
+
+**伪代码**：
+```rust
+struct BatchSender {
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: usize,
+    pending: Mutex<Vec<Request>>,
+    sender: Sender<Request>,
+}
+
+impl BatchSender {
+    async fn send(&self, req: Request) {
+        let current = self.in_flight.fetch_add(1, Ordering::AcqRel);
+
+        if current < self.max_in_flight {
+            // 窗口有空，直接发送
+            self.send_direct(req).await;
+        } else {
+            // 窗口满，攒到队列
+            let mut pending = self.pending.lock().unwrap();
+            pending.push(req);
+        }
+    }
+
+    async fn on_complete(&self) {
+        self.in_flight.fetch_sub(1, Ordering::Release);
+
+        // 检查是否有等待的请求
+        let req = {
+            let mut pending = self.pending.lock().unwrap();
+            pending.pop()
+        };
+        if let Some(req) = req {
+            self.send_direct(req).await;
+        }
+    }
+}
+```
+
+**Cap'n RPC 配合**：
+- Cap'n RPC 支持 Promise/流水线
+- 需要应用层实现窗口控制
+- 攒批大小可动态调整
+
+**调优参数**：
+- 窗口大小：16-64 之间，根据 RTT 调整
+- 最佳实践：窗口 × 单请求大小 ≈ 1-2 个 RTT 能发送的数据量
+
+**预期效果**：
+```
+假设：RTT = 0.5ms，单请求 RPC 开销 = 0.1ms
+
+滑动窗口（窗口=16）：
+  - 平均延迟 ≈ 1 个 RTT = 0.5ms
+  - 吞吐量 = 窗口 / RTT = 16 / 0.5ms = 32K QPS
+```
+
 #### 5.4 页式 B+tree（索引即 page）方案
 - 目标：索引节点本身就是固定 16KB page，root page_id 持久化
 - Storage 仅提供 `page_id -> page bytes`（可复用 Bitcask）
