@@ -65,6 +65,36 @@
 - 备注：后台 compaction 分段执行，避免阻塞前台写入
 - 状态：**已完成**（append‑only 段文件、内存索引、段滚动、compaction、manifest + fsync、自动触发策略）
 
+### 5.3 远端 WAL 批量写（设计草案）
+- 目标：**用 WAL 批量代替整页写入**，减少 RPC 开销
+- 批量大小：**256KB 固定**（不做超时 flush）
+- 发送策略：**batch 未满时不阻塞写；满 256KB 时触发一次 RPC 并阻塞等待 ack**
+- RPC：**复用 batchPut**（语义变为“追加 WAL 记录”）
+- 存储：**仅追加日志 + compaction**（Bitcask），暂不要求回放到 page
+- 读取：**只从 Compute 读**（Storage 仅用于持久化与压缩）
+- 崩溃恢复：**后续从 Storage 全量扫描重建**（暂不实现）
+
+#### 5.3.1 WAL 记录最小格式
+- 记录粒度：KV 级别
+- 字段：`key_len | val_len | key | value`
+- 备注：可预留 `txn_id/lsn/checksum` 便于未来扩展
+
+#### 5.3.2 写入流程（阻塞仅在 batch 满时）
+```mermaid
+flowchart TD
+    A[Compute put/delete] --> B[append to in-memory WAL buffer]
+    B --> C{buffer size < 256KB?}
+    C -->|yes| D[return immediately]
+    C -->|no| E[batchPut RPC (256KB)]
+    E --> F[Storage append log]
+    F --> G[ack]
+    G --> H[unblock writers]
+```
+
+#### 5.3.3 Storage 语义（最小要求）
+- `batchPut` 成功 = **日志已追加**（不要求 fsync）
+- compaction 保留最新值，旧版本清理
+
 #### 约束
 - **存储为单写者模型**（append‑only log），写入串行
 - 内存索引为 HashMap（无锁），由单写者线程更新
