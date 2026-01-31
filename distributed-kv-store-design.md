@@ -62,6 +62,7 @@
 - 选择：**Bitcask 风格**（多文件 append‑only）
 - 内存索引：**HashMap**，存储 `key -> (file_id, offset, len, checksum)`
 - 备注：后台 compaction 分段执行，避免阻塞前台写入
+- 状态：**已完成**（append‑only 段文件、内存索引、段滚动、compaction、manifest + fsync、自动触发策略）
 
 #### 约束
 - **存储为单写者模型**（append‑only log），写入串行
