@@ -12,6 +12,7 @@ const NUM_RECORDS: usize = 10_000;
 const OPERATIONS: usize = 1_000;
 const VALUE_SIZE: usize = 1024;
 const BATCH_SIZE: usize = 16_384;
+const SCAN_LENGTH: usize = 10;
 
 struct ZipfianGenerator {
     items: u64,
@@ -32,6 +33,17 @@ impl ZipfianGenerator {
     }
 }
 
+fn key_for(id: u64) -> String {
+    format!("user{:06}", id)
+}
+
+fn latest_key(zipf: &mut ZipfianGenerator, rng: &mut impl RngCore) -> String {
+    let rank = zipf.next(rng) as usize;
+    let max = NUM_RECORDS.saturating_sub(1);
+    let key_num = max.saturating_sub(rank.min(max));
+    key_for(key_num as u64)
+}
+
 fn setup(rt: &tokio::runtime::Runtime, local: &LocalSet, workers: usize) -> Arc<ComputeNode> {
     local.block_on(rt, async {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -41,7 +53,7 @@ fn setup(rt: &tokio::runtime::Runtime, local: &LocalSet, workers: usize) -> Arc<
             .unwrap();
         let value = vec![0u8; VALUE_SIZE];
         for i in 0..NUM_RECORDS {
-            let key = format!("user{:06}", i);
+            let key = key_for(i as u64);
             compute.put(&key, &value).await.unwrap();
         }
         Arc::new(compute)
@@ -53,7 +65,7 @@ fn setup_sled() -> sled::Db {
     let db = Config::new().path(dir.path()).open().unwrap();
     let value = vec![0u8; VALUE_SIZE];
     for i in 0..NUM_RECORDS {
-        let key = format!("user{:06}", i);
+        let key = key_for(i as u64);
         let _ = db.insert(key.as_bytes(), value.as_slice());
     }
     db
@@ -113,7 +125,7 @@ fn bench_ycsb_a(c: &mut Criterion) {
                     let mut bool_buf = [0u8; 1];
                     rng.fill_bytes(&mut bool_buf);
                     let key_num = zipf.next(&mut rng);
-                    let key = format!("user{:06}", key_num);
+                    let key = key_for(key_num);
                     if bool_buf[0] & 1 == 0 {
                         black_box(compute.get(&key).await.unwrap());
                     } else {
@@ -146,7 +158,7 @@ fn bench_ycsb_b(c: &mut Criterion) {
                     rng.fill_bytes(&mut float_buf);
                     let r: f64 = f64::from_le_bytes(float_buf).abs() % 1.0;
                     let key_num = zipf.next(&mut rng);
-                    let key = format!("user{:06}", key_num);
+                    let key = key_for(key_num);
                     if r < 0.95 {
                         black_box(compute.get(&key).await.unwrap());
                     } else {
@@ -176,8 +188,82 @@ fn bench_ycsb_c(c: &mut Criterion) {
                 let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
                 for _ in 0..OPERATIONS {
                     let key_num = zipf.next(&mut rng);
-                    let key = format!("user{:06}", key_num);
+                    let key = key_for(key_num);
                     black_box(compute.get(&key).await.unwrap());
+                }
+            })
+        })
+    });
+    group.finish();
+}
+
+fn bench_ycsb_d(c: &mut Criterion) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    let local = LocalSet::new();
+    let workers = rpc_workers();
+    let compute = setup(&rt, &local, workers);
+    let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
+    group.bench_function("workload_d", |b| {
+        let compute = compute.clone();
+        b.iter(|| {
+            let compute = compute.clone();
+            local.block_on(&rt, async move {
+                let mut rng = rand::thread_rng();
+                let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
+                for _ in 0..OPERATIONS {
+                    let key = latest_key(&mut zipf, &mut rng);
+                    black_box(compute.get(&key).await.unwrap());
+                }
+            })
+        })
+    });
+    group.finish();
+}
+
+fn bench_ycsb_e(c: &mut Criterion) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    let local = LocalSet::new();
+    let workers = rpc_workers();
+    let compute = setup(&rt, &local, workers);
+    let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
+    group.bench_function("workload_e", |b| {
+        let compute = compute.clone();
+        b.iter(|| {
+            let compute = compute.clone();
+            local.block_on(&rt, async move {
+                let mut rng = rand::thread_rng();
+                let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
+                for _ in 0..OPERATIONS {
+                    let key_num = zipf.next(&mut rng);
+                    let start = key_for(key_num);
+                    let end = key_for(key_num.saturating_add(SCAN_LENGTH as u64));
+                    let _ = compute.range(&start, &end).await.unwrap();
+                }
+            })
+        })
+    });
+    group.finish();
+}
+
+fn bench_ycsb_f(c: &mut Criterion) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    let local = LocalSet::new();
+    let workers = rpc_workers();
+    let compute = setup(&rt, &local, workers);
+    let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
+    group.bench_function("workload_f", |b| {
+        let compute = compute.clone();
+        b.iter(|| {
+            let compute = compute.clone();
+            local.block_on(&rt, async move {
+                let mut rng = rand::thread_rng();
+                let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
+                for _ in 0..OPERATIONS {
+                    let key_num = zipf.next(&mut rng);
+                    let key = key_for(key_num);
+                    if let Some(value) = compute.get(&key).await.unwrap() {
+                        compute.put(&key, &value).await.unwrap();
+                    }
                 }
             })
         })
@@ -219,7 +305,7 @@ fn bench_throughput_get(c: &mut Criterion) {
             let compute = compute.clone();
             local.block_on(&rt, async move {
                 for i in 0..OPERATIONS {
-                    let key = format!("user{:06}", i);
+                    let key = key_for(i as u64);
                     black_box(compute.get(&key).await.unwrap());
                 }
             })
@@ -306,7 +392,7 @@ fn bench_concurrency_workload_a(c: &mut Criterion) {
                                 let mut bool_buf = [0u8; 1];
                                 rng.fill_bytes(&mut bool_buf);
                                 let key_num = zipf.next(&mut rng);
-                                let key = format!("user{:06}", key_num);
+                                let key = key_for(key_num);
                                 if bool_buf[0] & 1 == 0 {
                                     let _ = compute.get(&key).await.unwrap();
                                 } else {
@@ -402,6 +488,68 @@ fn bench_sled_workload_c(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_sled_workload_d(c: &mut Criterion) {
+    if !sled_enabled() {
+        return;
+    }
+    let db = setup_sled();
+    let mut group = c.benchmark_group("sled_local");
+    group.bench_function("workload_d", |b| {
+        b.iter(|| {
+            let mut rng = rand::thread_rng();
+            let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
+            for _ in 0..OPERATIONS {
+                let key = latest_key(&mut zipf, &mut rng);
+                let _ = black_box(db.get(key.as_bytes()));
+            }
+        })
+    });
+    group.finish();
+}
+
+fn bench_sled_workload_e(c: &mut Criterion) {
+    if !sled_enabled() {
+        return;
+    }
+    let db = setup_sled();
+    let mut group = c.benchmark_group("sled_local");
+    group.bench_function("workload_e", |b| {
+        b.iter(|| {
+            let mut rng = rand::thread_rng();
+            let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
+            for _ in 0..OPERATIONS {
+                let key_num = zipf.next(&mut rng);
+                let start = key_for(key_num);
+                let end = key_for(key_num.saturating_add(SCAN_LENGTH as u64));
+                let _ = black_box(db.range(start.as_bytes()..=end.as_bytes()).take(SCAN_LENGTH));
+            }
+        })
+    });
+    group.finish();
+}
+
+fn bench_sled_workload_f(c: &mut Criterion) {
+    if !sled_enabled() {
+        return;
+    }
+    let db = setup_sled();
+    let mut group = c.benchmark_group("sled_local");
+    group.bench_function("workload_f", |b| {
+        b.iter(|| {
+            let mut rng = rand::thread_rng();
+            let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
+            for _ in 0..OPERATIONS {
+                let key_num = zipf.next(&mut rng);
+                let key = key_for(key_num);
+                if let Ok(Some(value)) = db.get(key.as_bytes()) {
+                    let _ = db.insert(key.as_bytes(), value.as_ref());
+                }
+            }
+        })
+    });
+    group.finish();
+}
+
 fn bench_sled_throughput_put(c: &mut Criterion) {
     if !sled_enabled() {
         return;
@@ -464,6 +612,9 @@ criterion_group!(
     bench_ycsb_a,
     bench_ycsb_b,
     bench_ycsb_c,
+    bench_ycsb_d,
+    bench_ycsb_e,
+    bench_ycsb_f,
     bench_throughput_put,
     bench_throughput_get,
     bench_streaming_full,
@@ -471,6 +622,9 @@ criterion_group!(
     bench_sled_workload_a,
     bench_sled_workload_b,
     bench_sled_workload_c,
+    bench_sled_workload_d,
+    bench_sled_workload_e,
+    bench_sled_workload_f,
     bench_sled_throughput_put,
     bench_sled_throughput_get,
     bench_sled_batch_put,
