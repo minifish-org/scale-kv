@@ -1,4 +1,4 @@
-use crate::{Result, Value};
+use crate::{PageId, Result, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -25,7 +25,7 @@ const MANIFEST_TMP_FILE: &str = "manifest.tmp";
 /// Storage node - Bitcask style append-only log + in-memory index.
 pub struct StorageNode {
     dir: PathBuf,
-    index: Mutex<HashMap<String, IndexEntry>>,
+    index: Mutex<HashMap<PageId, IndexEntry>>,
     writer: Mutex<LogWriter>,
     readers: Mutex<HashMap<u64, File>>,
     stats: Mutex<Stats>,
@@ -76,7 +76,7 @@ impl StorageNode {
         }
         segments.sort_unstable();
 
-        let mut index = HashMap::new();
+        let mut index: HashMap<PageId, IndexEntry> = HashMap::new();
         let mut entries_total = 0u64;
         let mut last_id = 0u64;
         for file_id in segments.iter().copied() {
@@ -153,9 +153,8 @@ impl StorageNode {
     }
 
     /// Put a key-value pair.
-    pub fn put(&self, key: impl AsRef<str>, value: &[u8]) {
-        let key = key.as_ref().to_string();
-        if let Ok(entry) = self.append_entry(&key, value) {
+    pub fn put(&self, key: PageId, value: &[u8]) {
+        if let Ok(entry) = self.append_entry(key, value) {
             let mut index = self.index.lock().unwrap();
             let existed = index.contains_key(&key);
             index.insert(key, entry);
@@ -168,16 +167,14 @@ impl StorageNode {
     }
 
     /// Get a value by key.
-    pub fn get(&self, key: impl AsRef<str>) -> Option<Value> {
-        let key_ref = key.as_ref();
-        let entry = *self.index.lock().unwrap().get(key_ref)?;
+    pub fn get(&self, key: PageId) -> Option<Value> {
+        let entry = *self.index.lock().unwrap().get(&key)?;
         self.read_value(entry)
     }
 
     /// Delete a key.
-    pub fn delete(&self, key: impl AsRef<str>) {
-        let key = key.as_ref().to_string();
-        if self.append_tombstone(&key).is_ok() {
+    pub fn delete(&self, key: PageId) {
+        if self.append_tombstone(key).is_ok() {
             let mut index = self.index.lock().unwrap();
             let existed = index.remove(&key).is_some();
             drop(index);
@@ -188,11 +185,11 @@ impl StorageNode {
     }
 
     /// Check if key exists.
-    pub fn contains(&self, key: impl AsRef<str>) -> bool {
-        self.index.lock().unwrap().contains_key(key.as_ref())
+    pub fn contains(&self, key: PageId) -> bool {
+        self.index.lock().unwrap().contains_key(&key)
     }
 
-    pub fn keys(&self) -> Vec<String> {
+    pub fn keys(&self) -> Vec<PageId> {
         self.index.lock().unwrap().keys().cloned().collect()
     }
 
@@ -218,7 +215,7 @@ impl StorageNode {
                 Some(value) => value,
                 None => continue,
             };
-            let entry_len = 8 + key.as_bytes().len() as u64 + value.len() as u64;
+            let entry_len = 8 + 8 + value.len() as u64;
             if size > 0 && size + entry_len > MAX_SEGMENT_SIZE {
                 new_file.sync_all()?;
                 new_file_id += 1;
@@ -227,13 +224,13 @@ impl StorageNode {
                 new_segments.push(new_file_id);
             }
             let offset = size;
-            write_u32(&mut new_file, key.as_bytes().len() as u32)?;
+            write_u32(&mut new_file, 8)?;
             write_u32(&mut new_file, value.len() as u32)?;
-            new_file.write_all(key.as_bytes())?;
+            new_file.write_all(&key.to_le_bytes())?;
             new_file.write_all(&value)?;
             size += entry_len;
             new_index.insert(
-                key.clone(),
+                *key,
                 IndexEntry {
                     file_id: new_file_id,
                     offset,
@@ -282,7 +279,7 @@ impl StorageNode {
         }
     }
 
-    fn append_entry(&self, key: &str, value: &[u8]) -> Result<IndexEntry> {
+    fn append_entry(&self, key: PageId, value: &[u8]) -> Result<IndexEntry> {
         let mut writer = self.writer.lock().unwrap();
         if writer.size >= MAX_SEGMENT_SIZE {
             writer.file_id += 1;
@@ -292,11 +289,10 @@ impl StorageNode {
         }
 
         let offset = writer.size;
-        let key_bytes = key.as_bytes();
-        let entry_len = 8 + key_bytes.len() as u64 + value.len() as u64;
-        write_u32(&mut writer.file, key_bytes.len() as u32)?;
+        let entry_len = 8 + 8 + value.len() as u64;
+        write_u32(&mut writer.file, 8)?;
         write_u32(&mut writer.file, value.len() as u32)?;
-        writer.file.write_all(key_bytes)?;
+        writer.file.write_all(&key.to_le_bytes())?;
         writer.file.write_all(value)?;
         writer.size += entry_len;
 
@@ -306,7 +302,7 @@ impl StorageNode {
         })
     }
 
-    fn append_tombstone(&self, key: &str) -> Result<()> {
+    fn append_tombstone(&self, key: PageId) -> Result<()> {
         let mut writer = self.writer.lock().unwrap();
         if writer.size >= MAX_SEGMENT_SIZE {
             writer.file_id += 1;
@@ -315,11 +311,10 @@ impl StorageNode {
             let _ = refresh_manifest(&self.dir, writer.file_id);
         }
 
-        let key_bytes = key.as_bytes();
-        let entry_len = 8 + key_bytes.len() as u64;
-        write_u32(&mut writer.file, key_bytes.len() as u32)?;
+        let entry_len = 8 + 8;
+        write_u32(&mut writer.file, 8)?;
         write_u32(&mut writer.file, TOMBSTONE)?;
-        writer.file.write_all(key_bytes)?;
+        writer.file.write_all(&key.to_le_bytes())?;
         writer.size += entry_len;
         Ok(())
     }
@@ -549,7 +544,7 @@ fn read_value_at(dir: &Path, entry: IndexEntry) -> Result<Option<Value>> {
     Ok(Some(value))
 }
 
-fn read_entry(file: &mut File, offset: u64) -> Result<Option<(String, u32, u32)>> {
+fn read_entry(file: &mut File, offset: u64) -> Result<Option<(PageId, u32, u32)>> {
     if file.seek(SeekFrom::Start(offset)).is_err() {
         return Ok(None);
     }
@@ -567,6 +562,10 @@ fn read_entry(file: &mut File, offset: u64) -> Result<Option<(String, u32, u32)>
         return Ok(None);
     }
 
+    if key_len != 8 {
+        return Err(std::io::Error::new(ErrorKind::InvalidData, "invalid key length").into());
+    }
+
     if val_len != TOMBSTONE {
         let mut skip = vec![0u8; val_len as usize];
         if file.read_exact(&mut skip).is_err() {
@@ -574,7 +573,9 @@ fn read_entry(file: &mut File, offset: u64) -> Result<Option<(String, u32, u32)>
         }
     }
 
-    let key = String::from_utf8_lossy(&key_buf).to_string();
+    let mut key_bytes = [0u8; 8];
+    key_bytes.copy_from_slice(&key_buf);
+    let key = PageId::from_le_bytes(key_bytes);
     let entry_len = 8 + key_len as u32 + if val_len == TOMBSTONE { 0 } else { val_len };
     Ok(Some((key, val_len, entry_len)))
 }
@@ -604,8 +605,8 @@ mod tests {
     fn test_put_and_get() {
         let dir = temp_dir();
         let node = StorageNode::open(&dir).unwrap();
-        node.put("foo", b"bar");
-        assert_eq!(node.get("foo"), Some(b"bar".to_vec()));
+        node.put(1, b"bar");
+        assert_eq!(node.get(1), Some(b"bar".to_vec()));
         drop(node);
         cleanup_dir(&dir);
     }
@@ -614,7 +615,7 @@ mod tests {
     fn test_get_missing() {
         let dir = temp_dir();
         let node = StorageNode::open(&dir).unwrap();
-        assert_eq!(node.get("missing"), None);
+        assert_eq!(node.get(999), None);
         drop(node);
         cleanup_dir(&dir);
     }
@@ -623,9 +624,9 @@ mod tests {
     fn test_overwrite() {
         let dir = temp_dir();
         let node = StorageNode::open(&dir).unwrap();
-        node.put("foo", b"bar");
-        node.put("foo", b"baz");
-        assert_eq!(node.get("foo"), Some(b"baz".to_vec()));
+        node.put(1, b"bar");
+        node.put(1, b"baz");
+        assert_eq!(node.get(1), Some(b"baz".to_vec()));
         drop(node);
         cleanup_dir(&dir);
     }
@@ -634,9 +635,9 @@ mod tests {
     fn test_delete() {
         let dir = temp_dir();
         let node = StorageNode::open(&dir).unwrap();
-        node.put("foo", b"bar");
-        node.delete("foo");
-        assert_eq!(node.get("foo"), None);
+        node.put(1, b"bar");
+        node.delete(1);
+        assert_eq!(node.get(1), None);
         drop(node);
         cleanup_dir(&dir);
     }
@@ -646,8 +647,8 @@ mod tests {
         let dir = temp_dir();
         let node = StorageNode::open(&dir).unwrap();
         assert_eq!(node.len(), 0);
-        node.put("a", b"1");
-        node.put("b", b"2");
+        node.put(1, b"1");
+        node.put(2, b"2");
         assert_eq!(node.len(), 2);
         drop(node);
         cleanup_dir(&dir);
@@ -657,9 +658,9 @@ mod tests {
     fn test_contains() {
         let dir = temp_dir();
         let node = StorageNode::open(&dir).unwrap();
-        node.put("foo", b"bar");
-        assert!(node.contains("foo"));
-        assert!(!node.contains("missing"));
+        node.put(1, b"bar");
+        assert!(node.contains(1));
+        assert!(!node.contains(999));
         drop(node);
         cleanup_dir(&dir);
     }
@@ -669,12 +670,12 @@ mod tests {
         let dir = temp_dir();
         {
             let node = StorageNode::open(&dir).unwrap();
-            node.put("foo", b"bar");
-            node.put("baz", b"qux");
+            node.put(1, b"bar");
+            node.put(2, b"qux");
         }
         let node = StorageNode::open(&dir).unwrap();
-        assert_eq!(node.get("foo"), Some(b"bar".to_vec()));
-        assert_eq!(node.get("baz"), Some(b"qux".to_vec()));
+        assert_eq!(node.get(1), Some(b"bar".to_vec()));
+        assert_eq!(node.get(2), Some(b"qux".to_vec()));
         drop(node);
         cleanup_dir(&dir);
     }
@@ -684,20 +685,20 @@ mod tests {
         let dir = temp_dir();
         let value = vec![b'x'; MAX_SEGMENT_SIZE as usize];
         let node = StorageNode::open(&dir).unwrap();
-        node.put("k1", &value);
-        node.put("k2", &value);
+        node.put(1, &value);
+        node.put(2, &value);
 
         let segments_before = list_segments(&dir).unwrap();
         assert!(segments_before.len() >= 2);
         let max_before = segments_before.iter().copied().max().unwrap_or(0);
 
-        node.delete("k1");
+        node.delete(1);
         node.compact().unwrap();
 
         let segments_after = list_segments(&dir).unwrap();
         assert!(segments_after.iter().all(|id| *id > max_before));
-        assert_eq!(node.get("k1"), None);
-        assert_eq!(node.get("k2"), Some(value));
+        assert_eq!(node.get(1), None);
+        assert_eq!(node.get(2), Some(value));
         drop(node);
         cleanup_dir(&dir);
     }
@@ -708,20 +709,20 @@ mod tests {
         let value = vec![b'x'; (MAX_SEGMENT_SIZE / 2) as usize];
         let node = StorageNode::open(&dir).unwrap();
 
-        node.put("k1", &value);
-        node.put("k2", &value);
-        node.put("k3", &value);
-        node.put("k4", &value);
+        node.put(1, &value);
+        node.put(2, &value);
+        node.put(3, &value);
+        node.put(4, &value);
 
-        node.delete("k1");
-        node.delete("k2");
-        node.delete("k3");
-        node.put("k5", &value);
+        node.delete(1);
+        node.delete(2);
+        node.delete(3);
+        node.put(5, &value);
 
         let segments = list_segments(&dir).unwrap();
         assert!(segments.len() <= COMPACTION_SEGMENT_LIMIT);
-        assert_eq!(node.get("k4"), Some(value.clone()));
-        assert_eq!(node.get("k5"), Some(value));
+        assert_eq!(node.get(4), Some(value.clone()));
+        assert_eq!(node.get(5), Some(value));
 
         drop(node);
         cleanup_dir(&dir);
@@ -731,7 +732,7 @@ mod tests {
     fn test_manifest_written() {
         let dir = temp_dir();
         let node = StorageNode::open(&dir).unwrap();
-        node.put("k1", b"v1");
+        node.put(1, b"v1");
 
         let manifest_contents = fs::read_to_string(manifest_path(&dir)).unwrap();
         assert!(manifest_contents.lines().any(|line| line == "version=1"));
@@ -747,7 +748,7 @@ mod tests {
     fn test_manifest_checksum_mismatch_fallback() {
         let dir = temp_dir();
         let node = StorageNode::open(&dir).unwrap();
-        node.put("k1", b"v1");
+        node.put(1, b"v1");
         drop(node);
 
         let manifest_path = manifest_path(&dir);
@@ -758,7 +759,7 @@ mod tests {
         .unwrap();
 
         let node = StorageNode::open(&dir).unwrap();
-        assert_eq!(node.get("k1"), Some(b"v1".to_vec()));
+        assert_eq!(node.get(1), Some(b"v1".to_vec()));
 
         drop(node);
         cleanup_dir(&dir);
@@ -769,9 +770,9 @@ mod tests {
         let dir = temp_dir();
         let value = vec![b'x'; MAX_SEGMENT_SIZE as usize];
         let node = StorageNode::open(&dir).unwrap();
-        node.put("k1", &value);
-        node.put("k2", &value);
-        node.put("k3", &value);
+        node.put(1, &value);
+        node.put(2, &value);
+        node.put(3, &value);
 
         let mut segments_before = list_segments(&dir).unwrap();
         segments_before.sort_unstable();
@@ -785,9 +786,9 @@ mod tests {
         for id in &segments_before {
             assert!(segments_after.contains(id));
         }
-        assert_eq!(node.get("k1"), Some(value.clone()));
-        assert_eq!(node.get("k2"), Some(value.clone()));
-        assert_eq!(node.get("k3"), Some(value));
+        assert_eq!(node.get(1), Some(value.clone()));
+        assert_eq!(node.get(2), Some(value.clone()));
+        assert_eq!(node.get(3), Some(value));
 
         drop(node);
         cleanup_dir(&dir);

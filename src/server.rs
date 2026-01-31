@@ -1,5 +1,5 @@
 use crate::storage_capnp::{storage, stream};
-use crate::{Result, StorageNode};
+use crate::{PageId, Result, StorageNode};
 use capnp::capability::Promise;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
@@ -22,7 +22,7 @@ struct StorageService {
 
 struct StreamService {
     data: Arc<StorageNode>,
-    keys: Vec<String>,
+    keys: Vec<PageId>,
     position: usize,
 }
 
@@ -32,15 +32,12 @@ impl storage::Server for StorageService {
         params: storage::GetParams,
         mut results: storage::GetResults,
     ) -> Promise<(), capnp::Error> {
-        let key = match params.get().and_then(|p| p.get_key()) {
-            Ok(key) => match key.to_str() {
-                Ok(key) => key.to_string(),
-                Err(err) => return Promise::err(capnp::Error::failed(err.to_string())),
-            },
+        let key = match params.get() {
+            Ok(params) => params.get_key(),
             Err(err) => return Promise::err(err),
         };
 
-        if let Some(value) = self.data.get(&key) {
+        if let Some(value) = self.data.get(key) {
             let mut res = results.get();
             res.set_found(true);
             res.set_value(&value);
@@ -60,19 +57,13 @@ impl storage::Server for StorageService {
             Ok(params) => params,
             Err(err) => return Promise::err(err),
         };
-        let key = match params.get_key() {
-            Ok(key) => match key.to_str() {
-                Ok(key) => key.to_string(),
-                Err(err) => return Promise::err(capnp::Error::failed(err.to_string())),
-            },
-            Err(err) => return Promise::err(err),
-        };
+        let key = params.get_key();
         let value = match params.get_value() {
             Ok(value) => value.to_vec(),
             Err(err) => return Promise::err(err),
         };
 
-        self.data.put(&key, &value);
+        self.data.put(key, &value);
         Promise::ok(())
     }
 
@@ -81,15 +72,12 @@ impl storage::Server for StorageService {
         params: storage::DeleteParams,
         mut results: storage::DeleteResults,
     ) -> Promise<(), capnp::Error> {
-        let key = match params.get().and_then(|p| p.get_key()) {
-            Ok(key) => match key.to_str() {
-                Ok(key) => key.to_string(),
-                Err(err) => return Promise::err(capnp::Error::failed(err.to_string())),
-            },
+        let key = match params.get() {
+            Ok(params) => params.get_key(),
             Err(err) => return Promise::err(err),
         };
-        let existed = self.data.get(&key).is_some();
-        self.data.delete(&key);
+        let existed = self.data.get(key).is_some();
+        self.data.delete(key);
         results.get().set_found(existed);
         Promise::ok(())
     }
@@ -124,18 +112,12 @@ impl storage::Server for StorageService {
         };
 
         for item in items.iter() {
-            let key = match item.get_key() {
-                Ok(key) => match key.to_str() {
-                    Ok(key) => key.to_string(),
-                    Err(err) => return Promise::err(capnp::Error::failed(err.to_string())),
-                },
-                Err(err) => return Promise::err(err),
-            };
+            let key = item.get_key();
             let value = match item.get_value() {
                 Ok(value) => value.to_vec(),
                 Err(err) => return Promise::err(err),
             };
-            self.data.put(&key, &value);
+            self.data.put(key, &value);
         }
 
         Promise::ok(())
@@ -157,15 +139,15 @@ impl stream::Server for StreamService {
         let count = remaining.min(max);
         let mut batch = Vec::with_capacity(count);
         for key in self.keys[self.position..self.position + count].iter() {
-            if let Some(value) = self.data.get(key) {
-                batch.push((key.clone(), value));
+            if let Some(value) = self.data.get(*key) {
+                batch.push((*key, value));
             }
         }
         self.position += count;
         let mut list = results.get().init_items(batch.len() as u32);
         for (i, (key, value)) in batch.into_iter().enumerate() {
             let mut item = list.reborrow().get(i as u32);
-            item.set_key(key.as_str().into());
+            item.set_key(key);
             item.set_value(&value);
         }
         results.get().set_done(self.position >= self.keys.len());

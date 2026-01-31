@@ -14,8 +14,6 @@ pub enum Error {
     Capnp(String),
     #[error("invalid page size: {0} (expected {1})")]
     InvalidPageSize(usize, usize),
-    #[error("invalid page id: {0}")]
-    InvalidPageId(String),
 }
 
 impl From<capnp::Error> for Error {

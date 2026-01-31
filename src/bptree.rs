@@ -144,3 +144,38 @@ fn child_index(keys: &[PageId], key: PageId) -> usize {
         Err(pos) => pos,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::BPlusTree;
+
+    #[test]
+    fn test_insert_and_contains() {
+        let tree = BPlusTree::new();
+        for key in 1..=100u64 {
+            tree.insert(key);
+        }
+
+        for key in 1..=100u64 {
+            assert!(tree.contains(key));
+        }
+        assert!(!tree.contains(101));
+    }
+
+    #[test]
+    fn test_remove_and_contains() {
+        let tree = BPlusTree::new();
+        for key in 1..=32u64 {
+            tree.insert(key);
+        }
+
+        for key in (1..=32u64).step_by(2) {
+            tree.remove(key);
+        }
+
+        for key in 1..=32u64 {
+            let expected = key % 2 == 0;
+            assert_eq!(tree.contains(key), expected);
+        }
+    }
+}

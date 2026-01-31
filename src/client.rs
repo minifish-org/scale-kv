@@ -297,8 +297,7 @@ impl StorageClient {
 
     pub async fn get(&self, page_id: PageId) -> Result<Option<Page>> {
         let mut request = self.client.get_request();
-        let key = page_id.to_string();
-        request.get().set_key(key.as_str().into());
+        request.get().set_key(page_id);
         let response = request.send().promise.await?;
         let response = response.get()?;
         if response.get_found() {
@@ -311,8 +310,7 @@ impl StorageClient {
     pub async fn put(&self, page_id: PageId, page: &[u8]) -> Result<()> {
         let mut request = self.client.put_request();
         let mut params = request.get();
-        let key = page_id.to_string();
-        params.set_key(key.as_str().into());
+        params.set_key(page_id);
         params.set_value(page);
         request.send().promise.await?;
         Ok(())
@@ -320,8 +318,7 @@ impl StorageClient {
 
     pub async fn delete(&self, page_id: PageId) -> Result<bool> {
         let mut request = self.client.delete_request();
-        let key = page_id.to_string();
-        request.get().set_key(key.as_str().into());
+        request.get().set_key(page_id);
         let response = request.send().promise.await?;
         Ok(response.get()?.get_found())
     }
@@ -339,8 +336,7 @@ impl StorageClient {
         let mut list = params.init_items(items.len() as u32);
         for (index, (page_id, page)) in items.iter().enumerate() {
             let mut slot = list.reborrow().get(index as u32);
-            let key = page_id.to_string();
-            slot.set_key(key.as_str().into());
+            slot.set_key(*page_id);
             slot.set_value(page);
         }
         request.send().promise.await?;
@@ -362,13 +358,7 @@ impl StreamClient {
         let items = response.get_items()?;
         let mut out = Vec::with_capacity(items.len() as usize);
         for item in items.iter() {
-            let key = item
-                .get_key()?
-                .to_str()
-                .map_err(|err| crate::Error::Capnp(err.to_string()))?;
-            let page_id = key
-                .parse::<PageId>()
-                .map_err(|_| Error::InvalidPageId(key.to_string()))?;
+            let page_id = item.get_key();
             let value = item.get_value()?.to_vec();
             out.push((page_id, value));
         }
