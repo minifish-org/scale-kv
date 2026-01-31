@@ -1,41 +1,47 @@
-use crate::PageId;
 use std::sync::RwLock;
 
 const MAX_KEYS: usize = 8;
 
-#[derive(Default)]
-pub struct BPlusTree {
-    root: RwLock<Node>,
+pub struct BPlusTree<K: Ord + Clone> {
+    root: RwLock<Node<K>>,
 }
 
 #[derive(Clone)]
-enum Node {
+enum Node<K: Ord + Clone> {
     Leaf {
-        keys: Vec<PageId>,
+        keys: Vec<K>,
     },
     Internal {
-        keys: Vec<PageId>,
-        children: Vec<Box<Node>>,
+        keys: Vec<K>,
+        children: Vec<Box<Node<K>>>,
     },
 }
 
-impl Default for Node {
+impl<K: Ord + Clone> Default for Node<K> {
     fn default() -> Self {
         Node::Leaf { keys: Vec::new() }
     }
 }
 
-impl BPlusTree {
+impl<K: Ord + Clone> Default for BPlusTree<K> {
+    fn default() -> Self {
+        Self {
+            root: RwLock::new(Node::default()),
+        }
+    }
+}
+
+impl<K: Ord + Clone> BPlusTree<K> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn contains(&self, key: PageId) -> bool {
+    pub fn contains(&self, key: &K) -> bool {
         let root = self.root.read().unwrap();
         root.contains(key)
     }
 
-    pub fn insert(&self, key: PageId) {
+    pub fn insert(&self, key: K) {
         let mut root = self.root.write().unwrap();
         if root.insert(key).is_some() {
             let (promote, right) = root.split();
@@ -47,7 +53,7 @@ impl BPlusTree {
         }
     }
 
-    pub fn remove(&self, key: PageId) {
+    pub fn remove(&self, key: &K) {
         let mut root = self.root.write().unwrap();
         root.remove(key);
         if let Node::Internal { keys: _, children } = &mut *root {
@@ -59,10 +65,10 @@ impl BPlusTree {
     }
 }
 
-impl Node {
-    fn contains(&self, key: PageId) -> bool {
+impl<K: Ord + Clone> Node<K> {
+    fn contains(&self, key: &K) -> bool {
         match self {
-            Node::Leaf { keys } => keys.binary_search(&key).is_ok(),
+            Node::Leaf { keys } => keys.binary_search(key).is_ok(),
             Node::Internal { keys, children } => {
                 let idx = child_index(keys, key);
                 children[idx].contains(key)
@@ -70,7 +76,7 @@ impl Node {
         }
     }
 
-    fn insert(&mut self, key: PageId) -> Option<()> {
+    fn insert(&mut self, key: K) -> Option<()> {
         match self {
             Node::Leaf { keys } => {
                 match keys.binary_search(&key) {
@@ -84,7 +90,7 @@ impl Node {
                 }
             }
             Node::Internal { keys, children } => {
-                let idx = child_index(keys, key);
+                let idx = child_index(keys, &key);
                 if children[idx].insert(key).is_some() {
                     let (promote, right) = children[idx].split();
                     keys.insert(idx, promote);
@@ -98,17 +104,17 @@ impl Node {
         }
     }
 
-    fn split(&mut self) -> (PageId, Box<Node>) {
+    fn split(&mut self) -> (K, Box<Node<K>>) {
         match self {
             Node::Leaf { keys } => {
                 let mid = keys.len() / 2;
                 let right_keys = keys.split_off(mid);
-                let promote = right_keys[0];
+                let promote = right_keys[0].clone();
                 (promote, Box::new(Node::Leaf { keys: right_keys }))
             }
             Node::Internal { keys, children } => {
                 let mid = keys.len() / 2;
-                let promote = keys[mid];
+                let promote = keys[mid].clone();
                 let right_keys = keys.split_off(mid + 1);
                 let right_children = children.split_off(mid + 1);
                 keys.truncate(mid);
@@ -123,10 +129,10 @@ impl Node {
         }
     }
 
-    fn remove(&mut self, key: PageId) {
+    fn remove(&mut self, key: &K) {
         match self {
             Node::Leaf { keys } => {
-                if let Ok(pos) = keys.binary_search(&key) {
+                if let Ok(pos) = keys.binary_search(key) {
                     keys.remove(pos);
                 }
             }
@@ -138,8 +144,8 @@ impl Node {
     }
 }
 
-fn child_index(keys: &[PageId], key: PageId) -> usize {
-    match keys.binary_search(&key) {
+fn child_index<K: Ord + Clone>(keys: &[K], key: &K) -> usize {
+    match keys.binary_search(key) {
         Ok(pos) => pos + 1,
         Err(pos) => pos,
     }
@@ -157,9 +163,9 @@ mod tests {
         }
 
         for key in 1..=100u64 {
-            assert!(tree.contains(key));
+            assert!(tree.contains(&key));
         }
-        assert!(!tree.contains(101));
+        assert!(!tree.contains(&101));
     }
 
     #[test]
@@ -170,12 +176,12 @@ mod tests {
         }
 
         for key in (1..=32u64).step_by(2) {
-            tree.remove(key);
+            tree.remove(&key);
         }
 
         for key in 1..=32u64 {
             let expected = key % 2 == 0;
-            assert_eq!(tree.contains(key), expected);
+            assert_eq!(tree.contains(&key), expected);
         }
     }
 }

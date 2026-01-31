@@ -14,6 +14,8 @@ pub enum Error {
     Capnp(String),
     #[error("invalid page size: {0} (expected {1})")]
     InvalidPageSize(usize, usize),
+    #[error("invalid value size: {0} (max {1})")]
+    InvalidValueSize(usize, usize),
 }
 
 impl From<capnp::Error> for Error {

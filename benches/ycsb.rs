@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rand::RngCore;
-use scale_kv::{ComputeNode, PageId, StorageServer, PAGE_SIZE};
+use scale_kv::{ComputeNode, StorageServer};
 use sled::Config;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use tokio::task::LocalSet;
 
 const NUM_RECORDS: usize = 10_000;
 const OPERATIONS: usize = 1_000;
-const VALUE_SIZE: usize = PAGE_SIZE;
+const VALUE_SIZE: usize = 1024;
 const BATCH_SIZE: usize = 16_384;
 
 struct ZipfianGenerator {
@@ -41,8 +41,8 @@ fn setup(rt: &tokio::runtime::Runtime, local: &LocalSet, workers: usize) -> Arc<
             .unwrap();
         let value = vec![0u8; VALUE_SIZE];
         for i in 0..NUM_RECORDS {
-            let page_id: PageId = i as PageId;
-            compute.put(page_id, &value).await.unwrap();
+            let key = format!("user{:06}", i);
+            compute.put(&key, &value).await.unwrap();
         }
         Arc::new(compute)
     })
@@ -113,12 +113,13 @@ fn bench_ycsb_a(c: &mut Criterion) {
                     let mut bool_buf = [0u8; 1];
                     rng.fill_bytes(&mut bool_buf);
                     let key_num = zipf.next(&mut rng);
+                    let key = format!("user{:06}", key_num);
                     if bool_buf[0] & 1 == 0 {
-                        black_box(compute.get(key_num).await.unwrap());
+                        black_box(compute.get(&key).await.unwrap());
                     } else {
                         let mut new_value = vec![0u8; VALUE_SIZE];
                         rng.fill_bytes(&mut new_value);
-                        compute.put(key_num, &new_value).await.unwrap();
+                        compute.put(&key, &new_value).await.unwrap();
                     }
                 }
             })
@@ -145,12 +146,13 @@ fn bench_ycsb_b(c: &mut Criterion) {
                     rng.fill_bytes(&mut float_buf);
                     let r: f64 = f64::from_le_bytes(float_buf).abs() % 1.0;
                     let key_num = zipf.next(&mut rng);
+                    let key = format!("user{:06}", key_num);
                     if r < 0.95 {
-                        black_box(compute.get(key_num).await.unwrap());
+                        black_box(compute.get(&key).await.unwrap());
                     } else {
                         let mut new_value = vec![0u8; VALUE_SIZE];
                         rng.fill_bytes(&mut new_value);
-                        compute.put(key_num, &new_value).await.unwrap();
+                        compute.put(&key, &new_value).await.unwrap();
                     }
                 }
             })
@@ -174,7 +176,8 @@ fn bench_ycsb_c(c: &mut Criterion) {
                 let mut zipf = ZipfianGenerator::new(NUM_RECORDS as u64);
                 for _ in 0..OPERATIONS {
                     let key_num = zipf.next(&mut rng);
-                    black_box(compute.get(key_num).await.unwrap());
+                    let key = format!("user{:06}", key_num);
+                    black_box(compute.get(&key).await.unwrap());
                 }
             })
         })
@@ -195,8 +198,8 @@ fn bench_throughput_put(c: &mut Criterion) {
             local.block_on(&rt, async move {
                 let value = vec![0u8; VALUE_SIZE];
                 for i in 0..OPERATIONS {
-                    let page_id: PageId = i as PageId;
-                    compute.put(page_id, &value).await.unwrap();
+                    let key = format!("key{:08}", i);
+                    compute.put(&key, &value).await.unwrap();
                 }
             })
         })
@@ -216,8 +219,8 @@ fn bench_throughput_get(c: &mut Criterion) {
             let compute = compute.clone();
             local.block_on(&rt, async move {
                 for i in 0..OPERATIONS {
-                    let page_id: PageId = i as PageId;
-                    black_box(compute.get(page_id).await.unwrap());
+                    let key = format!("user{:06}", i);
+                    black_box(compute.get(&key).await.unwrap());
                 }
             })
         })
@@ -265,9 +268,9 @@ fn bench_batch_put(c: &mut Criterion) {
             local.block_on(&rt, async move {
                 let mut items = Vec::with_capacity(BATCH_SIZE);
                 for i in 0..BATCH_SIZE {
-                    let page_id: PageId = i as PageId;
+                    let key = format!("batch{:08}", i);
                     let value = vec![0u8; VALUE_SIZE];
-                    items.push((page_id, value));
+                    items.push((key, value));
                 }
                 compute.batch_put(&items).await.unwrap();
             })
@@ -303,12 +306,13 @@ fn bench_concurrency_workload_a(c: &mut Criterion) {
                                 let mut bool_buf = [0u8; 1];
                                 rng.fill_bytes(&mut bool_buf);
                                 let key_num = zipf.next(&mut rng);
+                                let key = format!("user{:06}", key_num);
                                 if bool_buf[0] & 1 == 0 {
-                                    let _ = compute.get(key_num).await.unwrap();
+                                    let _ = compute.get(&key).await.unwrap();
                                 } else {
                                     let mut new_value = vec![0u8; VALUE_SIZE];
                                     rng.fill_bytes(&mut new_value);
-                                    compute.put(key_num, &new_value).await.unwrap();
+                                    compute.put(&key, &new_value).await.unwrap();
                                 }
                             }
                         }));

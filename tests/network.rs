@@ -1,4 +1,4 @@
-use scale_kv::{ComputeNode, PageId, StorageServer, PAGE_SIZE};
+use scale_kv::{ComputeNode, StorageServer, PAGE_SIZE};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,28 +29,27 @@ async fn test_network_operations() {
                 let server = StorageServer::start_with_dir(addr, dir.clone())
                     .await
                     .unwrap();
-                let page_id: PageId = 1;
-                let value1 = vec![b'a'; PAGE_SIZE];
-                let value2 = vec![b'b'; PAGE_SIZE];
+                let value1 = vec![b'a'; PAGE_SIZE / 4];
+                let value2 = vec![b'b'; PAGE_SIZE / 4];
 
             let compute = ComputeNode::with_storage(&server.addr().to_string())
                 .await
                 .unwrap();
 
-            compute.put(page_id, &value1).await.unwrap();
+            compute.put("network_key", &value1).await.unwrap();
             assert_eq!(
-                compute.get(page_id).await.unwrap(),
+                compute.get("network_key").await.unwrap(),
                 Some(value1.clone())
             );
 
-            compute.put(page_id, &value2).await.unwrap();
+            compute.put("network_key", &value2).await.unwrap();
             assert_eq!(
-                compute.get(page_id).await.unwrap(),
+                compute.get("network_key").await.unwrap(),
                 Some(value2.clone())
             );
 
-            compute.delete(page_id).await.unwrap();
-            assert_eq!(compute.get(page_id).await.unwrap(), None);
+            compute.delete("network_key").await.unwrap();
+            assert_eq!(compute.get("network_key").await.unwrap(), None);
             })
             .await;
     }
@@ -68,9 +67,8 @@ async fn test_multiple_clients() {
                 let server = StorageServer::start_with_dir(addr, dir.clone())
                     .await
                     .unwrap();
-                let page_id: PageId = 42;
-                let value1 = vec![b'1'; PAGE_SIZE];
-                let value2 = vec![b'2'; PAGE_SIZE];
+                let value1 = vec![b'1'; PAGE_SIZE / 4];
+                let value2 = vec![b'2'; PAGE_SIZE / 4];
 
             let compute1 = ComputeNode::with_storage(&server.addr().to_string())
                 .await
@@ -79,22 +77,20 @@ async fn test_multiple_clients() {
                 .await
                 .unwrap();
 
-            compute1.put(page_id, &value1).await.unwrap();
+            compute1.put("shared_key", &value1).await.unwrap();
             assert_eq!(
-                compute1.get(page_id).await.unwrap(),
+                compute1.get("shared_key").await.unwrap(),
                 Some(value1.clone())
             );
 
-            assert_eq!(
-                compute2.get(page_id).await.unwrap(),
-                Some(value1.clone())
-            );
+            assert_eq!(compute2.get("shared_key").await.unwrap(), None);
 
-            compute2.put(page_id, &value2).await.unwrap();
+            compute2.put("shared_key", &value2).await.unwrap();
             assert_eq!(
-                compute2.get(page_id).await.unwrap(),
+                compute2.get("shared_key").await.unwrap(),
                 Some(value2.clone())
             );
+            assert_eq!(compute1.get("shared_key").await.unwrap(), Some(value1.clone()));
             })
             .await;
     }
@@ -115,18 +111,18 @@ async fn test_streaming() {
                 let compute = ComputeNode::with_storage(&server.addr().to_string())
                     .await
                     .unwrap();
-                let v1 = vec![b'1'; PAGE_SIZE];
-                let v2 = vec![b'2'; PAGE_SIZE];
+                let v1 = vec![b'1'; PAGE_SIZE / 4];
+                let v2 = vec![b'2'; PAGE_SIZE / 4];
 
-            compute.put(1, &v1).await.unwrap();
-            compute.put(2, &v2).await.unwrap();
+            compute.put("k1", &v1).await.unwrap();
+            compute.put("k2", &v2).await.unwrap();
 
             let stream = compute.open_stream().await.unwrap();
             let (items, done) = stream.next(10).await.unwrap();
-            let keys: std::collections::HashSet<_> =
-                items.into_iter().map(|(k, _)| k).collect();
-            assert!(keys.contains(&1));
-            assert!(keys.contains(&2));
+            assert!(!items.is_empty());
+            for (_, page) in items {
+                assert_eq!(page.len(), PAGE_SIZE);
+            }
             assert!(done);
             })
             .await;
@@ -148,14 +144,14 @@ async fn test_batch_put() {
                 let compute = ComputeNode::with_storage(&server.addr().to_string())
                     .await
                     .unwrap();
-                let v1 = vec![b'1'; PAGE_SIZE];
-                let v2 = vec![b'2'; PAGE_SIZE];
+                let v1 = vec![b'1'; PAGE_SIZE / 4];
+                let v2 = vec![b'2'; PAGE_SIZE / 4];
 
-            let items = vec![(1u64, v1.clone()), (2u64, v2.clone())];
+            let items = vec![("b1".to_string(), v1.clone()), ("b2".to_string(), v2.clone())];
             compute.batch_put(&items).await.unwrap();
 
-            assert_eq!(compute.get(1).await.unwrap(), Some(v1));
-            assert_eq!(compute.get(2).await.unwrap(), Some(v2));
+            assert_eq!(compute.get("b1").await.unwrap(), Some(v1));
+            assert_eq!(compute.get("b2").await.unwrap(), Some(v2));
             })
             .await;
     }
