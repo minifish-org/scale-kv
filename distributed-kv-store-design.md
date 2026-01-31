@@ -95,6 +95,29 @@ flowchart TD
 - `batchPut` 成功 = **日志已追加**（不要求 fsync）
 - compaction 保留最新值，旧版本清理
 
+#### 5.3.4 可选方案：KV + page/slot redo（让 page 层真正有用）
+- 网络传输：**用户 KV + page_id + slot_id + lsn**
+- Storage：按 lsn **回放到 page**，再以 page 为单位写入 Bitcask
+- 作用：网络只发增量，但 Storage 仍维护与 Compute 一致的 page
+
+最小记录格式建议：
+```
+record {
+  lsn: u64
+  op: PUT | DEL
+  page_id: u64
+  slot_id: u16
+  key_len: u32
+  val_len: u32
+  key: bytes
+  value: bytes
+}
+```
+
+关键约束：
+- **page_id/slot_id 由 Compute 单写者生成**（必须全局唯一/有序）
+- Storage 按 **lsn 顺序重放**，需要幂等处理（避免重试重复 apply）
+
 #### 约束
 - **存储为单写者模型**（append‑only log），写入串行
 - 内存索引为 HashMap（无锁），由单写者线程更新
