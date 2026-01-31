@@ -52,7 +52,7 @@
 - Page 管理：**HashMap + RwLock**
 - Free Space Map：**Vec<VecDeque<PageId>> 分桶**（单写线程访问）
 
-### 5.3 计算层页式模型（决定）
+#### 5.1.1 计算层页式模型（决定）
 - KV 对应 Page：**一个 KV = 一个 Page**
 - Key：**page_id**
 - Value：**固定 16KB 页内容**
