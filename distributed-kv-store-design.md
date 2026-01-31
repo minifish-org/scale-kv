@@ -236,6 +236,92 @@ PageHeader {
 - **存储为单写者模型**（append‑only log），写入串行
 - 内存索引为 HashMap（无锁），由单写者线程更新
 
+#### 5.5 代码审查结果（2026-02-01）
+
+##### 5.5.1 严重问题
+
+| 严重程度 | 问题 | 位置 | 影响 |
+|---------|------|------|------|
+| 🔴 | Cap'n RPC 同步使用 | client.rs:287 | RPC 开销高，延迟大 |
+| 🔴 | B+Tree 无叶子链表 | bptree.rs:10-18 | Range scan 效率低 |
+| 🔴 | 同步文件 I/O 阻塞 async | node.rs:156 | 阻塞 tokio 线程池 |
+| 🔴 | `spawn_local` 兼容性 | server.rs:165 | 可能在 multi-thread runtime 中异常 |
+
+##### 5.5.2 详细问题说明
+
+**Cap'n RPC 同步使用**：
+```rust
+// 当前：每条 RPC 阻塞等待
+if let Some(storage) = &self.storage {
+    storage.put(page_id, &page).await?;  // ← 逐条等待
+}
+
+// 滑动窗口方案（5.3.5）：窗口有空就发，无空就排队
+```
+
+**B+Tree 无叶子链表**：
+```rust
+// 当前：只有 keys
+Node::Leaf {
+    keys: Vec<K>,
+},
+
+// 建议：添加兄弟指针
+Node::Leaf {
+    keys: Vec<K>,
+    prev: Option<Box<Node<K>>>,
+    next: Option<Box<Node<K>>>,
+},
+```
+
+**同步文件 I/O**：
+```rust
+// 当前：使用 std::fs::File（阻塞）
+writer.file.write_all(value)?;
+
+// 建议：改用 tokio 异步 API
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
+```
+
+**spawn_local 兼容性**：
+```rust
+// 当前：混用 spawn_local + features = ["full"]
+tokio::task::spawn_local(async move { ... });
+// features = ["full"] 包含 rt-multi-thread
+
+// 方案 A：统一用 spawn
+tokio::task::spawn(async move { ... });
+
+// 方案 B：用 current_thread runtime
+// Cargo.toml: features = ["rt-current-thread", "net"]
+```
+
+##### 5.5.3 中等问题
+
+| 严重程度 | 问题 | 位置 | 修复建议 |
+|---------|------|------|----------|
+| 🟡 | 锁内异步 I/O | client.rs:230-251 | 先释放锁，再做 I/O |
+| 🟡 | MAX_KEYS = 8 太小 | bptree.rs:3 | 根据 page 大小动态调整 |
+| 🟡 | 批量操作未并发 | client.rs:387 | 用 `join_all` 并发执行 |
+
+##### 5.5.4 轻微问题
+
+| 严重程度 | 问题 | 位置 | 修复建议 |
+|---------|------|------|----------|
+| 🟢 | 未使用 dashmap | Cargo.toml:11 | 移除依赖 |
+| 🟢 | tokio features 过量 | Cargo.toml:14 | 用 `rt-multi-thread + net` |
+
+##### 5.5.5 修复优先级
+
+| 优先级 | 问题 | 预计改动 |
+|--------|------|----------|
+| **P0** | 同步文件 I/O → 异步 | node.rs 较大改动 |
+| **P0** | Cap'n RPC 滑动窗口 | client.rs 中等改动 |
+| **P1** | spawn_local 兼容性 | server.rs 小改动 |
+| **P2** | B+Tree 叶子链表 | bptree.rs 中等改动 |
+| **P3** | 清理依赖 | Cargo.toml |
+
 ---
 
 ## 四、存储节点 - 单元测试
