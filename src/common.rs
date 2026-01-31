@@ -1,3 +1,7 @@
+pub const PAGE_SIZE: usize = 16 * 1024;
+
+pub type PageId = u64;
+pub type Page = Vec<u8>;
 pub type Value = Vec<u8>;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -8,6 +12,10 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("capnp error: {0}")]
     Capnp(String),
+    #[error("invalid page size: {0} (expected {1})")]
+    InvalidPageSize(usize, usize),
+    #[error("invalid page id: {0}")]
+    InvalidPageId(String),
 }
 
 impl From<capnp::Error> for Error {

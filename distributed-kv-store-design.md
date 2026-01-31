@@ -51,6 +51,7 @@
 - 选择：**自研 B+tree + 全树 RwLock（并发读、写串行）**
 - Page 管理：**HashMap + RwLock**
 - Free Space Map：**Vec<VecDeque<PageId>> 分桶**（单写线程访问）
+- 状态：**已完成**（B+tree 入口、页缓存、FSM、PageId/16KB 页模型）
 
 #### 5.1.1 计算层页式模型（决定）
 - KV 对应 Page：**一个 KV = 一个 Page**

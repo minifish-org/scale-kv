@@ -6,6 +6,8 @@
 pub mod common;
 pub use common::*;
 
+mod bptree;
+
 pub mod node;
 pub use node::StorageNode;
 

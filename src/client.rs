@@ -1,11 +1,13 @@
+use crate::bptree::BPlusTree;
 use crate::storage_capnp::{storage, stream as storage_stream};
-use crate::{Result, Value};
+use crate::{Error, Page, PageId, Result, PAGE_SIZE};
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
-use dashmap::DashMap;
 use futures::FutureExt;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, RwLock};
 use tokio::net::TcpStream;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -33,40 +35,75 @@ impl StorageClientPool {
         &self.clients[index % self.clients.len()]
     }
 
-    pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        self.pick().get(key).await
+    pub async fn get(&self, page_id: PageId) -> Result<Option<Page>> {
+        self.pick().get(page_id).await
     }
 
-    pub async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
-        self.pick().put(key, value).await
+    pub async fn put(&self, page_id: PageId, page: &[u8]) -> Result<()> {
+        self.pick().put(page_id, page).await
     }
 
-    pub async fn delete(&self, key: &str) -> Result<bool> {
-        self.pick().delete(key).await
+    pub async fn delete(&self, page_id: PageId) -> Result<bool> {
+        self.pick().delete(page_id).await
     }
 
     pub async fn open_stream(&self) -> Result<StreamClient> {
         self.pick().open_stream().await
     }
 
-    pub async fn batch_put(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
+    pub async fn batch_put(&self, items: &[(PageId, Page)]) -> Result<()> {
         self.pick().batch_put(items).await
     }
 
 }
 
 pub struct ComputeNode {
-    cache: DashMap<String, Value>,
+    tree: BPlusTree,
+    page_cache: RwLock<HashMap<PageId, Page>>,
+    fsm: Mutex<FreeSpaceMap>,
     cache_hits: AtomicUsize,
     cache_misses: AtomicUsize,
     operations: AtomicUsize,
     storage: Option<StorageClientPool>,
 }
 
+struct FreeSpaceMap {
+    buckets: Vec<VecDeque<PageId>>,
+    next_page: PageId,
+}
+
+impl FreeSpaceMap {
+    fn new() -> Self {
+        Self {
+            buckets: vec![VecDeque::new()],
+            next_page: 1,
+        }
+    }
+
+    fn allocate(&mut self) -> PageId {
+        if let Some(bucket) = self.buckets.get_mut(0) {
+            if let Some(id) = bucket.pop_front() {
+                return id;
+            }
+        }
+        let id = self.next_page;
+        self.next_page += 1;
+        id
+    }
+
+    fn free(&mut self, page_id: PageId) {
+        if let Some(bucket) = self.buckets.get_mut(0) {
+            bucket.push_back(page_id);
+        }
+    }
+}
+
 impl ComputeNode {
     pub fn new() -> Self {
         Self {
-            cache: DashMap::new(),
+            tree: BPlusTree::new(),
+            page_cache: RwLock::new(HashMap::new()),
+            fsm: Mutex::new(FreeSpaceMap::new()),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
@@ -77,7 +114,9 @@ impl ComputeNode {
     pub async fn with_storage(addr: &str) -> Result<Self> {
         let storage = StorageClientPool::connect(addr, 1).await?;
         Ok(Self {
-            cache: DashMap::new(),
+            tree: BPlusTree::new(),
+            page_cache: RwLock::new(HashMap::new()),
+            fsm: Mutex::new(FreeSpaceMap::new()),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
@@ -88,7 +127,9 @@ impl ComputeNode {
     pub async fn with_storage_workers(addr: &str, workers: usize) -> Result<Self> {
         let storage = StorageClientPool::connect(addr, workers).await?;
         Ok(Self {
-            cache: DashMap::new(),
+            tree: BPlusTree::new(),
+            page_cache: RwLock::new(HashMap::new()),
+            fsm: Mutex::new(FreeSpaceMap::new()),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
@@ -100,13 +141,14 @@ impl ComputeNode {
         Self::with_storage_workers(addr, size).await
     }
 
-    pub async fn get(&self, key: impl AsRef<str>) -> Result<Option<Value>> {
+    pub async fn get(&self, page_id: PageId) -> Result<Option<Page>> {
         self.operations.fetch_add(1, Ordering::Relaxed);
-        let key_ref = key.as_ref();
-
-        if let Some(value) = self.cache.get(key_ref) {
+        let in_tree = self.tree.contains(page_id);
+        if in_tree {
+            if let Some(page) = self.page_cache.read().unwrap().get(&page_id) {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(Some(value.clone()));
+            return Ok(Some(page.clone()));
+            }
         }
 
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
@@ -116,53 +158,57 @@ impl ComputeNode {
             None => return Ok(None),
         };
 
-        let value = storage.get(key_ref).await?;
-        if let Some(value) = value {
-            let key_string = key_ref.to_string();
-            self.cache.insert(key_string, value.clone());
-            return Ok(Some(value));
+        let page = storage.get(page_id).await?;
+        if let Some(page) = page {
+            self.tree.insert(page_id);
+            self.page_cache.write().unwrap().insert(page_id, page.clone());
+            return Ok(Some(page));
         }
         Ok(None)
     }
 
-    pub async fn put(&self, key: impl AsRef<str>, value: &[u8]) -> Result<()> {
+    pub async fn put(&self, page_id: PageId, page: &[u8]) -> Result<()> {
         self.operations.fetch_add(1, Ordering::Relaxed);
-        let key_ref = key.as_ref();
-        let key_string = key_ref.to_string();
-        let value_vec = value.to_vec();
-
-        self.cache.insert(key_string, value_vec);
+        let page = ensure_page(page)?;
+        self.tree.insert(page_id);
+        self.page_cache.write().unwrap().insert(page_id, page.clone());
 
         if let Some(storage) = &self.storage {
-            storage.put(key_ref, value).await?;
+            storage.put(page_id, &page).await?;
         }
 
         Ok(())
     }
 
-    pub async fn delete(&self, key: impl AsRef<str>) -> Result<()> {
+    pub async fn delete(&self, page_id: PageId) -> Result<()> {
         self.operations.fetch_add(1, Ordering::Relaxed);
-        let key_ref = key.as_ref();
-
-        self.cache.remove(key_ref);
+        self.tree.remove(page_id);
+        self.page_cache.write().unwrap().remove(&page_id);
 
         if let Some(storage) = &self.storage {
-            storage.delete(key_ref).await?;
+            storage.delete(page_id).await?;
         }
 
         Ok(())
     }
 
-    pub async fn batch_put(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
+    pub async fn batch_put(&self, items: &[(PageId, Page)]) -> Result<()> {
         let storage = match &self.storage {
             Some(storage) => storage,
             None => return Err(crate::Error::Capnp("no storage configured".to_string())),
         };
 
-        storage.batch_put(items).await?;
+        let mut pages = Vec::with_capacity(items.len());
+        for (page_id, page) in items {
+            pages.push((*page_id, ensure_page(page)?));
+        }
 
-        for (key, value) in items {
-            self.cache.insert(key.clone(), value.clone());
+        storage.batch_put(&pages).await?;
+
+        let mut cache = self.page_cache.write().unwrap();
+        for (page_id, page) in pages {
+            self.tree.insert(page_id);
+            cache.insert(page_id, page);
         }
 
         Ok(())
@@ -192,7 +238,7 @@ impl ComputeNode {
     }
 
     pub fn cache_size(&self) -> usize {
-        self.cache.len()
+        self.page_cache.read().unwrap().len()
     }
 
     pub fn reset_metrics(&self) {
@@ -208,6 +254,14 @@ impl ComputeNode {
             None => return Err(crate::Error::Capnp("no storage configured".to_string())),
         };
         storage.open_stream().await
+    }
+
+    pub fn allocate_page_id(&self) -> PageId {
+        self.fsm.lock().unwrap().allocate()
+    }
+
+    pub fn free_page_id(&self, page_id: PageId) {
+        self.fsm.lock().unwrap().free(page_id);
     }
 
 }
@@ -241,9 +295,10 @@ impl StorageClient {
         })
     }
 
-    pub async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+    pub async fn get(&self, page_id: PageId) -> Result<Option<Page>> {
         let mut request = self.client.get_request();
-        request.get().set_key(key.into());
+        let key = page_id.to_string();
+        request.get().set_key(key.as_str().into());
         let response = request.send().promise.await?;
         let response = response.get()?;
         if response.get_found() {
@@ -253,18 +308,20 @@ impl StorageClient {
         }
     }
 
-    pub async fn put(&self, key: &str, value: &[u8]) -> Result<()> {
+    pub async fn put(&self, page_id: PageId, page: &[u8]) -> Result<()> {
         let mut request = self.client.put_request();
         let mut params = request.get();
-        params.set_key(key.into());
-        params.set_value(value);
+        let key = page_id.to_string();
+        params.set_key(key.as_str().into());
+        params.set_value(page);
         request.send().promise.await?;
         Ok(())
     }
 
-    pub async fn delete(&self, key: &str) -> Result<bool> {
+    pub async fn delete(&self, page_id: PageId) -> Result<bool> {
         let mut request = self.client.delete_request();
-        request.get().set_key(key.into());
+        let key = page_id.to_string();
+        request.get().set_key(key.as_str().into());
         let response = request.send().promise.await?;
         Ok(response.get()?.get_found())
     }
@@ -276,14 +333,15 @@ impl StorageClient {
         Ok(StreamClient { stream })
     }
 
-    pub async fn batch_put(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
+    pub async fn batch_put(&self, items: &[(PageId, Page)]) -> Result<()> {
         let mut request = self.client.batch_put_request();
         let params = request.get();
         let mut list = params.init_items(items.len() as u32);
-        for (index, (key, value)) in items.iter().enumerate() {
+        for (index, (page_id, page)) in items.iter().enumerate() {
             let mut slot = list.reborrow().get(index as u32);
+            let key = page_id.to_string();
             slot.set_key(key.as_str().into());
-            slot.set_value(value);
+            slot.set_value(page);
         }
         request.send().promise.await?;
         Ok(())
@@ -296,7 +354,7 @@ pub struct StreamClient {
 }
 
 impl StreamClient {
-    pub async fn next(&self, max: u32) -> Result<(Vec<(String, Vec<u8>)>, bool)> {
+    pub async fn next(&self, max: u32) -> Result<(Vec<(PageId, Page)>, bool)> {
         let mut request = self.stream.next_request();
         request.get().set_max(max);
         let response = request.send().promise.await?;
@@ -304,12 +362,23 @@ impl StreamClient {
         let items = response.get_items()?;
         let mut out = Vec::with_capacity(items.len() as usize);
         for item in items.iter() {
-            let key = item.get_key()?.to_str().map_err(|err| {
-                crate::Error::Capnp(err.to_string())
-            })?;
+            let key = item
+                .get_key()?
+                .to_str()
+                .map_err(|err| crate::Error::Capnp(err.to_string()))?;
+            let page_id = key
+                .parse::<PageId>()
+                .map_err(|_| Error::InvalidPageId(key.to_string()))?;
             let value = item.get_value()?.to_vec();
-            out.push((key.to_string(), value));
+            out.push((page_id, value));
         }
         Ok((out, response.get_done()))
     }
+}
+
+fn ensure_page(page: &[u8]) -> Result<Page> {
+    if page.len() != PAGE_SIZE {
+        return Err(Error::InvalidPageSize(page.len(), PAGE_SIZE));
+    }
+    Ok(page.to_vec())
 }
