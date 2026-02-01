@@ -1,4 +1,5 @@
 use crate::storage_capnp::{storage, stream};
+use crate::node::{WalBatch, WalRecord};
 use crate::{PageId, Result, StorageNode};
 use capnp::capability::Promise;
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -149,6 +150,62 @@ impl storage::Server for StorageService {
             })
             .await
             .map_err(map_join_error)?;
+            Ok(())
+        })
+    }
+
+    fn append_wal(
+        &mut self,
+        params: storage::AppendWalParams,
+        _results: storage::AppendWalResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(params) => params,
+            Err(err) => return Promise::err(err),
+        };
+        let batch = match params.get_batch() {
+            Ok(batch) => batch,
+            Err(err) => return Promise::err(err),
+        };
+        let start_lsn = batch.get_start_lsn();
+        let end_lsn = batch.get_end_lsn();
+        let records = match batch.get_records() {
+            Ok(records) => records,
+            Err(err) => return Promise::err(err),
+        };
+
+        let mut wal_records = Vec::with_capacity(records.len() as usize);
+        for record in records.iter() {
+            let key = match record.get_key() {
+                Ok(key) => key.to_vec(),
+                Err(err) => return Promise::err(err),
+            };
+            let value = match record.get_value() {
+                Ok(value) => value.to_vec(),
+                Err(err) => return Promise::err(err),
+            };
+            wal_records.push(WalRecord {
+                lsn: record.get_lsn(),
+                op: record.get_op(),
+                page_id: record.get_page_id(),
+                slot_id: record.get_slot_id(),
+                key,
+                value,
+            });
+        }
+
+        let batch = WalBatch {
+            start_lsn,
+            end_lsn,
+            records: wal_records,
+        };
+
+        let data = self.data.clone();
+        Promise::from_future(async move {
+            task::spawn_blocking(move || data.append_wal_batch(batch))
+                .await
+                .map_err(map_join_error)?
+                .map_err(|err| capnp::Error::failed(err.to_string()))?;
             Ok(())
         })
     }

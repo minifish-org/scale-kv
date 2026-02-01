@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpStream;
 use tokio::task::LocalSet;
+use crate::node::WalBatch;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const PAGE_HEADER_SIZE: usize = 6;
@@ -1344,6 +1345,26 @@ impl StorageClient {
             let mut slot = list.reborrow().get(index as u32);
             slot.set_key(*page_id);
             slot.set_value(page);
+        }
+        request.send().promise.await?;
+        Ok(())
+    }
+
+    pub async fn append_wal(&self, batch: &WalBatch) -> Result<()> {
+        let mut request = self.client.append_wal_request();
+        let mut params = request.get();
+        let mut wal_batch = params.init_batch();
+        wal_batch.set_start_lsn(batch.start_lsn);
+        wal_batch.set_end_lsn(batch.end_lsn);
+        let mut records = wal_batch.init_records(batch.records.len() as u32);
+        for (index, record) in batch.records.iter().enumerate() {
+            let mut slot = records.reborrow().get(index as u32);
+            slot.set_lsn(record.lsn);
+            slot.set_op(record.op);
+            slot.set_page_id(record.page_id);
+            slot.set_slot_id(record.slot_id);
+            slot.set_key(&record.key);
+            slot.set_value(&record.value);
         }
         request.send().promise.await?;
         Ok(())

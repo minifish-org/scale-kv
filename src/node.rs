@@ -3,9 +3,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::hash::Hasher;
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
+use std::thread;
 
 const TOMBSTONE: u32 = u32::MAX;
 #[cfg(test)]
@@ -31,6 +33,7 @@ pub struct StorageNode {
     stats: Mutex<Stats>,
     compaction_segment_limit: usize,
     compaction_stale_ratio: u64,
+    wal_sender: Mutex<Option<Sender<WalBatch>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +48,69 @@ struct LogWriter {
     size: u64,
 }
 
+impl LogWriter {
+    fn rotate_if_needed(&mut self, dir: &Path) -> Result<()> {
+        if self.size < MAX_SEGMENT_SIZE {
+            return Ok(());
+        }
+        self.file_id += 1;
+        self.file = create_segment(dir, self.file_id)?;
+        self.size = 0;
+        Ok(())
+    }
+}
+
+impl WalWriter {
+    fn open(dir: PathBuf) -> Result<Self> {
+        let mut segments = list_wal_segments(&dir)?;
+        let (file_id, file, size) = if segments.is_empty() {
+            let file_id = 1u64;
+            let file = create_wal_segment(&dir, file_id)?;
+            (file_id, file, 0u64)
+        } else {
+            segments.sort_unstable();
+            let file_id = *segments.last().unwrap();
+            let path = wal_segment_path(&dir, file_id);
+            let file = OpenOptions::new().append(true).read(true).open(path)?;
+            let size = file.metadata()?.len();
+            (file_id, file, size)
+        };
+        Ok(Self {
+            dir,
+            file_id,
+            file,
+            size,
+        })
+    }
+
+    fn rotate_if_needed(&mut self) -> Result<()> {
+        if self.size < MAX_SEGMENT_SIZE {
+            return Ok(());
+        }
+        self.file_id += 1;
+        self.file = create_wal_segment(&self.dir, self.file_id)?;
+        self.size = 0;
+        Ok(())
+    }
+
+    fn append_batch(&mut self, batch: &WalBatch) -> Result<()> {
+        self.rotate_if_needed()?;
+        let mut buf = Vec::new();
+        encode_wal_batch(batch, &mut buf)?;
+        self.file.write_all(&buf)?;
+        self.size += buf.len() as u64;
+        self.file.sync_data()?;
+        Ok(())
+    }
+}
+
+struct WalWriter {
+    dir: PathBuf,
+    file_id: u64,
+    file: File,
+    size: u64,
+}
+
 struct Stats {
     stale_entries: u64,
 }
@@ -52,6 +118,97 @@ struct Stats {
 struct Manifest {
     active: u64,
     segments: Vec<u64>,
+}
+
+const WAL_SEGMENT_PREFIX: &str = "wal";
+
+fn wal_segment_path(dir: &Path, file_id: u64) -> PathBuf {
+    dir.join(format!("{}-{:020}.log", WAL_SEGMENT_PREFIX, file_id))
+}
+
+fn create_wal_segment(dir: &Path, file_id: u64) -> Result<File> {
+    let path = wal_segment_path(dir, file_id);
+    Ok(OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .truncate(true)
+        .open(path)?)
+}
+
+fn list_wal_segments(dir: &Path) -> Result<Vec<u64>> {
+    let mut segments = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(rest) = name.strip_prefix(&format!("{}-", WAL_SEGMENT_PREFIX)) {
+            if let Some(id_part) = rest.strip_suffix(".log") {
+                if let Ok(id) = id_part.parse::<u64>() {
+                    segments.push(id);
+                }
+            }
+        }
+    }
+    segments.sort_unstable();
+    Ok(segments)
+}
+
+#[derive(Clone, Debug)]
+pub struct WalRecord {
+    pub lsn: u64,
+    pub op: u8,
+    pub page_id: u64,
+    pub slot_id: u16,
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WalBatch {
+    pub start_lsn: u64,
+    pub end_lsn: u64,
+    pub records: Vec<WalRecord>,
+}
+
+fn encode_wal_batch(batch: &WalBatch, out: &mut Vec<u8>) -> Result<()> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&batch.start_lsn.to_le_bytes());
+    buf.extend_from_slice(&batch.end_lsn.to_le_bytes());
+    let count = batch.records.len() as u32;
+    buf.extend_from_slice(&count.to_le_bytes());
+    for record in &batch.records {
+        buf.extend_from_slice(&record.lsn.to_le_bytes());
+        buf.push(record.op);
+        buf.extend_from_slice(&record.page_id.to_le_bytes());
+        buf.extend_from_slice(&record.slot_id.to_le_bytes());
+        let key_len = record.key.len() as u32;
+        let val_len = record.value.len() as u32;
+        buf.extend_from_slice(&key_len.to_le_bytes());
+        buf.extend_from_slice(&val_len.to_le_bytes());
+        buf.extend_from_slice(&record.key);
+        buf.extend_from_slice(&record.value);
+    }
+    let total_len = buf.len() as u32;
+    out.extend_from_slice(&total_len.to_le_bytes());
+    out.extend_from_slice(&buf);
+    Ok(())
+}
+
+fn start_wal_writer(dir: PathBuf) -> Result<Sender<WalBatch>> {
+    let (tx, rx) = mpsc::channel::<WalBatch>();
+    thread::spawn(move || wal_writer_loop(dir, rx));
+    Ok(tx)
+}
+
+fn wal_writer_loop(dir: PathBuf, rx: Receiver<WalBatch>) {
+    let mut writer = match WalWriter::open(dir) {
+        Ok(writer) => writer,
+        Err(_) => return,
+    };
+    for batch in rx {
+        let _ = writer.append_batch(&batch);
+    }
 }
 
 impl StorageNode {
@@ -127,6 +284,7 @@ impl StorageNode {
         }
         write_manifest(&dir, file_id, &segments)?;
 
+        let wal_sender = start_wal_writer(dir.clone())?;
         Ok(Self {
             dir,
             index: Mutex::new(index),
@@ -139,7 +297,21 @@ impl StorageNode {
             stats: Mutex::new(Stats { stale_entries }),
             compaction_segment_limit,
             compaction_stale_ratio,
+            wal_sender: Mutex::new(Some(wal_sender)),
         })
+    }
+
+    pub fn append_wal_batch(&self, batch: WalBatch) -> Result<()> {
+        let sender = self.wal_sender.lock().unwrap();
+        match sender.as_ref() {
+            Some(sender) => Ok(sender.send(batch).map_err(|_| {
+                crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal queue closed"))
+            })?),
+            None => Err(crate::Error::Io(Error::new(
+                ErrorKind::BrokenPipe,
+                "wal queue not initialized",
+            ))),
+        }
     }
 
     /// Get the number of keys in storage.
