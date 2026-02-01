@@ -4,8 +4,8 @@ use crate::{Error, Page, PageId, Result, Value, PAGE_SIZE};
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
-use futures::FutureExt;
-use std::collections::{HashMap, VecDeque};
+use futures::{future::try_join_all, FutureExt};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpStream;
@@ -430,12 +430,56 @@ impl BatchedComputeNode {
 
     pub async fn range(&self, start: &str, end: &str) -> Result<Vec<(String, Value)>> {
         let keys = self.tree.keys_in_range(&start.to_string(), &end.to_string());
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(value) = self.get(&key).await? {
-                out.push((key, value));
+        let mut missing_pages: HashSet<PageId> = HashSet::new();
+        let mut key_slots: Vec<(String, SlotRef)> = Vec::with_capacity(keys.len());
+
+        {
+            let index = self.index.read().unwrap();
+            let page_cache = self.page_cache.read().unwrap();
+            for key in keys.into_iter() {
+                if let Some(slot_ref) = index.get(&key).copied() {
+                    if let Some(page) = page_cache.get(&slot_ref.page_id) {
+                        if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
+                            out.push((key, value));
+                            continue;
+                        }
+                    }
+                    missing_pages.insert(slot_ref.page_id);
+                    key_slots.push((key, slot_ref));
+                }
             }
         }
+
+        if !missing_pages.is_empty() {
+            let fetches = missing_pages
+                .iter()
+                .map(|page_id| self.fetch_page(*page_id))
+                .collect::<Vec<_>>();
+            let pages = try_join_all(fetches).await?;
+            {
+                let mut cache = self.page_cache.write().unwrap();
+                for (page_id, page) in missing_pages.iter().copied().zip(pages.into_iter()) {
+                    if let Some(page) = page {
+                        cache.insert(page_id, page);
+                    }
+                }
+            }
+        }
+
+        let cache = self.page_cache.read().unwrap();
+        for (key, slot_ref) in key_slots.into_iter() {
+            if let Some(page) = cache.get(&slot_ref.page_id) {
+                if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
+                    out.push((key, value));
+                }
+            }
+        }
+
         Ok(out)
     }
 
@@ -836,12 +880,56 @@ impl ComputeNode {
 
     pub async fn range(&self, start: &str, end: &str) -> Result<Vec<(String, Value)>> {
         let keys = self.tree.keys_in_range(&start.to_string(), &end.to_string());
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(value) = self.get(&key).await? {
-                out.push((key, value));
+        let mut missing_pages: HashSet<PageId> = HashSet::new();
+        let mut key_slots: Vec<(String, SlotRef)> = Vec::with_capacity(keys.len());
+
+        {
+            let index = self.index.read().unwrap();
+            let page_cache = self.page_cache.read().unwrap();
+            for key in keys.into_iter() {
+                if let Some(slot_ref) = index.get(&key).copied() {
+                    if let Some(page) = page_cache.get(&slot_ref.page_id) {
+                        if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
+                            out.push((key, value));
+                            continue;
+                        }
+                    }
+                    missing_pages.insert(slot_ref.page_id);
+                    key_slots.push((key, slot_ref));
+                }
             }
         }
+
+        if !missing_pages.is_empty() {
+            let fetches = missing_pages
+                .iter()
+                .map(|page_id| self.fetch_page(*page_id))
+                .collect::<Vec<_>>();
+            let pages = try_join_all(fetches).await?;
+            {
+                let mut cache = self.page_cache.write().unwrap();
+                for (page_id, page) in missing_pages.iter().copied().zip(pages.into_iter()) {
+                    if let Some(page) = page {
+                        cache.insert(page_id, page);
+                    }
+                }
+            }
+        }
+
+        let cache = self.page_cache.read().unwrap();
+        for (key, slot_ref) in key_slots.into_iter() {
+            if let Some(page) = cache.get(&slot_ref.page_id) {
+                if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
+                    out.push((key, value));
+                }
+            }
+        }
+
         Ok(out)
     }
 
