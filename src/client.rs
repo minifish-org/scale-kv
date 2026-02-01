@@ -6,10 +6,11 @@ use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
 use futures::{future::try_join_all, FutureExt};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpStream;
 use tokio::task::LocalSet;
+use tokio::time::{sleep, Duration};
 use crate::node::WalBatch;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -21,6 +22,90 @@ const BUCKET_SIZE: usize = 1024;
 pub struct StorageClientPool {
     clients: Vec<StorageClient>,
     next: AtomicUsize,
+}
+
+const WAL_BATCH_BYTES: usize = 256 * 1024;
+
+struct WalSender {
+    client: Arc<StorageClient>,
+    buffer: Mutex<Vec<crate::node::WalRecord>>,
+    buffer_bytes: Mutex<usize>,
+    pending: Mutex<VecDeque<crate::node::WalRecord>>,
+    lsn: AtomicU64,
+}
+
+impl WalSender {
+    fn new(client: Arc<StorageClient>) -> Self {
+        Self {
+            client,
+            buffer: Mutex::new(Vec::new()),
+            buffer_bytes: Mutex::new(0),
+            pending: Mutex::new(VecDeque::new()),
+            lsn: AtomicU64::new(1),
+        }
+    }
+
+    fn next_lsn(&self) -> u64 {
+        self.lsn.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn enqueue(&self, record: crate::node::WalRecord) {
+        let mut pending = self.pending.lock().unwrap();
+        pending.push_back(record);
+    }
+
+    fn drain_pending(&self) -> Vec<crate::node::WalRecord> {
+        let mut pending = self.pending.lock().unwrap();
+        pending.drain(..).collect()
+    }
+
+    async fn run(self: Arc<Self>) {
+        loop {
+            let mut new_records = self.drain_pending();
+            if new_records.is_empty() {
+                sleep(Duration::from_millis(1)).await;
+                continue;
+            }
+
+            let mut buffer = self.buffer.lock().unwrap();
+            let mut buffer_bytes = self.buffer_bytes.lock().unwrap();
+            for record in new_records.drain(..) {
+                *buffer_bytes += record.key.len() + record.value.len() + 32;
+                buffer.push(record);
+                if *buffer_bytes >= WAL_BATCH_BYTES {
+                    let batch = self.take_batch(&mut buffer, &mut buffer_bytes);
+                    drop(buffer);
+                    drop(buffer_bytes);
+                    let _ = self.client.append_wal(&batch).await;
+                    buffer = self.buffer.lock().unwrap();
+                    buffer_bytes = self.buffer_bytes.lock().unwrap();
+                }
+            }
+
+            if *buffer_bytes >= WAL_BATCH_BYTES {
+                let batch = self.take_batch(&mut buffer, &mut buffer_bytes);
+                drop(buffer);
+                drop(buffer_bytes);
+                let _ = self.client.append_wal(&batch).await;
+            }
+        }
+    }
+
+    fn take_batch(
+        &self,
+        buffer: &mut Vec<crate::node::WalRecord>,
+        buffer_bytes: &mut usize,
+    ) -> crate::node::WalBatch {
+        let records = std::mem::take(buffer);
+        *buffer_bytes = 0;
+        let start_lsn = records.first().map(|r| r.lsn).unwrap_or(0);
+        let end_lsn = records.last().map(|r| r.lsn).unwrap_or(0);
+        crate::node::WalBatch {
+            start_lsn,
+            end_lsn,
+            records,
+        }
+    }
 }
 
 impl StorageClientPool {
@@ -209,6 +294,7 @@ pub struct BatchedComputeNode {
     cache_misses: AtomicUsize,
     operations: AtomicUsize,
     storage: Option<Arc<BatchedStorageClientPool>>,
+    wal_sender: Option<Arc<WalSender>>,
 }
 
 impl BatchedComputeNode {
@@ -222,11 +308,18 @@ impl BatchedComputeNode {
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             storage: None,
+            wal_sender: None,
         }
     }
 
     pub async fn with_storage(addr: &str, window_size: usize, local: &LocalSet) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect(addr, local).await?);
         let storage = Some(Arc::new(BatchedStorageClientPool::connect(addr, window_size, local).await?));
+        let wal_sender = Arc::new(WalSender::new(client));
+        let wal_sender_clone = wal_sender.clone();
+        tokio::task::spawn_local(async move {
+            wal_sender_clone.run().await;
+        });
         Ok(Self {
             tree: BPlusTree::new(),
             index: RwLock::new(HashMap::new()),
@@ -236,6 +329,7 @@ impl BatchedComputeNode {
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             storage,
+            wal_sender: Some(wal_sender),
         })
     }
 
@@ -284,6 +378,28 @@ impl BatchedComputeNode {
         let key = key.as_ref().to_string();
         let payload_len = payload_len(key.as_bytes(), value)?;
         let required = payload_len + SLOT_ENTRY_SIZE;
+        if let Some(wal_sender) = &self.wal_sender {
+            let lsn = wal_sender.next_lsn();
+            wal_sender.enqueue(crate::node::WalRecord {
+                lsn,
+                op: 1,
+                page_id: 0,
+                slot_id: 0,
+                key: key.as_bytes().to_vec(),
+                value: value.to_vec(),
+            });
+        }
+        if let Some(wal_sender) = &self.wal_sender {
+            let lsn = wal_sender.next_lsn();
+            wal_sender.enqueue(crate::node::WalRecord {
+                lsn,
+                op: 1,
+                page_id: 0,
+                slot_id: 0,
+                key: key.as_bytes().to_vec(),
+                value: value.to_vec(),
+            });
+        }
 
         let mut old_slot = None;
         {
@@ -360,6 +476,28 @@ impl BatchedComputeNode {
     pub async fn delete(&self, key: impl AsRef<str>) -> Result<bool> {
         self.operations.fetch_add(1, Ordering::Relaxed);
         let key = key.as_ref().to_string();
+        if let Some(wal_sender) = &self.wal_sender {
+            let lsn = wal_sender.next_lsn();
+            wal_sender.enqueue(crate::node::WalRecord {
+                lsn,
+                op: 2,
+                page_id: 0,
+                slot_id: 0,
+                key: key.as_bytes().to_vec(),
+                value: Vec::new(),
+            });
+        }
+        if let Some(wal_sender) = &self.wal_sender {
+            let lsn = wal_sender.next_lsn();
+            wal_sender.enqueue(crate::node::WalRecord {
+                lsn,
+                op: 2,
+                page_id: 0,
+                slot_id: 0,
+                key: key.as_bytes().to_vec(),
+                value: Vec::new(),
+            });
+        }
         let slot_ref = {
             let mut index = self.index.write().unwrap();
             index.remove(&key)
@@ -488,6 +626,34 @@ impl BatchedComputeNode {
     pub async fn put_multi(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
         if items.is_empty() {
             return Ok(());
+        }
+
+        if let Some(wal_sender) = &self.wal_sender {
+            for (key, value) in items {
+                let lsn = wal_sender.next_lsn();
+                wal_sender.enqueue(crate::node::WalRecord {
+                    lsn,
+                    op: 1,
+                    page_id: 0,
+                    slot_id: 0,
+                    key: key.as_bytes().to_vec(),
+                    value: value.clone(),
+                });
+            }
+        }
+
+        if let Some(wal_sender) = &self.wal_sender {
+            for (key, value) in items {
+                let lsn = wal_sender.next_lsn();
+                wal_sender.enqueue(crate::node::WalRecord {
+                    lsn,
+                    op: 1,
+                    page_id: 0,
+                    slot_id: 0,
+                    key: key.as_bytes().to_vec(),
+                    value: value.clone(),
+                });
+            }
         }
 
         self.operations
@@ -746,6 +912,7 @@ pub struct ComputeNode {
     operations: AtomicUsize,
     storage: Option<StorageClientPool>,
     batch_sender: Option<Arc<BatchSender>>,
+    wal_sender: Option<Arc<WalSender>>,
 }
 
 impl ComputeNode {
@@ -760,11 +927,18 @@ impl ComputeNode {
             operations: AtomicUsize::new(0),
             storage: None,
             batch_sender: None,
+            wal_sender: None,
         }
     }
 
     pub async fn with_storage(addr: &str, local: &LocalSet) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect(addr, local).await?);
         let storage = StorageClientPool::connect(addr, 1, local).await?;
+        let wal_sender = Arc::new(WalSender::new(client));
+        let wal_sender_clone = wal_sender.clone();
+        tokio::task::spawn_local(async move {
+            wal_sender_clone.run().await;
+        });
         Ok(Self {
             tree: BPlusTree::new(),
             index: RwLock::new(HashMap::new()),
@@ -775,11 +949,18 @@ impl ComputeNode {
             operations: AtomicUsize::new(0),
             storage: Some(storage),
             batch_sender: None,
+            wal_sender: Some(wal_sender),
         })
     }
 
     pub async fn with_storage_workers(addr: &str, workers: usize, local: &LocalSet) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect(addr, local).await?);
         let storage = StorageClientPool::connect(addr, workers, local).await?;
+        let wal_sender = Arc::new(WalSender::new(client));
+        let wal_sender_clone = wal_sender.clone();
+        tokio::task::spawn_local(async move {
+            wal_sender_clone.run().await;
+        });
         Ok(Self {
             tree: BPlusTree::new(),
             index: RwLock::new(HashMap::new()),
@@ -790,6 +971,7 @@ impl ComputeNode {
             operations: AtomicUsize::new(0),
             storage: Some(storage),
             batch_sender: None,
+            wal_sender: Some(wal_sender),
         })
     }
 
@@ -799,7 +981,12 @@ impl ComputeNode {
 
     pub async fn with_storage_batched(addr: &str, window_size: usize, local: &LocalSet) -> Result<Self> {
         let client = Arc::new(StorageClient::connect(addr, local).await?);
-        let batch_sender = Arc::new(BatchSender::new(client, window_size));
+        let batch_sender = Arc::new(BatchSender::new(client.clone(), window_size));
+        let wal_sender = Arc::new(WalSender::new(client));
+        let wal_sender_clone = wal_sender.clone();
+        tokio::task::spawn_local(async move {
+            wal_sender_clone.run().await;
+        });
         Ok(Self {
             tree: BPlusTree::new(),
             index: RwLock::new(HashMap::new()),
@@ -810,6 +997,7 @@ impl ComputeNode {
             operations: AtomicUsize::new(0),
             storage: None,
             batch_sender: Some(batch_sender),
+            wal_sender: Some(wal_sender),
         })
     }
 
