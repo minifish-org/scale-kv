@@ -1,6 +1,6 @@
 use std::sync::RwLock;
 
-const MAX_KEYS: usize = 8;
+const MAX_KEYS: usize = 256;
 
 pub struct BPlusTree<K: Ord + Clone> {
     root: RwLock<Node<K>>,
