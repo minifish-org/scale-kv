@@ -48,7 +48,7 @@ fn setup(rt: &tokio::runtime::Runtime, local: &LocalSet, workers: usize) -> Arc<
     local.block_on(rt, async {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let server = StorageServer::start(addr).await.unwrap();
-        let compute = ComputeNode::with_storage_workers(&server.addr().to_string(), workers)
+        let compute = ComputeNode::with_storage_workers(&server.addr().to_string(), workers, local)
             .await
             .unwrap();
         let value = vec![0u8; VALUE_SIZE];

@@ -32,7 +32,7 @@ async fn test_network_operations() {
                 let value1 = vec![b'a'; PAGE_SIZE / 4];
                 let value2 = vec![b'b'; PAGE_SIZE / 4];
 
-            let compute = ComputeNode::with_storage(&server.addr().to_string())
+            let compute = ComputeNode::with_storage(&server.addr().to_string(), &local)
                 .await
                 .unwrap();
 
@@ -71,10 +71,10 @@ async fn test_multiple_clients() {
                 let value1 = vec![b'1'; PAGE_SIZE / 4];
                 let value2 = vec![b'2'; PAGE_SIZE / 4];
 
-            let compute1 = ComputeNode::with_storage(&server.addr().to_string())
+            let compute1 = ComputeNode::with_storage(&server.addr().to_string(), &local)
                 .await
                 .unwrap();
-            let compute2 = ComputeNode::with_storage(&server.addr().to_string())
+            let compute2 = ComputeNode::with_storage(&server.addr().to_string(), &local)
                 .await
                 .unwrap();
 
@@ -109,9 +109,9 @@ async fn test_streaming() {
                 let server = StorageServer::start_with_dir(addr, dir.clone())
                     .await
                     .unwrap();
-                let compute = ComputeNode::with_storage(&server.addr().to_string())
-                    .await
-                    .unwrap();
+            let compute = ComputeNode::with_storage(&server.addr().to_string(), &local)
+                .await
+                .unwrap();
                 let v1 = vec![b'1'; PAGE_SIZE / 4];
                 let v2 = vec![b'2'; PAGE_SIZE / 4];
 
@@ -142,9 +142,9 @@ async fn test_batch_put() {
                 let server = StorageServer::start_with_dir(addr, dir.clone())
                     .await
                     .unwrap();
-                let compute = ComputeNode::with_storage(&server.addr().to_string())
-                    .await
-                    .unwrap();
+            let compute = ComputeNode::with_storage(&server.addr().to_string(), &local)
+                .await
+                .unwrap();
                 let v1 = vec![b'1'; PAGE_SIZE / 4];
                 let v2 = vec![b'2'; PAGE_SIZE / 4];
 

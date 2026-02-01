@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpStream;
+use tokio::task::LocalSet;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 const PAGE_HEADER_SIZE: usize = 6;
@@ -22,11 +23,11 @@ pub struct StorageClientPool {
 }
 
 impl StorageClientPool {
-    pub async fn connect(addr: &str, size: usize) -> Result<Self> {
+    pub async fn connect(addr: &str, size: usize, local: &LocalSet) -> Result<Self> {
         let size = size.max(1);
         let mut clients = Vec::with_capacity(size);
         for _ in 0..size {
-            clients.push(StorageClient::connect(addr).await?);
+            clients.push(StorageClient::connect(addr, local).await?);
         }
         Ok(Self {
             clients,
@@ -162,8 +163,8 @@ pub struct BatchedStorageClientPool {
 
 impl BatchedStorageClientPool {
     /// Connect to a storage server with batching.
-    pub async fn connect(addr: &str, window_size: usize) -> Result<Self> {
-        let client = Arc::new(StorageClient::connect(addr).await?);
+    pub async fn connect(addr: &str, window_size: usize, local: &LocalSet) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect(addr, local).await?);
         let sender = Arc::new(BatchSender::new(client, window_size));
         Ok(Self { sender })
     }
@@ -223,8 +224,8 @@ impl BatchedComputeNode {
         }
     }
 
-    pub async fn with_storage(addr: &str, window_size: usize) -> Result<Self> {
-        let storage = Some(Arc::new(BatchedStorageClientPool::connect(addr, window_size).await?));
+    pub async fn with_storage(addr: &str, window_size: usize, local: &LocalSet) -> Result<Self> {
+        let storage = Some(Arc::new(BatchedStorageClientPool::connect(addr, window_size, local).await?));
         Ok(Self {
             tree: BPlusTree::new(),
             index: RwLock::new(HashMap::new()),
@@ -605,8 +606,8 @@ impl ComputeNode {
         }
     }
 
-    pub async fn with_storage(addr: &str) -> Result<Self> {
-        let storage = StorageClientPool::connect(addr, 1).await?;
+    pub async fn with_storage(addr: &str, local: &LocalSet) -> Result<Self> {
+        let storage = StorageClientPool::connect(addr, 1, local).await?;
         Ok(Self {
             tree: BPlusTree::new(),
             index: RwLock::new(HashMap::new()),
@@ -620,8 +621,8 @@ impl ComputeNode {
         })
     }
 
-    pub async fn with_storage_workers(addr: &str, workers: usize) -> Result<Self> {
-        let storage = StorageClientPool::connect(addr, workers).await?;
+    pub async fn with_storage_workers(addr: &str, workers: usize, local: &LocalSet) -> Result<Self> {
+        let storage = StorageClientPool::connect(addr, workers, local).await?;
         Ok(Self {
             tree: BPlusTree::new(),
             index: RwLock::new(HashMap::new()),
@@ -635,12 +636,12 @@ impl ComputeNode {
         })
     }
 
-    pub async fn with_storage_pool(addr: &str, size: usize) -> Result<Self> {
-        Self::with_storage_workers(addr, size).await
+    pub async fn with_storage_pool(addr: &str, size: usize, local: &LocalSet) -> Result<Self> {
+        Self::with_storage_workers(addr, size, local).await
     }
 
-    pub async fn with_storage_batched(addr: &str, window_size: usize) -> Result<Self> {
-        let client = Arc::new(StorageClient::connect(addr).await?);
+    pub async fn with_storage_batched(addr: &str, window_size: usize, local: &LocalSet) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect(addr, local).await?);
         let batch_sender = Arc::new(BatchSender::new(client, window_size));
         Ok(Self {
             tree: BPlusTree::new(),
@@ -970,7 +971,7 @@ pub struct StorageClient {
 }
 
 impl StorageClient {
-    pub async fn connect(addr: &str) -> Result<Self> {
+    pub async fn connect(addr: &str, local: &LocalSet) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
         let (reader, writer) = stream.into_split();
         let reader = reader.compat();
@@ -979,7 +980,7 @@ impl StorageClient {
         let network = VatNetwork::new(reader, writer, Side::Client, Default::default());
         let mut rpc_system = RpcSystem::new(Box::new(network), None);
         let client: storage::Client = rpc_system.bootstrap(Side::Server);
-        let task = tokio::task::spawn_local(rpc_system.map(|_| ()));
+        let task = local.spawn_local(rpc_system.map(|_| ()));
 
         Ok(Self {
             client,
