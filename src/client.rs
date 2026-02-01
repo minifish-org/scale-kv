@@ -7,7 +7,7 @@ use capnp_rpc::RpcSystem;
 use futures::FutureExt;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpStream;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -61,7 +61,170 @@ impl StorageClientPool {
 
 }
 
-pub struct ComputeNode {
+/// Sliding window batch sender for RPC requests.
+/// Reduces RPC overhead by allowing in-flight requests and queuing when window is full.
+///
+/// The sender maintains a window of in-flight requests. When the window is full,
+/// new requests are queued until a slot becomes available. This allows batching
+/// of RPC calls without explicitly waiting for batch size thresholds.
+///
+/// # How it works
+/// - Window size = N means up to N requests can be in-flight simultaneously
+/// - When window is full, requests wait in a queue
+/// - When any request completes, a waiting request is sent
+/// - Result: lower latency (≈1 RTT) with high throughput
+///
+/// # Usage
+/// ```ignore
+/// // Create with window size of 16
+/// let sender = Arc::new(BatchSender::new(client, 16));
+///
+/// // Send requests - they are automatically batched via sliding window
+/// for i in 0..100 {
+///     let s = sender.clone();
+///     tokio::spawn(async move {
+///         s.put(i, &data).await;
+///     });
+/// }
+/// ```
+pub struct BatchSender {
+    client: Arc<StorageClient>,
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: usize,
+    pending: Arc<Mutex<VecDeque<(PageId, Page)>>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl BatchSender {
+    /// Create a new batch sender with the given window size.
+    pub fn new(client: Arc<StorageClient>, max_in_flight: usize) -> Self {
+        Self {
+            client,
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: max_in_flight.max(1),
+            pending: Arc::new(Mutex::new(VecDeque::new())),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Send a put request with sliding window batching.
+    /// If the window is full, the request will be queued until a slot is available.
+    pub async fn put(&self, page_id: PageId, page: &[u8]) -> Result<()> {
+        let slot_available = self.in_flight.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| {
+                if current < self.max_in_flight {
+                    Some(current + 1)
+                } else {
+                    None
+                }
+            },
+        ).is_ok();
+
+        if !slot_available {
+            // Window is full, queue the request
+            let mut pending = self.pending.lock().unwrap();
+            pending.push_back((page_id, page.to_vec()));
+
+            // Wait for a slot to become available
+            loop {
+                // Check again after acquiring the lock
+                let in_flight = self.in_flight.load(Ordering::Acquire);
+                if in_flight < self.max_in_flight {
+                    // Slot available, take from pending instead
+                    if let Some((queued_id, queued_page)) = pending.pop_front() {
+                        drop(pending);
+                        return self.send_and_complete(queued_id, &queued_page).await;
+                    }
+                    // No pending, proceed with original request
+                    drop(pending);
+                    self.in_flight.fetch_add(1, Ordering::Release);
+                    return self.send_and_complete(page_id, page).await;
+                }
+
+                // Wait for notification
+                let notify = self.notify.clone();
+                drop(pending);
+                notify.notified().await;
+                pending = self.pending.lock().unwrap();
+            }
+        }
+
+        // Window has space, send directly
+        self.send_and_complete(page_id, page).await
+    }
+
+    async fn send_and_complete(&self, page_id: PageId, page: &[u8]) -> Result<()> {
+        let result = self.client.put(page_id, page).await;
+
+        // Release the slot
+        let remaining = self.in_flight.fetch_sub(1, Ordering::Release);
+
+        // If there are pending requests and we were the one who freed a slot,
+        // notify waiters (but only notify once)
+        if remaining == self.max_in_flight {
+            self.notify.notify_one();
+        }
+
+        result
+    }
+
+    /// Get the current number of in-flight requests.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Get the number of pending requests waiting for a slot.
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+}
+
+/// Batched storage pool using sliding window.
+pub struct BatchedStorageClientPool {
+    sender: Arc<BatchSender>,
+}
+
+impl BatchedStorageClientPool {
+    /// Connect to a storage server with batching.
+    pub async fn connect(addr: &str, window_size: usize) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect(addr).await?);
+        let sender = Arc::new(BatchSender::new(client, window_size));
+        Ok(Self { sender })
+    }
+
+    pub async fn get(&self, page_id: PageId) -> Result<Option<Page>> {
+        self.sender.client.get(page_id).await
+    }
+
+    pub async fn put(&self, page_id: PageId, page: &[u8]) -> Result<()> {
+        self.sender.put(page_id, page).await
+    }
+
+    pub async fn delete(&self, page_id: PageId) -> Result<bool> {
+        self.sender.client.delete(page_id).await
+    }
+
+    pub async fn batch_put(&self, items: &[(PageId, Page)]) -> Result<()> {
+        // For batch_put, we send directly without batching
+        // This is useful for large bulk operations
+        self.sender.client.batch_put(items).await
+    }
+
+    /// Get the number of in-flight requests.
+    pub fn in_flight(&self) -> usize {
+        self.sender.in_flight()
+    }
+
+    /// Get the number of pending requests.
+    pub fn pending(&self) -> usize {
+        self.sender.pending_count()
+    }
+}
+
+/// Compute node that uses batched storage for better RPC performance.
+pub struct BatchedComputeNode {
     tree: BPlusTree<String>,
     index: RwLock<HashMap<String, SlotRef>>,
     page_cache: RwLock<HashMap<PageId, Page>>,
@@ -69,7 +232,277 @@ pub struct ComputeNode {
     cache_hits: AtomicUsize,
     cache_misses: AtomicUsize,
     operations: AtomicUsize,
-    storage: Option<StorageClientPool>,
+    storage: Option<Arc<BatchedStorageClientPool>>,
+}
+
+impl BatchedComputeNode {
+    pub fn new() -> Self {
+        Self {
+            tree: BPlusTree::new(),
+            index: RwLock::new(HashMap::new()),
+            page_cache: RwLock::new(HashMap::new()),
+            fsm: Mutex::new(FreeSpaceMap::new()),
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            storage: None,
+        }
+    }
+
+    pub async fn with_storage(addr: &str, window_size: usize) -> Result<Self> {
+        let storage = Some(Arc::new(BatchedStorageClientPool::connect(addr, window_size).await?));
+        Ok(Self {
+            tree: BPlusTree::new(),
+            index: RwLock::new(HashMap::new()),
+            page_cache: RwLock::new(HashMap::new()),
+            fsm: Mutex::new(FreeSpaceMap::new()),
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            storage,
+        })
+    }
+
+    pub async fn get(&self, key: impl AsRef<str>) -> Result<Option<Value>> {
+        self.operations.fetch_add(1, Ordering::Relaxed);
+        let key = key.as_ref().to_string();
+        if !self.tree.contains(&key) {
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+
+        let slot_ref = {
+            let index = self.index.read().unwrap();
+            match index.get(&key) {
+                Some(slot_ref) => *slot_ref,
+                None => {
+                    self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
+            }
+        };
+
+        if let Some(page) = self.page_cache.read().unwrap().get(&slot_ref.page_id) {
+            if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(value));
+            }
+        }
+
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        let storage = match &self.storage {
+            Some(storage) => storage,
+            None => return Ok(None),
+        };
+
+        let page = storage.get(slot_ref.page_id).await?;
+        if let Some(page) = page {
+            let value = read_value(&page, slot_ref.slot_id, key.as_bytes());
+            self.page_cache.write().unwrap().insert(slot_ref.page_id, page);
+            return Ok(value);
+        }
+
+        Ok(None)
+    }
+
+    pub async fn put(&self, key: impl AsRef<str>, value: &[u8]) -> Result<()> {
+        self.operations.fetch_add(1, Ordering::Relaxed);
+        let key = key.as_ref().to_string();
+        let payload_len = payload_len(key.as_bytes(), value)?;
+        let required = payload_len + SLOT_ENTRY_SIZE;
+
+        let mut old_slot = None;
+        {
+            let mut index = self.index.write().unwrap();
+            if let Some(slot_ref) = index.remove(&key) {
+                old_slot = Some(slot_ref);
+            }
+        }
+        if let Some(slot_ref) = old_slot {
+            let mut page = if let Some(page) = self.page_cache.read().unwrap().get(&slot_ref.page_id) {
+                Some(page.clone())
+            } else {
+                self.fetch_page(slot_ref.page_id).await?
+            };
+            if let Some(mut page) = page.take() {
+                clear_slot(&mut page, slot_ref.slot_id);
+                let free = page_free_space(&page);
+                self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
+                self.page_cache.write().unwrap().insert(slot_ref.page_id, page.clone());
+                if let Some(storage) = &self.storage {
+                    storage.put(slot_ref.page_id, &page).await?;
+                }
+            }
+            self.tree.remove(&key);
+        }
+
+        let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
+        let mut page = if let Some(page) = self.page_cache.read().unwrap().get(&page_id) {
+            page.clone()
+        } else if is_new {
+            new_page()
+        } else {
+            self.fetch_page(page_id).await?.unwrap_or_else(new_page)
+        };
+
+        let mut slot_id = insert_record(&mut page, key.as_bytes(), value)?;
+        if slot_id.is_none() {
+            let (fresh_id, _) = self.fsm.lock().unwrap().allocate(PAGE_SIZE);
+            page_id = fresh_id;
+            page = new_page();
+            slot_id = insert_record(&mut page, key.as_bytes(), value)?;
+        }
+
+        let slot_id = slot_id.ok_or_else(|| {
+            Error::InvalidValueSize(value.len(), max_value_size_for_key(key.as_bytes()))
+        })?;
+
+        let free = page_free_space(&page);
+        self.fsm.lock().unwrap().update_page(page_id, free);
+        self.page_cache.write().unwrap().insert(page_id, page.clone());
+        self.index
+            .write()
+            .unwrap()
+            .insert(key.clone(), SlotRef { page_id, slot_id });
+        self.tree.insert(key);
+
+        if let Some(storage) = &self.storage {
+            storage.put(page_id, &page).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn delete(&self, key: impl AsRef<str>) -> Result<bool> {
+        self.operations.fetch_add(1, Ordering::Relaxed);
+        let key = key.as_ref().to_string();
+        let slot_ref = {
+            let mut index = self.index.write().unwrap();
+            index.remove(&key)
+        };
+
+        if let Some(slot_ref) = slot_ref {
+            let mut page = if let Some(page) = self.page_cache.read().unwrap().get(&slot_ref.page_id)
+            {
+                page.clone()
+            } else {
+                self.fetch_page(slot_ref.page_id)
+                    .await?
+                    .unwrap_or_else(new_page)
+            };
+            clear_slot(&mut page, slot_ref.slot_id);
+            let free = page_free_space(&page);
+            self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
+            self.page_cache.write().unwrap().insert(slot_ref.page_id, page.clone());
+            if let Some(storage) = &self.storage {
+                storage.put(slot_ref.page_id, &page).await?;
+            }
+            self.tree.remove(&key);
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    pub async fn batch_put(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
+        self.put_multi(items).await
+    }
+
+    pub fn cache_hits(&self) -> usize {
+        self.cache_hits.load(Ordering::Relaxed)
+    }
+
+    pub fn cache_misses(&self) -> usize {
+        self.cache_misses.load(Ordering::Relaxed)
+    }
+
+    pub fn operations(&self) -> usize {
+        self.operations.load(Ordering::Relaxed)
+    }
+
+    pub fn cache_hit_rate(&self) -> f64 {
+        let hits = self.cache_hits.load(Ordering::Relaxed);
+        let misses = self.cache_misses.load(Ordering::Relaxed);
+        let total = hits + misses;
+        if total == 0 {
+            0.0
+        } else {
+            hits as f64 / total as f64
+        }
+    }
+
+    pub fn cache_size(&self) -> usize {
+        self.page_cache.read().unwrap().len()
+    }
+
+    pub fn reset_metrics(&self) {
+        self.cache_hits.store(0, Ordering::Relaxed);
+        self.cache_misses.store(0, Ordering::Relaxed);
+        self.operations.store(0, Ordering::Relaxed);
+    }
+
+    pub async fn get_multi(&self, keys: &[String]) -> Result<Vec<Option<Value>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(self.get(key).await?);
+        }
+        Ok(out)
+    }
+
+    pub async fn put_multi(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
+        for (key, value) in items {
+            self.put(key, value).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn range(&self, start: &str, end: &str) -> Result<Vec<(String, Value)>> {
+        let keys = self.tree.keys_in_range(&start.to_string(), &end.to_string());
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = self.get(&key).await? {
+                out.push((key, value));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn stats(&self) -> ComputeStats {
+        let cache_hits = self.cache_hits();
+        let cache_misses = self.cache_misses();
+        let operations = self.operations();
+        let cache_hit_rate = self.cache_hit_rate();
+        ComputeStats {
+            keys: self.tree.len(),
+            pages: self.page_cache.read().unwrap().len(),
+            cache_hits,
+            cache_misses,
+            operations,
+            cache_hit_rate,
+        }
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.storage.as_ref().map(|s| s.in_flight()).unwrap_or(0)
+    }
+
+    pub fn pending(&self) -> usize {
+        self.storage.as_ref().map(|s| s.pending()).unwrap_or(0)
+    }
+
+    async fn fetch_page(&self, page_id: PageId) -> Result<Option<Page>> {
+        let storage = match &self.storage {
+            Some(storage) => storage,
+            None => return Ok(None),
+        };
+        storage.get(page_id).await
+    }
+}
+
+impl Default for BatchedComputeNode {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct ComputeStats {
@@ -127,6 +560,17 @@ impl FreeSpaceMap {
         let idx = bucket_index(free);
         self.buckets[idx].push_back(page_id);
     }
+}
+
+pub struct ComputeNode {
+    tree: BPlusTree<String>,
+    index: RwLock<HashMap<String, SlotRef>>,
+    page_cache: RwLock<HashMap<PageId, Page>>,
+    fsm: Mutex<FreeSpaceMap>,
+    cache_hits: AtomicUsize,
+    cache_misses: AtomicUsize,
+    operations: AtomicUsize,
+    storage: Option<StorageClientPool>,
 }
 
 impl ComputeNode {

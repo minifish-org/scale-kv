@@ -12,7 +12,7 @@ pub mod node;
 pub use node::StorageNode;
 
 pub mod client;
-pub use client::{ComputeNode, StorageClient};
+pub use client::{BatchSender, BatchedComputeNode, BatchedStorageClientPool, ComputeNode, StorageClient};
 
 pub mod server;
 pub use server::StorageServer;
