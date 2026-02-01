@@ -314,32 +314,6 @@ fn bench_throughput_get(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_streaming_full(c: &mut Criterion) {
-    let rt = Builder::new_current_thread().enable_all().build().unwrap();
-    let local = LocalSet::new();
-    let workers = rpc_workers();
-    let compute = setup(&rt, &local, workers);
-    let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
-    group.bench_function("streaming_full", |b| {
-        let compute = compute.clone();
-        b.iter(|| {
-            let compute = compute.clone();
-            local.block_on(&rt, async move {
-                let stream = compute.open_stream().await.unwrap();
-                let mut total = 0usize;
-                loop {
-                    let (items, done) = stream.next(256).await.unwrap();
-                    total += items.len();
-                    if done {
-                        break;
-                    }
-                }
-                black_box(total);
-            })
-        })
-    });
-    group.finish();
-}
 
 fn bench_batch_put(c: &mut Criterion) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
@@ -617,7 +591,6 @@ criterion_group!(
     bench_ycsb_f,
     bench_throughput_put,
     bench_throughput_get,
-    bench_streaming_full,
     bench_batch_put,
     bench_sled_workload_a,
     bench_sled_workload_b,

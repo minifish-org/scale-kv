@@ -68,11 +68,6 @@ impl StorageNodeReplay {
         self.node.get(page_id)
     }
 
-    fn should_apply(&self, lsn: u64) -> bool {
-        let last_applied = self.last_applied_lsn.lock().unwrap();
-        lsn > *last_applied
-    }
-
     fn last_applied(&self) -> u64 {
         *self.last_applied_lsn.lock().unwrap()
     }

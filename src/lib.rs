@@ -6,13 +6,15 @@
 pub mod common;
 pub use common::*;
 
-mod bptree;
+mod page_bptree;
 
 pub mod node;
 pub use node::StorageNode;
 
 pub mod client;
 pub use client::{BatchSender, BatchedComputeNode, BatchedStorageClientPool, ComputeNode, StorageClient};
+
+pub use page_bptree::{PageBPlusTree, SlotRef as PageSlotRef};
 
 pub mod server;
 pub use server::StorageServer;

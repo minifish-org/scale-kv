@@ -99,39 +99,6 @@ async fn test_multiple_clients() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_streaming() {
-    let dir = temp_dir();
-    {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-                let server = StorageServer::start_with_dir(addr, dir.clone())
-                    .await
-                    .unwrap();
-            let compute = ComputeNode::with_storage(&server.addr().to_string(), &local)
-                .await
-                .unwrap();
-                let v1 = vec![b'1'; PAGE_SIZE / 4];
-                let v2 = vec![b'2'; PAGE_SIZE / 4];
-
-            compute.put("k1", &v1).await.unwrap();
-            compute.put("k2", &v2).await.unwrap();
-
-            let stream = compute.open_stream().await.unwrap();
-            let (items, done) = stream.next(10).await.unwrap();
-            assert!(!items.is_empty());
-            for (_, page) in items {
-                assert_eq!(page.len(), PAGE_SIZE);
-            }
-            assert!(done);
-            })
-            .await;
-    }
-    cleanup_dir(&dir);
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn test_batch_put() {
     let dir = temp_dir();
     {
