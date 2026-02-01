@@ -91,11 +91,13 @@ flowchart TD
     G --> H[unblock writers]
 ```
 
-#### 5.3.3 Storage 语义（最小要求）
-- `batchPut` 成功 = **日志已追加**（不要求 fsync）
+#### 5.3.3 Storage 语义（更新：持久 WAL + 早 ACK）
+- `batchPut` 成功 = **已入队（收到即 ACK）**，不代表 durability
+- WAL **顺序 append + segment**（A+B 方案）
+- WAL **落盘后后台 replay**，不阻塞写入吞吐
 - compaction 保留最新值，旧版本清理
 
-#### 5.3.4 可选方案：KV + page/slot redo（让 page 层真正有用）
+#### 5.3.4 KV + page/slot redo（当前选择：KV redo）
 - 网络传输：**用户 KV + page_id + slot_id + lsn**
 - Storage：按 lsn **回放到 page**，再以 page 为单位写入 Bitcask
 - 作用：网络只发增量，但 Storage 仍维护与 Compute 一致的 page
@@ -116,7 +118,14 @@ record {
 
 关键约束：
 - **page_id/slot_id 由 Compute 单写者生成**（必须全局唯一/有序）
-- Storage 按 **lsn 顺序重放**，需要幂等处理（避免重试重复 apply）
+- Storage 按 **lsn 顺序重放**，需要幂等处理（`lsn > last_applied` 才 apply）
+
+#### 5.3.5 WAL 落盘与 replay（A+B 方案）
+- **WAL 落盘**：Storage 端顺序 append + segment（如 64MB）
+- **ACK 语义**：Storage 收到即 ACK（队列接收成功）
+- **Replay 线程**：后台读取 WAL，按 `page_id` 聚合再写 Bitcask
+- **聚合阈值**：每 page **8KB** 写回触发（不使用时间触发）
+- **LSN**：严格递增，`lsn > last_applied` 才 apply
 
 #### 5.3.5 滑动窗口攒批方案（2026-02-01）
 - **目标**：降低平均延迟，避免 Group Commit 的"等待攒批"问题
