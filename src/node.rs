@@ -25,6 +25,8 @@ const COMPACTION_SEGMENT_LIMIT_ENV: &str = "SCALE_KV_COMPACTION_SEGMENTS";
 const COMPACTION_STALE_RATIO_ENV: &str = "SCALE_KV_COMPACTION_RATIO";
 const MANIFEST_FILE: &str = "manifest";
 const MANIFEST_TMP_FILE: &str = "manifest.tmp";
+const WAL_STATE_FILE: &str = "wal_state";
+const WAL_STATE_TMP_FILE: &str = "wal_state.tmp";
 
 /// Storage node - Bitcask style append-only log + in-memory index.
 pub struct StorageNode {
@@ -46,11 +48,15 @@ struct ReplayBuffer {
 
 struct StorageNodeReplay {
     node: Arc<StorageNode>,
+    last_applied_lsn: Mutex<u64>,
 }
 
 impl StorageNodeReplay {
-    fn new(node: Arc<StorageNode>) -> Self {
-        Self { node }
+    fn new(node: Arc<StorageNode>, last_applied_lsn: u64) -> Self {
+        Self {
+            node,
+            last_applied_lsn: Mutex::new(last_applied_lsn),
+        }
     }
 
     fn write_page(&self, page_id: PageId, page: &[u8]) -> Result<()> {
@@ -60,6 +66,19 @@ impl StorageNodeReplay {
 
     fn read_page(&self, page_id: PageId) -> Option<Page> {
         self.node.get(page_id)
+    }
+
+    fn should_apply(&self, lsn: u64) -> bool {
+        let last_applied = self.last_applied_lsn.lock().unwrap();
+        lsn > *last_applied
+    }
+
+    fn update_last_applied(&self, lsn: u64) {
+        let mut last_applied = self.last_applied_lsn.lock().unwrap();
+        if lsn > *last_applied {
+            *last_applied = lsn;
+            let _ = write_wal_state(&self.node.dir, *last_applied);
+        }
     }
 }
 
@@ -209,6 +228,10 @@ struct Manifest {
     segments: Vec<u64>,
 }
 
+struct WalState {
+    last_applied_lsn: u64,
+}
+
 const WAL_SEGMENT_PREFIX: &str = "wal";
 
 fn wal_segment_path(dir: &Path, file_id: u64) -> PathBuf {
@@ -307,6 +330,9 @@ fn wal_replay_loop(node: StorageNodeReplay, rx: Receiver<WalBatch>) {
     let mut buffers: HashMap<PageId, ReplayBuffer> = HashMap::new();
     for batch in rx {
         for record in batch.records.into_iter() {
+            if !node.should_apply(record.lsn) {
+                continue;
+            }
             let page_id = record.page_id;
             let buffer = buffers.entry(page_id).or_insert_with(ReplayBuffer::new);
             buffer.push(record);
@@ -331,14 +357,20 @@ fn replay_page_records(
     if records.is_empty() {
         return Ok(());
     }
+    let mut max_lsn = 0u64;
     let page = node
         .read_page(page_id)
         .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
     let mut page = page;
     for record in records {
+        if record.lsn > max_lsn {
+            max_lsn = record.lsn;
+        }
         apply_wal_record(&mut page, &record)?;
     }
-    node.write_page(page_id, &page)
+    node.write_page(page_id, &page)?;
+    node.update_last_applied(max_lsn);
+    Ok(())
 }
 
 fn apply_wal_record(page: &mut [u8], record: &WalRecord) -> Result<()> {
@@ -464,6 +496,10 @@ impl StorageNode {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
 
+        let wal_state = read_wal_state(&dir).unwrap_or(WalState {
+            last_applied_lsn: 0,
+        });
+
         let manifest = read_manifest(&dir)?;
         let mut segments = match manifest.as_ref() {
             Some(manifest) if !manifest.segments.is_empty() => manifest.segments.clone(),
@@ -541,7 +577,7 @@ impl StorageNode {
             wal_sender: Mutex::new(Some(wal_sender)),
             wal_replay_rx: Mutex::new(Some(wal_replay_rx)),
         };
-        node.start_wal_replay();
+        node.start_wal_replay(wal_state.last_applied_lsn);
         Ok(node)
     }
 
@@ -572,13 +608,13 @@ impl StorageNode {
         }
     }
 
-    pub fn start_wal_replay(&self) {
+    pub fn start_wal_replay(&self, last_applied_lsn: u64) {
         let rx = self.wal_replay_rx.lock().unwrap().take();
         if rx.is_none() {
             return;
         }
         let rx = rx.unwrap();
-        let replay = StorageNodeReplay::new(Arc::new(self.clone_inner()));
+        let replay = StorageNodeReplay::new(Arc::new(self.clone_inner()), last_applied_lsn);
         thread::spawn(move || {
             wal_replay_loop(replay, rx);
         });
@@ -911,6 +947,39 @@ fn write_manifest(dir: &Path, active: u64, segments: &[u64]) -> Result<()> {
     file.sync_all()?;
     fs::rename(tmp_path, path)?;
     sync_dir(dir);
+    Ok(())
+}
+
+fn read_wal_state(dir: &Path) -> Result<WalState> {
+    let path = dir.join(WAL_STATE_FILE);
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Ok(WalState {
+                last_applied_lsn: 0,
+            })
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let mut buf = [0u8; 8];
+    file.read_exact(&mut buf)?;
+    let last_applied_lsn = u64::from_le_bytes(buf);
+    Ok(WalState { last_applied_lsn })
+}
+
+fn write_wal_state(dir: &Path, last_applied_lsn: u64) -> Result<()> {
+    let tmp_path = dir.join(WAL_STATE_TMP_FILE);
+    let path = dir.join(WAL_STATE_FILE);
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)?;
+        file.write_all(&last_applied_lsn.to_le_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(tmp_path, path)?;
     Ok(())
 }
 
