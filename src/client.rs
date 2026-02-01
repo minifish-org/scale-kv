@@ -292,26 +292,36 @@ impl BatchedComputeNode {
             }
         }
         if let Some(slot_ref) = old_slot {
-            let mut page = if let Some(page) = self.page_cache.read().unwrap().get(&slot_ref.page_id) {
-                Some(page.clone())
-            } else {
-                self.fetch_page(slot_ref.page_id).await?
+            let cached_page = {
+                self.page_cache
+                    .read()
+                    .unwrap()
+                    .get(&slot_ref.page_id)
+                    .cloned()
+            };
+            let mut page = match cached_page {
+                Some(page) => Some(page),
+                None => self.fetch_page(slot_ref.page_id).await?,
             };
             if let Some(mut page) = page.take() {
                 clear_slot(&mut page, slot_ref.slot_id);
                 let free = page_free_space(&page);
                 self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
                 self.page_cache.write().unwrap().insert(slot_ref.page_id, page.clone());
-        if let Some(storage) = &self.storage {
-            storage.put(slot_ref.page_id, &page).await?;
-        }
+                let page_id = slot_ref.page_id;
+                if let Some(storage) = &self.storage {
+                    storage.put(page_id, &page).await?;
+                }
             }
             self.tree.remove(&key);
         }
 
         let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
-        let mut page = if let Some(page) = self.page_cache.read().unwrap().get(&page_id) {
-            page.clone()
+        let cached_page = {
+            self.page_cache.read().unwrap().get(&page_id).cloned()
+        };
+        let mut page = if let Some(page) = cached_page {
+            page
         } else if is_new {
             new_page()
         } else {
@@ -355,9 +365,15 @@ impl BatchedComputeNode {
         };
 
         if let Some(slot_ref) = slot_ref {
-            let mut page = if let Some(page) = self.page_cache.read().unwrap().get(&slot_ref.page_id)
-            {
-                page.clone()
+            let cached_page = {
+                self.page_cache
+                    .read()
+                    .unwrap()
+                    .get(&slot_ref.page_id)
+                    .cloned()
+            };
+            let mut page = if let Some(page) = cached_page {
+                page
             } else {
                 self.fetch_page(slot_ref.page_id)
                     .await?
@@ -716,10 +732,16 @@ impl ComputeNode {
             }
         }
         if let Some(slot_ref) = old_slot {
-            let mut page = if let Some(page) = self.page_cache.read().unwrap().get(&slot_ref.page_id) {
-                Some(page.clone())
-            } else {
-                self.fetch_page(slot_ref.page_id).await?
+            let cached_page = {
+                self.page_cache
+                    .read()
+                    .unwrap()
+                    .get(&slot_ref.page_id)
+                    .cloned()
+            };
+            let mut page = match cached_page {
+                Some(page) => Some(page),
+                None => self.fetch_page(slot_ref.page_id).await?,
             };
             if let Some(mut page) = page.take() {
                 clear_slot(&mut page, slot_ref.slot_id);
@@ -729,18 +751,22 @@ impl ComputeNode {
                     .write()
                     .unwrap()
                     .insert(slot_ref.page_id, page.clone());
+                let page_id = slot_ref.page_id;
                 if let Some(batch_sender) = &self.batch_sender {
-                    batch_sender.put(slot_ref.page_id, &page).await?;
+                    batch_sender.put(page_id, &page).await?;
                 } else if let Some(storage) = &self.storage {
-                    storage.put(slot_ref.page_id, &page).await?;
+                    storage.put(page_id, &page).await?;
                 }
             }
             self.tree.remove(&key);
         }
 
         let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
-        let mut page = if let Some(page) = self.page_cache.read().unwrap().get(&page_id) {
-            page.clone()
+        let cached_page = {
+            self.page_cache.read().unwrap().get(&page_id).cloned()
+        };
+        let mut page = if let Some(page) = cached_page {
+            page
         } else if is_new {
             new_page()
         } else {
@@ -786,9 +812,15 @@ impl ComputeNode {
         };
 
         if let Some(slot_ref) = slot_ref {
-            let mut page = if let Some(page) = self.page_cache.read().unwrap().get(&slot_ref.page_id)
-            {
-                page.clone()
+            let cached_page = {
+                self.page_cache
+                    .read()
+                    .unwrap()
+                    .get(&slot_ref.page_id)
+                    .cloned()
+            };
+            let mut page = if let Some(page) = cached_page {
+                page
             } else {
                 self.fetch_page(slot_ref.page_id)
                     .await?
@@ -801,10 +833,11 @@ impl ComputeNode {
                 .write()
                 .unwrap()
                 .insert(slot_ref.page_id, page.clone());
+            let page_id = slot_ref.page_id;
             if let Some(batch_sender) = &self.batch_sender {
-                batch_sender.put(slot_ref.page_id, &page).await?;
+                batch_sender.put(page_id, &page).await?;
             } else if let Some(storage) = &self.storage {
-                storage.put(slot_ref.page_id, &page).await?;
+                storage.put(page_id, &page).await?;
             }
             self.tree.remove(&key);
             return Ok(true);
