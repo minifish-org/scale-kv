@@ -73,6 +73,10 @@ impl StorageNodeReplay {
         lsn > *last_applied
     }
 
+    fn last_applied(&self) -> u64 {
+        *self.last_applied_lsn.lock().unwrap()
+    }
+
     fn update_last_applied(&self, lsn: u64) {
         let mut last_applied = self.last_applied_lsn.lock().unwrap();
         if lsn > *last_applied {
@@ -329,10 +333,16 @@ fn wal_writer_loop(dir: PathBuf, rx: Receiver<WalBatch>, replay_tx: Sender<WalBa
 fn wal_replay_loop(node: StorageNodeReplay, rx: Receiver<WalBatch>) {
     let mut buffers: HashMap<PageId, ReplayBuffer> = HashMap::new();
     for batch in rx {
+        let mut last_seen = node.last_applied();
         for record in batch.records.into_iter() {
-            if !node.should_apply(record.lsn) {
+            if record.lsn <= last_seen {
                 continue;
             }
+            if record.lsn != last_seen + 1 {
+                // out-of-order or gap: stop applying this batch
+                break;
+            }
+            last_seen = record.lsn;
             let page_id = record.page_id;
             let buffer = buffers.entry(page_id).or_insert_with(ReplayBuffer::new);
             buffer.push(record);
