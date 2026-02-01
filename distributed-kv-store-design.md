@@ -69,12 +69,13 @@
 - 目标：**用 WAL 批量代替整页写入**，减少 RPC 开销
 - 批量大小：**256KB 固定**（不做超时 flush）
 - 发送策略：**前台不阻塞**，WAL 只入本地队列；后台异步攒批发送并等待 ACK
+- 触发条件：后台线程仅在 **buffer 达到 256KB** 时发送（不做超时 flush）
 - RPC：**新增 appendWal(batch)**（专用 WAL 追加接口）
 - Storage：**WAL 顺序落盘 + segment（A+B：顺序追加 + 分段轮换）**
 - ACK 语义：**Storage 收到 WAL batch 并成功入队后立即 ACK**（不等落盘/回放）
 - Replay：**后台异步回放 WAL → page → Bitcask**（按 page_id 聚合，阈值 8KB）
 - 读取：**只从 Compute 读**（Storage 仅用于持久化与压缩）
-- 崩溃恢复：**通过 WAL 落盘重放恢复**（不依赖全量扫描）
+- 崩溃恢复：**启动时扫描 WAL segment，从 wal_state.last_applied_lsn 继续回放**
 
 #### 5.3.1 WAL 记录最小格式（KV redo）
 - 记录粒度：KV 级别
@@ -129,6 +130,7 @@ record {
 - **Replay 线程**：后台读取 WAL，按 lsn 顺序回放更新内存 page，按 `page_id` 聚合后写 Bitcask
 - **聚合阈值**：每 page **8KB** 写回触发（不使用时间触发）
 - **LSN**：严格递增，`lsn > last_applied` 才 apply
+- **wal_state**：回放完成后持久化 `last_applied_lsn`
 
 ### 5.6 滑动窗口攒批方案（2026-02-01）
 - **目标**：降低平均延迟，避免 Group Commit 的"等待攒批"问题
