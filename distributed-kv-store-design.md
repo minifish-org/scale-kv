@@ -68,33 +68,33 @@
 ### 5.3 远端 WAL 批量写（设计草案）
 - 目标：**用 WAL 批量代替整页写入**，减少 RPC 开销
 - 批量大小：**256KB 固定**（不做超时 flush）
-- 发送策略：**前台不阻塞**，WAL 只入本地队列；后台异步攒批发送并等待 ack
-- RPC：**新增 appendWal(batch)**（专用 WAL 追加接口，避免复用 batchPut 语义混淆）
-- Storage：**WAL 顺序落盘 + segment（A+B）**
-- ACK：**收到即 ACK（仅入队，不等落盘/回放）**
+- 发送策略：**前台不阻塞**，WAL 只入本地队列；后台异步攒批发送并等待 ACK
+- RPC：**新增 appendWal(batch)**（专用 WAL 追加接口）
+- Storage：**WAL 顺序落盘 + segment（A+B：顺序追加 + 分段轮换）**
+- ACK 语义：**Storage 收到 WAL batch 并成功入队后立即 ACK**（不等落盘/回放）
 - Replay：**后台异步回放 WAL → page → Bitcask**（按 page_id 聚合，阈值 8KB）
 - 读取：**只从 Compute 读**（Storage 仅用于持久化与压缩）
 - 崩溃恢复：**通过 WAL 落盘重放恢复**（不依赖全量扫描）
 
-#### 5.3.1 WAL 记录最小格式
+#### 5.3.1 WAL 记录最小格式（KV redo）
 - 记录粒度：KV 级别
-- 字段：`key_len | val_len | key | value`
-- 备注：可预留 `txn_id/lsn/checksum` 便于未来扩展
+- 字段：`lsn | op | page_id | slot_id | key_len | val_len | key | value`
+- 备注：`txn_id/checksum` 可选
 
-#### 5.3.2 写入流程（阻塞仅在 batch 满时）
+#### 5.3.2 写入流程（前台不阻塞）
 ```mermaid
 flowchart TD
     A[Compute put/delete] --> B[append to in-memory WAL buffer]
     B --> C{buffer size < 256KB?}
     C -->|yes| D[return immediately]
-    C -->|no| E[batchPut RPC (256KB)]
-    E --> F[Storage append log]
-    F --> G[ack]
-    G --> H[unblock writers]
+    C -->|no| E[enqueue WAL batch]
+    E --> F[appendWal RPC (256KB)]
+    F --> G[Storage enqueue]
+    G --> H[ack]
 ```
 
 #### 5.3.3 Storage 语义（更新：持久 WAL + 早 ACK）
-- `batchPut` 成功 = **已入队（收到即 ACK）**，不代表 durability
+- `appendWal` 成功 = **已入队（收到即 ACK）**，不代表 durability
 - WAL **顺序 append + segment**（A+B 方案）
 - WAL **落盘后后台 replay**，不阻塞写入吞吐
 - compaction 保留最新值，旧版本清理
@@ -120,16 +120,17 @@ record {
 
 关键约束：
 - **page_id/slot_id 由 Compute 单写者生成**（必须全局唯一/有序）
+- **LSN 由 Compute 单写者生成**（严格递增）
 - Storage 按 **lsn 顺序重放**，需要幂等处理（`lsn > last_applied` 才 apply）
 
 #### 5.3.5 WAL 落盘与 replay（A+B 方案）
 - **WAL 落盘**：Storage 端顺序 append + segment（如 64MB）
-- **ACK 语义**：Storage 收到即 ACK（队列接收成功）
-- **Replay 线程**：后台读取 WAL，按 `page_id` 聚合再写 Bitcask
+- **ACK 语义**：Storage 收到 WAL batch 并成功入队后立即 ACK
+- **Replay 线程**：后台读取 WAL，按 lsn 顺序回放更新内存 page，按 `page_id` 聚合后写 Bitcask
 - **聚合阈值**：每 page **8KB** 写回触发（不使用时间触发）
 - **LSN**：严格递增，`lsn > last_applied` 才 apply
 
-#### 5.6 滑动窗口攒批方案（2026-02-01）
+### 5.6 滑动窗口攒批方案（2026-02-01）
 - **目标**：降低平均延迟，避免 Group Commit 的"等待攒批"问题
 - **核心洞察**：不是"等攒够再发"，而是"流水线化"
 
