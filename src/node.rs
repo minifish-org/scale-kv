@@ -84,6 +84,18 @@ impl StorageNodeReplay {
             let _ = write_wal_state(&self.node.dir, *last_applied);
         }
     }
+
+    fn apply_record(&self, record: WalRecord) -> Result<()> {
+        let page_id = record.page_id;
+        let page = self
+            .read_page(page_id)
+            .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
+        let mut page = page;
+        apply_wal_record(&mut page, &record)?;
+        self.write_page(page_id, &page)?;
+        self.update_last_applied(record.lsn);
+        Ok(())
+    }
 }
 
 impl ReplayBuffer {
@@ -330,6 +342,91 @@ fn wal_writer_loop(dir: PathBuf, rx: Receiver<WalBatch>, replay_tx: Sender<WalBa
     }
 }
 
+fn read_wal_batch(file: &mut File) -> Result<Option<WalBatch>> {
+    let mut len_buf = [0u8; 4];
+    match file.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+    let total_len = u32::from_le_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; total_len];
+    file.read_exact(&mut buf)?;
+    let mut cursor = 0usize;
+
+    let start_lsn = read_u64_from(&buf, &mut cursor)?;
+    let end_lsn = read_u64_from(&buf, &mut cursor)?;
+    let count = read_u32_from(&buf, &mut cursor)? as usize;
+    let mut records = Vec::with_capacity(count);
+    for _ in 0..count {
+        let lsn = read_u64_from(&buf, &mut cursor)?;
+        let op = read_u8_from(&buf, &mut cursor)?;
+        let page_id = read_u64_from(&buf, &mut cursor)?;
+        let slot_id = read_u16_from(&buf, &mut cursor)?;
+        let key_len = read_u32_from(&buf, &mut cursor)? as usize;
+        let val_len = read_u32_from(&buf, &mut cursor)? as usize;
+        if cursor + key_len + val_len > buf.len() {
+            return Err(Error::new(ErrorKind::InvalidData, "wal record truncated").into());
+        }
+        let key = buf[cursor..cursor + key_len].to_vec();
+        cursor += key_len;
+        let value = buf[cursor..cursor + val_len].to_vec();
+        cursor += val_len;
+        records.push(WalRecord {
+            lsn,
+            op,
+            page_id,
+            slot_id,
+            key,
+            value,
+        });
+    }
+    Ok(Some(WalBatch {
+        start_lsn,
+        end_lsn,
+        records,
+    }))
+}
+
+fn read_u64_from(buf: &[u8], cursor: &mut usize) -> Result<u64> {
+    if *cursor + 8 > buf.len() {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "wal batch truncated").into());
+    }
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&buf[*cursor..*cursor + 8]);
+    *cursor += 8;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_u32_from(buf: &[u8], cursor: &mut usize) -> Result<u32> {
+    if *cursor + 4 > buf.len() {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "wal batch truncated").into());
+    }
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&buf[*cursor..*cursor + 4]);
+    *cursor += 4;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u16_from(buf: &[u8], cursor: &mut usize) -> Result<u16> {
+    if *cursor + 2 > buf.len() {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "wal batch truncated").into());
+    }
+    let mut bytes = [0u8; 2];
+    bytes.copy_from_slice(&buf[*cursor..*cursor + 2]);
+    *cursor += 2;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u8_from(buf: &[u8], cursor: &mut usize) -> Result<u8> {
+    if *cursor + 1 > buf.len() {
+        return Err(Error::new(ErrorKind::UnexpectedEof, "wal batch truncated").into());
+    }
+    let value = buf[*cursor];
+    *cursor += 1;
+    Ok(value)
+}
+
 fn wal_replay_loop(node: StorageNodeReplay, rx: Receiver<WalBatch>) {
     let mut buffers: HashMap<PageId, ReplayBuffer> = HashMap::new();
     for batch in rx {
@@ -385,7 +482,7 @@ fn replay_page_records(
 
 fn apply_wal_record(page: &mut [u8], record: &WalRecord) -> Result<()> {
     match record.op {
-        1 => insert_record_at_slot(page, record.slot_id, &record.key, &record.value),
+        1 => insert_record_at_slot_checked(page, record.slot_id, &record.key, &record.value),
         2 => {
             clear_slot(page, record.slot_id);
             Ok(())
@@ -474,6 +571,40 @@ fn insert_record_at_slot(page: &mut [u8], slot_id: u16, key: &[u8], value: &[u8]
     free_end = payload_offset;
     write_header(page, slots, free_start, free_end);
     Ok(())
+}
+
+fn insert_record_at_slot_checked(
+    page: &mut [u8],
+    slot_id: u16,
+    key: &[u8],
+    value: &[u8],
+) -> Result<()> {
+    if page.len() != PAGE_SIZE {
+        return Err(crate::Error::InvalidPageSize(page.len(), PAGE_SIZE));
+    }
+    let (slots, _, _) = read_header(page);
+    if slot_id < slots {
+        let (offset, len) = read_slot(page, slot_id);
+        if len != 0 {
+            let offset = offset as usize;
+            if offset + 4 <= PAGE_SIZE {
+                let key_len = read_u16(page, offset) as usize;
+                let value_len = read_u16(page, offset + 2) as usize;
+                let key_start = offset + 4;
+                let key_end = key_start + key_len;
+                let value_end = key_end + value_len;
+                if value_end <= PAGE_SIZE {
+                    let old_key = &page[key_start..key_end];
+                    if old_key != key {
+                        return Err(crate::Error::Capnp(
+                            "wal replay slot key mismatch".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    insert_record_at_slot(page, slot_id, key, value)
 }
 
 fn clear_slot(page: &mut [u8], slot_id: u16) {
@@ -587,6 +718,7 @@ impl StorageNode {
             wal_sender: Mutex::new(Some(wal_sender)),
             wal_replay_rx: Mutex::new(Some(wal_replay_rx)),
         };
+        node.replay_wal_segments(wal_state.last_applied_lsn)?;
         node.start_wal_replay(wal_state.last_applied_lsn);
         Ok(node)
     }
@@ -628,6 +760,32 @@ impl StorageNode {
         thread::spawn(move || {
             wal_replay_loop(replay, rx);
         });
+    }
+
+    fn replay_wal_segments(&self, last_applied_lsn: u64) -> Result<()> {
+        let mut segments = list_wal_segments(&self.dir)?;
+        segments.sort_unstable();
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let replay = StorageNodeReplay::new(Arc::new(self.clone_inner()), last_applied_lsn);
+        for file_id in segments {
+            let path = wal_segment_path(&self.dir, file_id);
+            let mut file = File::open(&path)?;
+            loop {
+                let batch = match read_wal_batch(&mut file)? {
+                    Some(batch) => batch,
+                    None => break,
+                };
+                for record in batch.records {
+                    if record.lsn <= replay.last_applied() {
+                        continue;
+                    }
+                    replay.apply_record(record)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Get the number of keys in storage.

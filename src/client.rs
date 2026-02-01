@@ -76,7 +76,7 @@ impl WalSender {
                     let batch = self.take_batch(&mut buffer, &mut buffer_bytes);
                     drop(buffer);
                     drop(buffer_bytes);
-                    let _ = self.client.append_wal(&batch).await;
+                    self.send_with_retry(batch).await;
                     buffer = self.buffer.lock().unwrap();
                     buffer_bytes = self.buffer_bytes.lock().unwrap();
                 }
@@ -86,8 +86,22 @@ impl WalSender {
                 let batch = self.take_batch(&mut buffer, &mut buffer_bytes);
                 drop(buffer);
                 drop(buffer_bytes);
-                let _ = self.client.append_wal(&batch).await;
+                self.send_with_retry(batch).await;
             }
+        }
+    }
+
+    async fn send_with_retry(&self, batch: crate::node::WalBatch) {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            if self.client.append_wal(&batch).await.is_ok() {
+                break;
+            }
+            if attempts >= 3 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
         }
     }
 
