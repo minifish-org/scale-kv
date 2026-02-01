@@ -10,6 +10,7 @@ pub struct BPlusTree<K: Ord + Clone> {
 enum Node<K: Ord + Clone> {
     Leaf {
         keys: Vec<K>,
+        next: Option<*mut Node<K>>,
     },
     Internal {
         keys: Vec<K>,
@@ -19,7 +20,10 @@ enum Node<K: Ord + Clone> {
 
 impl<K: Ord + Clone> Default for Node<K> {
     fn default() -> Self {
-        Node::Leaf { keys: Vec::new() }
+        Node::Leaf {
+            keys: Vec::new(),
+            next: None,
+        }
     }
 }
 
@@ -56,7 +60,7 @@ impl<K: Ord + Clone> BPlusTree<K> {
     pub fn remove(&self, key: &K) {
         let mut root = self.root.write().unwrap();
         root.remove(key);
-        if let Node::Internal { keys: _, children } = &mut *root {
+        if let Node::Internal { children, .. } = &mut *root {
             if children.len() == 1 {
                 let child = children.pop().unwrap();
                 *root = *child;
@@ -80,7 +84,7 @@ impl<K: Ord + Clone> BPlusTree<K> {
 impl<K: Ord + Clone> Node<K> {
     fn contains(&self, key: &K) -> bool {
         match self {
-            Node::Leaf { keys } => keys.binary_search(key).is_ok(),
+            Node::Leaf { keys, .. } => keys.binary_search(key).is_ok(),
             Node::Internal { keys, children } => {
                 let idx = child_index(keys, key);
                 children[idx].contains(key)
@@ -90,7 +94,7 @@ impl<K: Ord + Clone> Node<K> {
 
     fn insert(&mut self, key: K) -> Option<()> {
         match self {
-            Node::Leaf { keys } => {
+            Node::Leaf { keys, .. } => {
                 match keys.binary_search(&key) {
                     Ok(_) => return None,
                     Err(pos) => keys.insert(pos, key),
@@ -118,11 +122,17 @@ impl<K: Ord + Clone> Node<K> {
 
     fn split(&mut self) -> (K, Box<Node<K>>) {
         match self {
-            Node::Leaf { keys } => {
+            Node::Leaf { keys, next } => {
                 let mid = keys.len() / 2;
                 let right_keys = keys.split_off(mid);
                 let promote = right_keys[0].clone();
-                (promote, Box::new(Node::Leaf { keys: right_keys }))
+                let mut right = Box::new(Node::Leaf {
+                    keys: right_keys,
+                    next: *next,
+                });
+                let right_ptr: *mut Node<K> = &mut *right;
+                *next = Some(right_ptr);
+                (promote, right)
             }
             Node::Internal { keys, children } => {
                 let mid = keys.len() / 2;
@@ -143,7 +153,7 @@ impl<K: Ord + Clone> Node<K> {
 
     fn remove(&mut self, key: &K) {
         match self {
-            Node::Leaf { keys } => {
+            Node::Leaf { keys, .. } => {
                 if let Ok(pos) = keys.binary_search(key) {
                     keys.remove(pos);
                 }
@@ -157,35 +167,33 @@ impl<K: Ord + Clone> Node<K> {
 
     fn len(&self) -> usize {
         match self {
-            Node::Leaf { keys } => keys.len(),
+            Node::Leaf { keys, .. } => keys.len(),
             Node::Internal { children, .. } => children.iter().map(|child| child.len()).sum(),
         }
     }
 
     fn collect_range(&self, start: &K, end: &K, out: &mut Vec<K>) {
         match self {
-            Node::Leaf { keys } => {
+            Node::Leaf { keys, next } => {
                 for key in keys {
                     if key < start {
                         continue;
                     }
                     if key > end {
-                        break;
+                        return;
                     }
                     out.push(key.clone());
                 }
+                if let Some(next_ptr) = next {
+                    unsafe {
+                        let next_node = &**next_ptr;
+                        next_node.collect_range(start, end, out);
+                    }
+                }
             }
             Node::Internal { keys, children } => {
-                let mut idx = child_index(keys, start);
-                while idx < children.len() {
-                    children[idx].collect_range(start, end, out);
-                    if let Some(boundary) = keys.get(idx) {
-                        if boundary > end {
-                            break;
-                        }
-                    }
-                    idx += 1;
-                }
+                let idx = child_index(keys, start);
+                children[idx].collect_range(start, end, out);
             }
         }
     }
