@@ -1450,4 +1450,111 @@ mod tests {
         drop(node);
         cleanup_dir(&dir);
     }
+
+    #[test]
+    fn test_wal_state_roundtrip() {
+        let dir = temp_dir();
+        write_wal_state(&dir, 42).unwrap();
+        let state = read_wal_state(&dir).unwrap();
+        assert_eq!(state.last_applied_lsn, 42);
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn test_wal_encode_decode_roundtrip() {
+        let dir = temp_dir();
+        let path = dir.join("wal-test.log");
+        let batch = WalBatch {
+            start_lsn: 1,
+            end_lsn: 2,
+            records: vec![
+                WalRecord {
+                    lsn: 1,
+                    op: 1,
+                    page_id: 7,
+                    slot_id: 0,
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                },
+                WalRecord {
+                    lsn: 2,
+                    op: 2,
+                    page_id: 7,
+                    slot_id: 0,
+                    key: b"k1".to_vec(),
+                    value: Vec::new(),
+                },
+            ],
+        };
+        let mut buf = Vec::new();
+        encode_wal_batch(&batch, &mut buf).unwrap();
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&buf).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut file = File::open(&path).unwrap();
+        let decoded = read_wal_batch(&mut file).unwrap().unwrap();
+        assert_eq!(decoded.start_lsn, 1);
+        assert_eq!(decoded.end_lsn, 2);
+        assert_eq!(decoded.records.len(), 2);
+        assert_eq!(decoded.records[0].key, b"k1".to_vec());
+        assert_eq!(decoded.records[0].value, b"v1".to_vec());
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn test_replay_page_records_applies_updates() {
+        let dir = temp_dir();
+        let node = StorageNode::open(&dir).unwrap();
+        let mut page = vec![0u8; PAGE_SIZE];
+        write_header(&mut page, 0, PAGE_HEADER_SIZE as u16, PAGE_SIZE as u16);
+        node.put(10, &page);
+        let replay = StorageNodeReplay::new(Arc::new(node.clone_inner()), 0);
+        let records = vec![
+            WalRecord {
+                lsn: 1,
+                op: 1,
+                page_id: 10,
+                slot_id: 0,
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+            },
+            WalRecord {
+                lsn: 2,
+                op: 1,
+                page_id: 10,
+                slot_id: 1,
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+            },
+        ];
+        replay_page_records(&replay, 10, records).unwrap();
+        let page = replay.node.get(10).unwrap();
+        let read_slot = |page: &[u8], slot_id: u16| -> Vec<u8> {
+            let offset = slot_offset(slot_id);
+            let pos = read_u16(page, offset) as usize;
+            let len = read_u16(page, offset + 2) as usize;
+            if len == 0 {
+                return Vec::new();
+            }
+            let key_len = read_u16(page, pos) as usize;
+            let value_len = read_u16(page, pos + 2) as usize;
+            let value_start = pos + 4 + key_len;
+            let value_end = value_start + value_len;
+            page[value_start..value_end].to_vec()
+        };
+        assert_eq!(read_slot(&page, 0), b"v1");
+        assert_eq!(read_slot(&page, 1), b"v2");
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn test_wal_slot_key_mismatch_is_rejected() {
+        let mut page = vec![0u8; PAGE_SIZE];
+        write_header(&mut page, 0, PAGE_HEADER_SIZE as u16, PAGE_SIZE as u16);
+        insert_record_at_slot_checked(&mut page, 0, b"k1", b"v1").unwrap();
+        let err = insert_record_at_slot_checked(&mut page, 0, b"k2", b"v2").unwrap_err();
+        assert!(format!("{err}").contains("wal replay slot key mismatch"));
+    }
 }

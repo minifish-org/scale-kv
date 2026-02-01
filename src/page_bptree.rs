@@ -354,3 +354,61 @@ fn encode_child_id(child: PageId) -> Vec<u8> {
 fn decode_child_id(buf: &[u8]) -> PageId {
     u64::from_le_bytes(buf[0..8].try_into().unwrap())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{PageBPlusTree, SlotRef};
+
+    fn key_for(i: u32) -> Vec<u8> {
+        let mut key = format!("k{:03}", i).into_bytes();
+        key.extend_from_slice(&vec![b'x'; 100]);
+        key
+    }
+
+    #[test]
+    fn test_insert_get_remove_len() {
+        let mut tree = PageBPlusTree::new();
+        let key = b"alpha".to_vec();
+        let slot = SlotRef {
+            page_id: 1,
+            slot_id: 2,
+        };
+        let updated = SlotRef {
+            page_id: 7,
+            slot_id: 9,
+        };
+
+        assert_eq!(tree.get(&key), None);
+        tree.insert(key.clone(), slot).unwrap();
+        assert_eq!(tree.get(&key), Some(slot));
+        assert_eq!(tree.len(), 1);
+
+        tree.insert(key.clone(), updated).unwrap();
+        assert_eq!(tree.get(&key), Some(updated));
+        assert_eq!(tree.len(), 1);
+
+        tree.remove(&key).unwrap();
+        assert_eq!(tree.get(&key), None);
+        assert_eq!(tree.len(), 0);
+    }
+
+    #[test]
+    fn test_range_across_splits() {
+        let mut tree = PageBPlusTree::new();
+        for i in 0..120u32 {
+            let key = key_for(i);
+            let slot = SlotRef {
+                page_id: i as u64 + 1,
+                slot_id: (i % 512) as u16,
+            };
+            tree.insert(key, slot).unwrap();
+        }
+
+        let start = key_for(10);
+        let end = key_for(50);
+        let range = tree.range(&start, &end);
+        assert_eq!(range.len(), 41);
+        assert_eq!(range.first().unwrap().0, start);
+        assert_eq!(range.last().unwrap().0, end);
+    }
+}
