@@ -20,15 +20,10 @@ struct WalBatch {
   records @2 :List(WalRecord);
 }
 
-interface Stream {
-  next @0 (max :UInt32) -> (items :List(KeyValue), done :Bool);
-}
-
 interface Storage {
   get @0 (key :UInt64) -> (found :Bool, value :Data);
   put @1 (key :UInt64, value :Data) -> ();
   delete @2 (key :UInt64) -> (found :Bool);
-  stream @3 () -> (stream :Stream);
-  batchPut @4 (items :List(KeyValue)) -> ();
-  appendWal @5 (batch :WalBatch) -> ();
+  batchPut @3 (items :List(KeyValue)) -> ();
+  appendWal @4 (batch :WalBatch) -> ();
 }

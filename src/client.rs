@@ -1,5 +1,5 @@
-use crate::bptree::BPlusTree;
-use crate::storage_capnp::{storage, stream as storage_stream};
+use crate::page_bptree::{PageBPlusTree, SlotRef as PageSlotRef};
+use crate::storage_capnp::storage;
 use crate::{Error, Page, PageId, Result, Value, PAGE_SIZE};
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
@@ -152,9 +152,6 @@ impl StorageClientPool {
         self.pick().delete(page_id).await
     }
 
-    pub async fn open_stream(&self) -> Result<StreamClient> {
-        self.pick().open_stream().await
-    }
 
     pub async fn batch_put(&self, items: &[(PageId, Page)]) -> Result<()> {
         self.pick().batch_put(items).await
@@ -300,8 +297,7 @@ impl BatchedStorageClientPool {
 
 /// Compute node that uses batched storage for better RPC performance.
 pub struct BatchedComputeNode {
-    tree: BPlusTree<String>,
-    index: RwLock<HashMap<String, SlotRef>>,
+    tree: Mutex<PageBPlusTree>,
     page_cache: RwLock<HashMap<PageId, Page>>,
     fsm: Mutex<FreeSpaceMap>,
     cache_hits: AtomicUsize,
@@ -314,8 +310,7 @@ pub struct BatchedComputeNode {
 impl BatchedComputeNode {
     pub fn new() -> Self {
         Self {
-            tree: BPlusTree::new(),
-            index: RwLock::new(HashMap::new()),
+            tree: Mutex::new(PageBPlusTree::new()),
             page_cache: RwLock::new(HashMap::new()),
             fsm: Mutex::new(FreeSpaceMap::new()),
             cache_hits: AtomicUsize::new(0),
@@ -335,8 +330,7 @@ impl BatchedComputeNode {
             wal_sender_clone.run().await;
         });
         Ok(Self {
-            tree: BPlusTree::new(),
-            index: RwLock::new(HashMap::new()),
+            tree: Mutex::new(PageBPlusTree::new()),
             page_cache: RwLock::new(HashMap::new()),
             fsm: Mutex::new(FreeSpaceMap::new()),
             cache_hits: AtomicUsize::new(0),
@@ -350,19 +344,11 @@ impl BatchedComputeNode {
     pub async fn get(&self, key: impl AsRef<str>) -> Result<Option<Value>> {
         self.operations.fetch_add(1, Ordering::Relaxed);
         let key = key.as_ref().to_string();
-        if !self.tree.contains(&key) {
-            self.cache_misses.fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
-        }
-
-        let slot_ref = {
-            let index = self.index.read().unwrap();
-            match index.get(&key) {
-                Some(slot_ref) => *slot_ref,
-                None => {
-                    self.cache_misses.fetch_add(1, Ordering::Relaxed);
-                    return Ok(None);
-                }
+        let slot_ref = match self.tree.lock().unwrap().get(key.as_bytes()) {
+            Some(slot_ref) => slot_ref,
+            None => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
             }
         };
 
@@ -392,36 +378,7 @@ impl BatchedComputeNode {
         let key = key.as_ref().to_string();
         let payload_len = payload_len(key.as_bytes(), value)?;
         let required = payload_len + SLOT_ENTRY_SIZE;
-        if let Some(wal_sender) = &self.wal_sender {
-            let lsn = wal_sender.next_lsn();
-            wal_sender.enqueue(crate::node::WalRecord {
-                lsn,
-                op: 1,
-                page_id: 0,
-                slot_id: 0,
-                key: key.as_bytes().to_vec(),
-                value: value.to_vec(),
-            });
-        }
-        if let Some(wal_sender) = &self.wal_sender {
-            let lsn = wal_sender.next_lsn();
-            wal_sender.enqueue(crate::node::WalRecord {
-                lsn,
-                op: 1,
-                page_id: 0,
-                slot_id: 0,
-                key: key.as_bytes().to_vec(),
-                value: value.to_vec(),
-            });
-        }
-
-        let mut old_slot = None;
-        {
-            let mut index = self.index.write().unwrap();
-            if let Some(slot_ref) = index.remove(&key) {
-                old_slot = Some(slot_ref);
-            }
-        }
+        let old_slot = self.tree.lock().unwrap().get(key.as_bytes());
         if let Some(slot_ref) = old_slot {
             let cached_page = {
                 self.page_cache
@@ -441,8 +398,8 @@ impl BatchedComputeNode {
                 self.page_cache.write().unwrap().insert(slot_ref.page_id, page.clone());
                 let _page_id = slot_ref.page_id;
             }
-            self.tree.remove(&key);
-        }
+                self.tree.lock().unwrap().remove(key.as_bytes())?;
+            }
 
         let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
         let cached_page = {
@@ -471,13 +428,22 @@ impl BatchedComputeNode {
         let free = page_free_space(&page);
         self.fsm.lock().unwrap().update_page(page_id, free);
         self.page_cache.write().unwrap().insert(page_id, page.clone());
-        self.index
-            .write()
+        self.tree
+            .lock()
             .unwrap()
-            .insert(key.clone(), SlotRef { page_id, slot_id });
-        self.tree.insert(key);
+            .insert(key.as_bytes().to_vec(), PageSlotRef { page_id, slot_id })?;
 
-        let _page_id = page_id;
+        if let Some(wal_sender) = &self.wal_sender {
+            let lsn = wal_sender.next_lsn();
+            wal_sender.enqueue(crate::node::WalRecord {
+                lsn,
+                op: 1,
+                page_id,
+                slot_id,
+                key: key.as_bytes().to_vec(),
+                value: value.to_vec(),
+            });
+        }
 
         Ok(())
     }
@@ -485,21 +451,7 @@ impl BatchedComputeNode {
     pub async fn delete(&self, key: impl AsRef<str>) -> Result<bool> {
         self.operations.fetch_add(1, Ordering::Relaxed);
         let key = key.as_ref().to_string();
-        if let Some(wal_sender) = &self.wal_sender {
-            let lsn = wal_sender.next_lsn();
-            wal_sender.enqueue(crate::node::WalRecord {
-                lsn,
-                op: 2,
-                page_id: 0,
-                slot_id: 0,
-                key: key.as_bytes().to_vec(),
-                value: Vec::new(),
-            });
-        }
-        let slot_ref = {
-            let mut index = self.index.write().unwrap();
-            index.remove(&key)
-        };
+        let slot_ref = self.tree.lock().unwrap().get(key.as_bytes());
 
         if let Some(slot_ref) = slot_ref {
             let cached_page = {
@@ -521,7 +473,18 @@ impl BatchedComputeNode {
             self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
             self.page_cache.write().unwrap().insert(slot_ref.page_id, page.clone());
             let _page_id = slot_ref.page_id;
-            self.tree.remove(&key);
+            self.tree.lock().unwrap().remove(key.as_bytes())?;
+            if let Some(wal_sender) = &self.wal_sender {
+                let lsn = wal_sender.next_lsn();
+                wal_sender.enqueue(crate::node::WalRecord {
+                    lsn,
+                    op: 2,
+                    page_id: slot_ref.page_id,
+                    slot_id: slot_ref.slot_id,
+                    key: key.as_bytes().to_vec(),
+                    value: Vec::new(),
+                });
+            }
             return Ok(true);
         }
 
@@ -572,13 +535,12 @@ impl BatchedComputeNode {
 
         let mut out = vec![None; keys.len()];
         let mut missing_pages: HashSet<PageId> = HashSet::new();
-        let mut pending: Vec<(usize, String, SlotRef)> = Vec::new();
+        let mut pending: Vec<(usize, String, PageSlotRef)> = Vec::new();
 
         {
-            let index = self.index.read().unwrap();
             let page_cache = self.page_cache.read().unwrap();
             for (idx, key) in keys.iter().cloned().enumerate() {
-                if let Some(slot_ref) = index.get(&key).copied() {
+                if let Some(slot_ref) = self.tree.lock().unwrap().get(key.as_bytes()) {
                     if let Some(page) = page_cache.get(&slot_ref.page_id) {
                         if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
                             out[idx] = Some(value);
@@ -624,34 +586,6 @@ impl BatchedComputeNode {
             return Ok(());
         }
 
-        if let Some(wal_sender) = &self.wal_sender {
-            for (key, value) in items {
-                let lsn = wal_sender.next_lsn();
-                wal_sender.enqueue(crate::node::WalRecord {
-                    lsn,
-                    op: 1,
-                    page_id: 0,
-                    slot_id: 0,
-                    key: key.as_bytes().to_vec(),
-                    value: value.clone(),
-                });
-            }
-        }
-
-        if let Some(wal_sender) = &self.wal_sender {
-            for (key, value) in items {
-                let lsn = wal_sender.next_lsn();
-                wal_sender.enqueue(crate::node::WalRecord {
-                    lsn,
-                    op: 1,
-                    page_id: 0,
-                    slot_id: 0,
-                    key: key.as_bytes().to_vec(),
-                    value: value.clone(),
-                });
-            }
-        }
-
         self.operations
             .fetch_add(items.len(), Ordering::Relaxed);
 
@@ -662,14 +596,7 @@ impl BatchedComputeNode {
             let payload_len = payload_len(key.as_bytes(), value)?;
             let required = payload_len + SLOT_ENTRY_SIZE;
 
-            let mut old_slot = None;
-            {
-                let mut index = self.index.write().unwrap();
-                if let Some(slot_ref) = index.remove(&key) {
-                    old_slot = Some(slot_ref);
-                }
-            }
-
+            let old_slot = self.tree.lock().unwrap().get(key.as_bytes());
             if let Some(slot_ref) = old_slot {
                 let page = if let Some(page) = modified_pages.get(&slot_ref.page_id) {
                     page.clone()
@@ -692,7 +619,7 @@ impl BatchedComputeNode {
                 let free = page_free_space(&page);
                 self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
                 modified_pages.insert(slot_ref.page_id, page);
-                self.tree.remove(&key);
+                self.tree.lock().unwrap().remove(key.as_bytes())?;
             }
 
             let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
@@ -726,11 +653,22 @@ impl BatchedComputeNode {
             let free = page_free_space(&page);
             self.fsm.lock().unwrap().update_page(page_id, free);
             modified_pages.insert(page_id, page);
-            self.index
-                .write()
+            self.tree
+                .lock()
                 .unwrap()
-                .insert(key.clone(), SlotRef { page_id, slot_id });
-            self.tree.insert(key);
+                .insert(key.as_bytes().to_vec(), PageSlotRef { page_id, slot_id })?;
+
+            if let Some(wal_sender) = &self.wal_sender {
+                let lsn = wal_sender.next_lsn();
+                wal_sender.enqueue(crate::node::WalRecord {
+                    lsn,
+                    op: 1,
+                    page_id,
+                    slot_id,
+                    key: key.as_bytes().to_vec(),
+                    value: value.clone(),
+                });
+            }
         }
 
         if !modified_pages.is_empty() {
@@ -746,29 +684,30 @@ impl BatchedComputeNode {
     }
 
     pub async fn range(&self, start: &str, end: &str) -> Result<Vec<(String, Value)>> {
-        let keys = self.tree.keys_in_range(&start.to_string(), &end.to_string());
+        let keys = self
+            .tree
+            .lock()
+            .unwrap()
+            .range(start.as_bytes(), end.as_bytes());
         if keys.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut out = Vec::with_capacity(keys.len());
         let mut missing_pages: HashSet<PageId> = HashSet::new();
-        let mut key_slots: Vec<(String, SlotRef)> = Vec::with_capacity(keys.len());
+        let mut key_slots: Vec<(Vec<u8>, PageSlotRef)> = Vec::with_capacity(keys.len());
 
         {
-            let index = self.index.read().unwrap();
             let page_cache = self.page_cache.read().unwrap();
-            for key in keys.into_iter() {
-                if let Some(slot_ref) = index.get(&key).copied() {
-                    if let Some(page) = page_cache.get(&slot_ref.page_id) {
-                        if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
-                            out.push((key, value));
-                            continue;
-                        }
+            for (key, slot_ref) in keys.into_iter() {
+                if let Some(page) = page_cache.get(&slot_ref.page_id) {
+                    if let Some(value) = read_value(page, slot_ref.slot_id, &key) {
+                        out.push((String::from_utf8_lossy(&key).to_string(), value));
+                        continue;
                     }
-                    missing_pages.insert(slot_ref.page_id);
-                    key_slots.push((key, slot_ref));
                 }
+                missing_pages.insert(slot_ref.page_id);
+                key_slots.push((key, slot_ref));
             }
         }
 
@@ -791,8 +730,8 @@ impl BatchedComputeNode {
         let cache = self.page_cache.read().unwrap();
         for (key, slot_ref) in key_slots.into_iter() {
             if let Some(page) = cache.get(&slot_ref.page_id) {
-                if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
-                    out.push((key, value));
+                if let Some(value) = read_value(page, slot_ref.slot_id, &key) {
+                    out.push((String::from_utf8_lossy(&key).to_string(), value));
                 }
             }
         }
@@ -806,7 +745,7 @@ impl BatchedComputeNode {
         let operations = self.operations();
         let cache_hit_rate = self.cache_hit_rate();
         ComputeStats {
-            keys: self.tree.len(),
+            keys: self.tree.lock().unwrap().len(),
             pages: self.page_cache.read().unwrap().len(),
             cache_hits,
             cache_misses,
@@ -845,12 +784,6 @@ pub struct ComputeStats {
     pub cache_misses: usize,
     pub operations: usize,
     pub cache_hit_rate: f64,
-}
-
-#[derive(Clone, Copy)]
-struct SlotRef {
-    page_id: PageId,
-    slot_id: u16,
 }
 
 struct FreeSpaceMap {
@@ -896,8 +829,7 @@ impl FreeSpaceMap {
 }
 
 pub struct ComputeNode {
-    tree: BPlusTree<String>,
-    index: RwLock<HashMap<String, SlotRef>>,
+    tree: Mutex<PageBPlusTree>,
     page_cache: RwLock<HashMap<PageId, Page>>,
     fsm: Mutex<FreeSpaceMap>,
     cache_hits: AtomicUsize,
@@ -911,8 +843,7 @@ pub struct ComputeNode {
 impl ComputeNode {
     pub fn new() -> Self {
         Self {
-            tree: BPlusTree::new(),
-            index: RwLock::new(HashMap::new()),
+            tree: Mutex::new(PageBPlusTree::new()),
             page_cache: RwLock::new(HashMap::new()),
             fsm: Mutex::new(FreeSpaceMap::new()),
             cache_hits: AtomicUsize::new(0),
@@ -933,8 +864,7 @@ impl ComputeNode {
             wal_sender_clone.run().await;
         });
         Ok(Self {
-            tree: BPlusTree::new(),
-            index: RwLock::new(HashMap::new()),
+            tree: Mutex::new(PageBPlusTree::new()),
             page_cache: RwLock::new(HashMap::new()),
             fsm: Mutex::new(FreeSpaceMap::new()),
             cache_hits: AtomicUsize::new(0),
@@ -955,8 +885,7 @@ impl ComputeNode {
             wal_sender_clone.run().await;
         });
         Ok(Self {
-            tree: BPlusTree::new(),
-            index: RwLock::new(HashMap::new()),
+            tree: Mutex::new(PageBPlusTree::new()),
             page_cache: RwLock::new(HashMap::new()),
             fsm: Mutex::new(FreeSpaceMap::new()),
             cache_hits: AtomicUsize::new(0),
@@ -981,8 +910,7 @@ impl ComputeNode {
             wal_sender_clone.run().await;
         });
         Ok(Self {
-            tree: BPlusTree::new(),
-            index: RwLock::new(HashMap::new()),
+            tree: Mutex::new(PageBPlusTree::new()),
             page_cache: RwLock::new(HashMap::new()),
             fsm: Mutex::new(FreeSpaceMap::new()),
             cache_hits: AtomicUsize::new(0),
@@ -997,19 +925,12 @@ impl ComputeNode {
     pub async fn get(&self, key: impl AsRef<str>) -> Result<Option<Value>> {
         self.operations.fetch_add(1, Ordering::Relaxed);
         let key = key.as_ref().to_string();
-        if !self.tree.contains(&key) {
-            self.cache_misses.fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
-        }
 
-        let slot_ref = {
-            let index = self.index.read().unwrap();
-            match index.get(&key) {
-                Some(slot_ref) => *slot_ref,
-                None => {
-                    self.cache_misses.fetch_add(1, Ordering::Relaxed);
-                    return Ok(None);
-                }
+        let slot_ref = match self.tree.lock().unwrap().get(key.as_bytes()) {
+            Some(slot_ref) => slot_ref,
+            None => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
             }
         };
 
@@ -1046,13 +967,7 @@ impl ComputeNode {
         let payload_len = payload_len(key.as_bytes(), value)?;
         let required = payload_len + SLOT_ENTRY_SIZE;
 
-        let mut old_slot = None;
-        {
-            let mut index = self.index.write().unwrap();
-            if let Some(slot_ref) = index.remove(&key) {
-                old_slot = Some(slot_ref);
-            }
-        }
+        let old_slot = self.tree.lock().unwrap().get(key.as_bytes());
         if let Some(slot_ref) = old_slot {
             let cached_page = {
                 self.page_cache
@@ -1075,8 +990,8 @@ impl ComputeNode {
                     .insert(slot_ref.page_id, page.clone());
                 let _page_id = slot_ref.page_id;
             }
-            self.tree.remove(&key);
-        }
+                self.tree.lock().unwrap().remove(key.as_bytes())?;
+            }
 
         let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
         let cached_page = {
@@ -1105,13 +1020,10 @@ impl ComputeNode {
         let free = page_free_space(&page);
         self.fsm.lock().unwrap().update_page(page_id, free);
         self.page_cache.write().unwrap().insert(page_id, page.clone());
-        self.index
-            .write()
+        self.tree
+            .lock()
             .unwrap()
-            .insert(key.clone(), SlotRef { page_id, slot_id });
-        self.tree.insert(key);
-
-        let _page_id = page_id;
+            .insert(key.as_bytes().to_vec(), PageSlotRef { page_id, slot_id })?;
 
         Ok(())
     }
@@ -1119,10 +1031,7 @@ impl ComputeNode {
     pub async fn delete(&self, key: impl AsRef<str>) -> Result<bool> {
         self.operations.fetch_add(1, Ordering::Relaxed);
         let key = key.as_ref().to_string();
-        let slot_ref = {
-            let mut index = self.index.write().unwrap();
-            index.remove(&key)
-        };
+        let slot_ref = self.tree.lock().unwrap().get(key.as_bytes());
 
         if let Some(slot_ref) = slot_ref {
             let cached_page = {
@@ -1146,8 +1055,7 @@ impl ComputeNode {
                 .write()
                 .unwrap()
                 .insert(slot_ref.page_id, page.clone());
-            let _page_id = slot_ref.page_id;
-            self.tree.remove(&key);
+            self.tree.lock().unwrap().remove(key.as_bytes())?;
             return Ok(true);
         }
 
@@ -1192,17 +1100,10 @@ impl ComputeNode {
     }
 
 
-    pub async fn open_stream(&self) -> Result<StreamClient> {
-        let storage = match &self.storage {
-            Some(storage) => storage,
-            None => return Err(crate::Error::Capnp("no storage configured".to_string())),
-        };
-        storage.open_stream().await
-    }
 
     pub fn exists(&self, key: impl AsRef<str>) -> bool {
         let key = key.as_ref().to_string();
-        self.tree.contains(&key)
+        self.tree.lock().unwrap().get(key.as_bytes()).is_some()
     }
 
     pub async fn get_multi(&self, keys: &[String]) -> Result<Vec<Option<Value>>> {
@@ -1212,13 +1113,12 @@ impl ComputeNode {
 
         let mut out = vec![None; keys.len()];
         let mut missing_pages: HashSet<PageId> = HashSet::new();
-        let mut pending: Vec<(usize, String, SlotRef)> = Vec::new();
+        let mut pending: Vec<(usize, String, PageSlotRef)> = Vec::new();
 
         {
-            let index = self.index.read().unwrap();
             let page_cache = self.page_cache.read().unwrap();
             for (idx, key) in keys.iter().cloned().enumerate() {
-                if let Some(slot_ref) = index.get(&key).copied() {
+                if let Some(slot_ref) = self.tree.lock().unwrap().get(key.as_bytes()) {
                     if let Some(page) = page_cache.get(&slot_ref.page_id) {
                         if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
                             out[idx] = Some(value);
@@ -1274,15 +1174,8 @@ impl ComputeNode {
             let payload_len = payload_len(key.as_bytes(), value)?;
             let required = payload_len + SLOT_ENTRY_SIZE;
 
-            let mut old_slot = None;
-            {
-                let mut index = self.index.write().unwrap();
-                if let Some(slot_ref) = index.remove(&key) {
-                    old_slot = Some(slot_ref);
-                }
-            }
-
-            if let Some(slot_ref) = old_slot {
+        let old_slot = self.tree.lock().unwrap().get(key.as_bytes());
+        if let Some(slot_ref) = old_slot {
                 let page = if let Some(page) = modified_pages.get(&slot_ref.page_id) {
                     page.clone()
                 } else {
@@ -1304,8 +1197,8 @@ impl ComputeNode {
                 let free = page_free_space(&page);
                 self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
                 modified_pages.insert(slot_ref.page_id, page);
-                self.tree.remove(&key);
-            }
+            self.tree.lock().unwrap().remove(key.as_bytes())?;
+        }
 
             let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
             let mut page = if let Some(page) = modified_pages.get(&page_id) {
@@ -1338,11 +1231,34 @@ impl ComputeNode {
             let free = page_free_space(&page);
             self.fsm.lock().unwrap().update_page(page_id, free);
             modified_pages.insert(page_id, page);
-            self.index
-                .write()
-                .unwrap()
-                .insert(key.clone(), SlotRef { page_id, slot_id });
-            self.tree.insert(key);
+        self.tree
+            .lock()
+            .unwrap()
+            .insert(key.as_bytes().to_vec(), PageSlotRef { page_id, slot_id })?;
+
+        if let Some(wal_sender) = &self.wal_sender {
+            let lsn = wal_sender.next_lsn();
+            wal_sender.enqueue(crate::node::WalRecord {
+                lsn,
+                op: 1,
+                page_id,
+                slot_id,
+                key: key.as_bytes().to_vec(),
+                value: value.to_vec(),
+            });
+        }
+
+            if let Some(wal_sender) = &self.wal_sender {
+                let lsn = wal_sender.next_lsn();
+                wal_sender.enqueue(crate::node::WalRecord {
+                    lsn,
+                    op: 1,
+                    page_id,
+                    slot_id,
+                    key: key.as_bytes().to_vec(),
+                    value: value.clone(),
+                });
+            }
         }
 
         if !modified_pages.is_empty() {
@@ -1358,29 +1274,30 @@ impl ComputeNode {
     }
 
     pub async fn range(&self, start: &str, end: &str) -> Result<Vec<(String, Value)>> {
-        let keys = self.tree.keys_in_range(&start.to_string(), &end.to_string());
+        let keys = self
+            .tree
+            .lock()
+            .unwrap()
+            .range(start.as_bytes(), end.as_bytes());
         if keys.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut out = Vec::with_capacity(keys.len());
         let mut missing_pages: HashSet<PageId> = HashSet::new();
-        let mut key_slots: Vec<(String, SlotRef)> = Vec::with_capacity(keys.len());
+        let mut key_slots: Vec<(Vec<u8>, PageSlotRef)> = Vec::with_capacity(keys.len());
 
         {
-            let index = self.index.read().unwrap();
             let page_cache = self.page_cache.read().unwrap();
-            for key in keys.into_iter() {
-                if let Some(slot_ref) = index.get(&key).copied() {
-                    if let Some(page) = page_cache.get(&slot_ref.page_id) {
-                        if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
-                            out.push((key, value));
-                            continue;
-                        }
+            for (key, slot_ref) in keys.into_iter() {
+                if let Some(page) = page_cache.get(&slot_ref.page_id) {
+                    if let Some(value) = read_value(page, slot_ref.slot_id, &key) {
+                        out.push((String::from_utf8_lossy(&key).to_string(), value));
+                        continue;
                     }
-                    missing_pages.insert(slot_ref.page_id);
-                    key_slots.push((key, slot_ref));
                 }
+                missing_pages.insert(slot_ref.page_id);
+                key_slots.push((key, slot_ref));
             }
         }
 
@@ -1403,8 +1320,8 @@ impl ComputeNode {
         let cache = self.page_cache.read().unwrap();
         for (key, slot_ref) in key_slots.into_iter() {
             if let Some(page) = cache.get(&slot_ref.page_id) {
-                if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
-                    out.push((key, value));
+                if let Some(value) = read_value(page, slot_ref.slot_id, &key) {
+                    out.push((String::from_utf8_lossy(&key).to_string(), value));
                 }
             }
         }
@@ -1418,7 +1335,7 @@ impl ComputeNode {
         let operations = self.operations();
         let cache_hit_rate = self.cache_hit_rate();
         ComputeStats {
-            keys: self.tree.len(),
+            keys: self.tree.lock().unwrap().len(),
             pages: self.page_cache.read().unwrap().len(),
             cache_hits,
             cache_misses,
@@ -1494,12 +1411,6 @@ impl StorageClient {
         Ok(response.get()?.get_found())
     }
 
-    pub async fn open_stream(&self) -> Result<StreamClient> {
-        let request = self.client.stream_request();
-        let response = request.send().promise.await?;
-        let stream = response.get()?.get_stream()?;
-        Ok(StreamClient { stream })
-    }
 
     pub async fn batch_put(&self, items: &[(PageId, Page)]) -> Result<()> {
         let mut request = self.client.batch_put_request();
@@ -1516,7 +1427,7 @@ impl StorageClient {
 
     pub async fn append_wal(&self, batch: &WalBatch) -> Result<()> {
         let mut request = self.client.append_wal_request();
-        let mut params = request.get();
+        let params = request.get();
         let mut wal_batch = params.init_batch();
         wal_batch.set_start_lsn(batch.start_lsn);
         wal_batch.set_end_lsn(batch.end_lsn);
@@ -1535,27 +1446,6 @@ impl StorageClient {
     }
 }
 
-
-pub struct StreamClient {
-    stream: storage_stream::Client,
-}
-
-impl StreamClient {
-    pub async fn next(&self, max: u32) -> Result<(Vec<(PageId, Page)>, bool)> {
-        let mut request = self.stream.next_request();
-        request.get().set_max(max);
-        let response = request.send().promise.await?;
-        let response = response.get()?;
-        let items = response.get_items()?;
-        let mut out = Vec::with_capacity(items.len() as usize);
-        for item in items.iter() {
-            let page_id = item.get_key();
-            let value = item.get_value()?.to_vec();
-            out.push((page_id, value));
-        }
-        Ok((out, response.get_done()))
-    }
-}
 
 fn bucket_count() -> usize {
     PAGE_SIZE / BUCKET_SIZE + 1

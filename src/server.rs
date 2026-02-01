@@ -1,6 +1,6 @@
-use crate::storage_capnp::{storage, stream};
+use crate::storage_capnp::storage;
 use crate::node::{WalBatch, WalRecord};
-use crate::{PageId, Result, StorageNode};
+use crate::{Result, StorageNode};
 use capnp::capability::Promise;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
@@ -20,12 +20,6 @@ pub struct StorageServer {
 
 struct StorageService {
     data: Arc<StorageNode>,
-}
-
-struct StreamService {
-    data: Arc<StorageNode>,
-    keys: Vec<PageId>,
-    position: usize,
 }
 
 impl storage::Server for StorageService {
@@ -101,21 +95,6 @@ impl storage::Server for StorageService {
             results.get().set_found(existed);
             Ok(())
         })
-    }
-
-    fn stream(
-        &mut self,
-        _params: storage::StreamParams,
-        mut results: storage::StreamResults,
-    ) -> Promise<(), capnp::Error> {
-        let keys = self.data.keys();
-        let client: stream::Client = capnp_rpc::new_client(StreamService {
-            data: self.data.clone(),
-            keys,
-            position: 0,
-        });
-        results.get().set_stream(client);
-        Promise::ok(())
     }
 
     fn batch_put(
@@ -210,46 +189,6 @@ impl storage::Server for StorageService {
         })
     }
 
-}
-
-impl stream::Server for StreamService {
-    fn next(
-        &mut self,
-        params: stream::NextParams,
-        mut results: stream::NextResults,
-    ) -> Promise<(), capnp::Error> {
-        let max = match params.get() {
-            Ok(params) => params.get_max() as usize,
-            Err(err) => return Promise::err(err),
-        };
-        let remaining = self.keys.len().saturating_sub(self.position);
-        let count = remaining.min(max);
-        let keys = self.keys[self.position..self.position + count].to_vec();
-        self.position += count;
-        let data = self.data.clone();
-        let done = self.position >= self.keys.len();
-        Promise::from_future(async move {
-            let batch = task::spawn_blocking(move || {
-                let mut out = Vec::new();
-                for key in keys {
-                    if let Some(value) = data.get(key) {
-                        out.push((key, value));
-                    }
-                }
-                out
-            })
-            .await
-            .map_err(map_join_error)?;
-            let mut list = results.get().init_items(batch.len() as u32);
-            for (i, (key, value)) in batch.into_iter().enumerate() {
-                let mut item = list.reborrow().get(i as u32);
-                item.set_key(key);
-                item.set_value(&value);
-            }
-            results.get().set_done(done);
-            Ok(())
-        })
-    }
 }
 
 fn map_join_error(err: task::JoinError) -> capnp::Error {
