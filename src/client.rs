@@ -425,10 +425,7 @@ impl BatchedComputeNode {
                 let free = page_free_space(&page);
                 self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
                 self.page_cache.write().unwrap().insert(slot_ref.page_id, page.clone());
-                let page_id = slot_ref.page_id;
-                if let Some(storage) = &self.storage {
-                    storage.put(page_id, &page).await?;
-                }
+                let _page_id = slot_ref.page_id;
             }
             self.tree.remove(&key);
         }
@@ -466,9 +463,7 @@ impl BatchedComputeNode {
             .insert(key.clone(), SlotRef { page_id, slot_id });
         self.tree.insert(key);
 
-        if let Some(storage) = &self.storage {
-            storage.put(page_id, &page).await?;
-        }
+        let _page_id = page_id;
 
         Ok(())
     }
@@ -476,17 +471,6 @@ impl BatchedComputeNode {
     pub async fn delete(&self, key: impl AsRef<str>) -> Result<bool> {
         self.operations.fetch_add(1, Ordering::Relaxed);
         let key = key.as_ref().to_string();
-        if let Some(wal_sender) = &self.wal_sender {
-            let lsn = wal_sender.next_lsn();
-            wal_sender.enqueue(crate::node::WalRecord {
-                lsn,
-                op: 2,
-                page_id: 0,
-                slot_id: 0,
-                key: key.as_bytes().to_vec(),
-                value: Vec::new(),
-            });
-        }
         if let Some(wal_sender) = &self.wal_sender {
             let lsn = wal_sender.next_lsn();
             wal_sender.enqueue(crate::node::WalRecord {
@@ -522,9 +506,7 @@ impl BatchedComputeNode {
             let free = page_free_space(&page);
             self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
             self.page_cache.write().unwrap().insert(slot_ref.page_id, page.clone());
-            if let Some(storage) = &self.storage {
-                storage.put(slot_ref.page_id, &page).await?;
-            }
+            let _page_id = slot_ref.page_id;
             self.tree.remove(&key);
             return Ok(true);
         }
@@ -744,10 +726,7 @@ impl BatchedComputeNode {
             }
         }
 
-        if let Some(storage) = &self.storage {
-            let batch = modified_pages.into_iter().collect::<Vec<_>>();
-            storage.batch_put(&batch).await?;
-        }
+        let _batch = modified_pages;
 
         Ok(())
     }
@@ -1080,12 +1059,7 @@ impl ComputeNode {
                     .write()
                     .unwrap()
                     .insert(slot_ref.page_id, page.clone());
-                let page_id = slot_ref.page_id;
-                if let Some(batch_sender) = &self.batch_sender {
-                    batch_sender.put(page_id, &page).await?;
-                } else if let Some(storage) = &self.storage {
-                    storage.put(page_id, &page).await?;
-                }
+                let _page_id = slot_ref.page_id;
             }
             self.tree.remove(&key);
         }
@@ -1123,11 +1097,7 @@ impl ComputeNode {
             .insert(key.clone(), SlotRef { page_id, slot_id });
         self.tree.insert(key);
 
-        if let Some(batch_sender) = &self.batch_sender {
-            batch_sender.put(page_id, &page).await?;
-        } else if let Some(storage) = &self.storage {
-            storage.put(page_id, &page).await?;
-        }
+        let _page_id = page_id;
 
         Ok(())
     }
@@ -1162,12 +1132,7 @@ impl ComputeNode {
                 .write()
                 .unwrap()
                 .insert(slot_ref.page_id, page.clone());
-            let page_id = slot_ref.page_id;
-            if let Some(batch_sender) = &self.batch_sender {
-                batch_sender.put(page_id, &page).await?;
-            } else if let Some(storage) = &self.storage {
-                storage.put(page_id, &page).await?;
-            }
+            let _page_id = slot_ref.page_id;
             self.tree.remove(&key);
             return Ok(true);
         }
@@ -1373,10 +1338,7 @@ impl ComputeNode {
             }
         }
 
-        if let Some(storage) = &self.storage {
-            let batch = modified_pages.into_iter().collect::<Vec<_>>();
-            storage.batch_put(&batch).await?;
-        }
+        let _batch = modified_pages;
 
         Ok(())
     }
