@@ -1,4 +1,4 @@
-use crate::{PageId, Result, Value};
+use crate::{Page, PageId, Result, Value, PAGE_SIZE};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -6,10 +6,12 @@ use std::hash::Hasher;
 use std::io::{Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 const TOMBSTONE: u32 = u32::MAX;
+const PAGE_HEADER_SIZE: usize = 6;
+const SLOT_ENTRY_SIZE: usize = 4;
 #[cfg(test)]
 const MAX_SEGMENT_SIZE: u64 = 8 * 1024;
 #[cfg(not(test))]
@@ -34,6 +36,54 @@ pub struct StorageNode {
     compaction_segment_limit: usize,
     compaction_stale_ratio: u64,
     wal_sender: Mutex<Option<Sender<WalBatch>>>,
+    wal_replay_rx: Mutex<Option<Receiver<WalBatch>>>,
+}
+
+struct ReplayBuffer {
+    bytes: usize,
+    records: Vec<WalRecord>,
+}
+
+struct StorageNodeReplay {
+    node: Arc<StorageNode>,
+}
+
+impl StorageNodeReplay {
+    fn new(node: Arc<StorageNode>) -> Self {
+        Self { node }
+    }
+
+    fn write_page(&self, page_id: PageId, page: &[u8]) -> Result<()> {
+        self.node.put(page_id, page);
+        Ok(())
+    }
+
+    fn read_page(&self, page_id: PageId) -> Option<Page> {
+        self.node.get(page_id)
+    }
+}
+
+impl ReplayBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: 0,
+            records: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, record: WalRecord) {
+        self.bytes += record.key.len() + record.value.len() + 32;
+        self.records.push(record);
+    }
+
+    fn should_flush(&self) -> bool {
+        self.bytes >= 8 * 1024
+    }
+
+    fn take(&mut self) -> Vec<WalRecord> {
+        self.bytes = 0;
+        std::mem::take(&mut self.records)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -48,6 +98,16 @@ struct LogWriter {
     size: u64,
 }
 
+impl Clone for LogWriter {
+    fn clone(&self) -> Self {
+        Self {
+            file_id: self.file_id,
+            file: self.file.try_clone().expect("failed to clone log writer"),
+            size: self.size,
+        }
+    }
+}
+
 impl LogWriter {
     fn rotate_if_needed(&mut self, dir: &Path) -> Result<()> {
         if self.size < MAX_SEGMENT_SIZE {
@@ -58,6 +118,27 @@ impl LogWriter {
         self.size = 0;
         Ok(())
     }
+}
+
+fn append_entry_to_log(
+    dir: &Path,
+    writer: &mut LogWriter,
+    key: PageId,
+    value: &[u8],
+) -> Result<IndexEntry> {
+    writer.rotate_if_needed(dir)?;
+    let offset = writer.size;
+    let entry_len = 8 + 8 + value.len() as u64;
+    write_u32(&mut writer.file, 8)?;
+    write_u32(&mut writer.file, value.len() as u32)?;
+    writer.file.write_all(&key.to_le_bytes())?;
+    writer.file.write_all(value)?;
+    writer.size += entry_len;
+    let _ = refresh_manifest(dir, writer.file_id);
+    Ok(IndexEntry {
+        file_id: writer.file_id,
+        offset,
+    })
 }
 
 impl WalWriter {
@@ -113,6 +194,14 @@ struct WalWriter {
 
 struct Stats {
     stale_entries: u64,
+}
+
+impl Clone for Stats {
+    fn clone(&self) -> Self {
+        Self {
+            stale_entries: self.stale_entries,
+        }
+    }
 }
 
 struct Manifest {
@@ -195,20 +284,172 @@ fn encode_wal_batch(batch: &WalBatch, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-fn start_wal_writer(dir: PathBuf) -> Result<Sender<WalBatch>> {
+fn start_wal_writer(dir: PathBuf) -> Result<(Sender<WalBatch>, Receiver<WalBatch>)> {
     let (tx, rx) = mpsc::channel::<WalBatch>();
-    thread::spawn(move || wal_writer_loop(dir, rx));
-    Ok(tx)
+    let (replay_tx, replay_rx) = mpsc::channel::<WalBatch>();
+    thread::spawn(move || wal_writer_loop(dir, rx, replay_tx));
+    Ok((tx, replay_rx))
 }
 
-fn wal_writer_loop(dir: PathBuf, rx: Receiver<WalBatch>) {
+fn wal_writer_loop(dir: PathBuf, rx: Receiver<WalBatch>, replay_tx: Sender<WalBatch>) {
     let mut writer = match WalWriter::open(dir) {
         Ok(writer) => writer,
         Err(_) => return,
     };
     for batch in rx {
-        let _ = writer.append_batch(&batch);
+        if writer.append_batch(&batch).is_ok() {
+            let _ = replay_tx.send(batch);
+        }
     }
+}
+
+fn wal_replay_loop(node: StorageNodeReplay, rx: Receiver<WalBatch>) {
+    let mut buffers: HashMap<PageId, ReplayBuffer> = HashMap::new();
+    for batch in rx {
+        for record in batch.records.into_iter() {
+            let page_id = record.page_id;
+            let buffer = buffers.entry(page_id).or_insert_with(ReplayBuffer::new);
+            buffer.push(record);
+            if buffer.should_flush() {
+                let records = buffer.take();
+                let _ = replay_page_records(&node, page_id, records);
+            }
+        }
+    }
+
+    for (page_id, mut buffer) in buffers.into_iter() {
+        let records = buffer.take();
+        let _ = replay_page_records(&node, page_id, records);
+    }
+}
+
+fn replay_page_records(
+    node: &StorageNodeReplay,
+    page_id: PageId,
+    records: Vec<WalRecord>,
+) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let page = node
+        .read_page(page_id)
+        .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
+    let mut page = page;
+    for record in records {
+        apply_wal_record(&mut page, &record)?;
+    }
+    node.write_page(page_id, &page)
+}
+
+fn apply_wal_record(page: &mut [u8], record: &WalRecord) -> Result<()> {
+    match record.op {
+        1 => insert_record_at_slot(page, record.slot_id, &record.key, &record.value),
+        2 => {
+            clear_slot(page, record.slot_id);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn read_header(page: &[u8]) -> (u16, u16, u16) {
+    let slots = read_u16(page, 0);
+    let free_start = read_u16(page, 2);
+    let free_end = read_u16(page, 4);
+    (slots, free_start, free_end)
+}
+
+fn write_header(page: &mut [u8], slots: u16, free_start: u16, free_end: u16) {
+    write_u16(page, 0, slots);
+    write_u16(page, 2, free_start);
+    write_u16(page, 4, free_end);
+}
+
+fn read_slot(page: &[u8], slot_id: u16) -> (u16, u16) {
+    let offset = slot_offset(slot_id);
+    let pos = read_u16(page, offset);
+    let len = read_u16(page, offset + 2);
+    (pos, len)
+}
+
+fn write_slot(page: &mut [u8], slot_id: u16, offset: u16, len: u16) {
+    let pos = slot_offset(slot_id);
+    write_u16(page, pos, offset);
+    write_u16(page, pos + 2, len)
+}
+
+fn slot_offset(slot_id: u16) -> usize {
+    PAGE_HEADER_SIZE + SLOT_ENTRY_SIZE * slot_id as usize
+}
+
+fn find_free_slot(page: &[u8], slots: u16) -> Option<u16> {
+    for slot_id in 0..slots {
+        let (_, len) = read_slot(page, slot_id);
+        if len == 0 {
+            return Some(slot_id);
+        }
+    }
+    None
+}
+
+fn insert_record_at_slot(page: &mut [u8], slot_id: u16, key: &[u8], value: &[u8]) -> Result<()> {
+    if page.len() != PAGE_SIZE {
+        return Err(crate::Error::InvalidPageSize(page.len(), PAGE_SIZE));
+    }
+    let (mut slots, mut free_start, mut free_end) = read_header(page);
+    let payload_len = 4 + key.len() + value.len();
+
+    let free_slot = if slot_id < slots {
+        Some(slot_id)
+    } else {
+        find_free_slot(page, slots)
+    };
+
+    let mut needed = payload_len;
+    if free_slot.is_none() {
+        needed += SLOT_ENTRY_SIZE;
+    }
+    let free_bytes = free_end.saturating_sub(free_start) as usize;
+    if free_bytes < needed {
+        return Err(crate::Error::InvalidValueSize(needed, free_bytes));
+    }
+
+    let slot_id = free_slot.unwrap_or(slots);
+    if free_slot.is_none() {
+        free_start = free_start.saturating_add(SLOT_ENTRY_SIZE as u16);
+        slots = slots.saturating_add(1);
+    }
+
+    let payload_offset = (free_end as usize).saturating_sub(payload_len) as u16;
+    write_u16(page, payload_offset as usize, key.len() as u16);
+    write_u16(page, payload_offset as usize + 2, value.len() as u16);
+    let mut cursor = payload_offset as usize + 4;
+    page[cursor..cursor + key.len()].copy_from_slice(key);
+    cursor += key.len();
+    page[cursor..cursor + value.len()].copy_from_slice(value);
+
+    write_slot(page, slot_id, payload_offset, payload_len as u16);
+    free_end = payload_offset;
+    write_header(page, slots, free_start, free_end);
+    Ok(())
+}
+
+fn clear_slot(page: &mut [u8], slot_id: u16) {
+    if page.len() != PAGE_SIZE {
+        return;
+    }
+    write_slot(page, slot_id, 0, 0)
+}
+
+fn read_u16(page: &[u8], offset: usize) -> u16 {
+    let mut buf = [0u8; 2];
+    buf.copy_from_slice(&page[offset..offset + 2]);
+    u16::from_le_bytes(buf)
+}
+
+fn write_u16(page: &mut [u8], offset: usize, value: u16) {
+    let bytes = value.to_le_bytes();
+    page[offset..offset + 2].copy_from_slice(&bytes)
 }
 
 impl StorageNode {
@@ -284,8 +525,8 @@ impl StorageNode {
         }
         write_manifest(&dir, file_id, &segments)?;
 
-        let wal_sender = start_wal_writer(dir.clone())?;
-        Ok(Self {
+        let (wal_sender, wal_replay_rx) = start_wal_writer(dir.clone())?;
+        let node = Self {
             dir,
             index: Mutex::new(index),
             writer: Mutex::new(LogWriter {
@@ -298,7 +539,10 @@ impl StorageNode {
             compaction_segment_limit,
             compaction_stale_ratio,
             wal_sender: Mutex::new(Some(wal_sender)),
-        })
+            wal_replay_rx: Mutex::new(Some(wal_replay_rx)),
+        };
+        node.start_wal_replay();
+        Ok(node)
     }
 
     pub fn append_wal_batch(&self, batch: WalBatch) -> Result<()> {
@@ -312,6 +556,32 @@ impl StorageNode {
                 "wal queue not initialized",
             ))),
         }
+    }
+
+    fn clone_inner(&self) -> StorageNode {
+        StorageNode {
+            dir: self.dir.clone(),
+            index: Mutex::new(self.index.lock().unwrap().clone()),
+            writer: Mutex::new(self.writer.lock().unwrap().clone()),
+            readers: Mutex::new(HashMap::new()),
+            stats: Mutex::new(self.stats.lock().unwrap().clone()),
+            compaction_segment_limit: self.compaction_segment_limit,
+            compaction_stale_ratio: self.compaction_stale_ratio,
+            wal_sender: Mutex::new(None),
+            wal_replay_rx: Mutex::new(None),
+        }
+    }
+
+    pub fn start_wal_replay(&self) {
+        let rx = self.wal_replay_rx.lock().unwrap().take();
+        if rx.is_none() {
+            return;
+        }
+        let rx = rx.unwrap();
+        let replay = StorageNodeReplay::new(Arc::new(self.clone_inner()));
+        thread::spawn(move || {
+            wal_replay_loop(replay, rx);
+        });
     }
 
     /// Get the number of keys in storage.
@@ -453,25 +723,8 @@ impl StorageNode {
 
     fn append_entry(&self, key: PageId, value: &[u8]) -> Result<IndexEntry> {
         let mut writer = self.writer.lock().unwrap();
-        if writer.size >= MAX_SEGMENT_SIZE {
-            writer.file_id += 1;
-            writer.file = create_segment(&self.dir, writer.file_id)?;
-            writer.size = 0;
-            let _ = refresh_manifest(&self.dir, writer.file_id);
-        }
-
-        let offset = writer.size;
-        let entry_len = 8 + 8 + value.len() as u64;
-        write_u32(&mut writer.file, 8)?;
-        write_u32(&mut writer.file, value.len() as u32)?;
-        writer.file.write_all(&key.to_le_bytes())?;
-        writer.file.write_all(value)?;
-        writer.size += entry_len;
-
-        Ok(IndexEntry {
-            file_id: writer.file_id,
-            offset,
-        })
+        let entry = append_entry_to_log(&self.dir, &mut writer, key, value)?;
+        Ok(entry)
     }
 
     fn append_tombstone(&self, key: PageId) -> Result<()> {
