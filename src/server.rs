@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 
@@ -37,15 +38,20 @@ impl storage::Server for StorageService {
             Err(err) => return Promise::err(err),
         };
 
-        if let Some(value) = self.data.get(key) {
-            let mut res = results.get();
-            res.set_found(true);
-            res.set_value(&value);
-        } else {
-            results.get().set_found(false);
-        }
-
-        Promise::ok(())
+        let data = self.data.clone();
+        Promise::from_future(async move {
+            let value = task::spawn_blocking(move || data.get(key))
+                .await
+                .map_err(map_join_error)?;
+            if let Some(value) = value {
+                let mut res = results.get();
+                res.set_found(true);
+                res.set_value(&value);
+            } else {
+                results.get().set_found(false);
+            }
+            Ok(())
+        })
     }
 
     fn put(
@@ -63,8 +69,13 @@ impl storage::Server for StorageService {
             Err(err) => return Promise::err(err),
         };
 
-        self.data.put(key, &value);
-        Promise::ok(())
+        let data = self.data.clone();
+        Promise::from_future(async move {
+            task::spawn_blocking(move || data.put(key, &value))
+                .await
+                .map_err(map_join_error)?;
+            Ok(())
+        })
     }
 
     fn delete(
@@ -76,10 +87,19 @@ impl storage::Server for StorageService {
             Ok(params) => params.get_key(),
             Err(err) => return Promise::err(err),
         };
-        let existed = self.data.get(key).is_some();
-        self.data.delete(key);
-        results.get().set_found(existed);
-        Promise::ok(())
+        let data = self.data.clone();
+        Promise::from_future(async move {
+            let data_for_get = data.clone();
+            let existed = task::spawn_blocking(move || data_for_get.get(key).is_some())
+                .await
+                .map_err(map_join_error)?;
+            let data_for_delete = data.clone();
+            task::spawn_blocking(move || data_for_delete.delete(key))
+                .await
+                .map_err(map_join_error)?;
+            results.get().set_found(existed);
+            Ok(())
+        })
     }
 
     fn stream(
@@ -111,16 +131,26 @@ impl storage::Server for StorageService {
             Err(err) => return Promise::err(err),
         };
 
+        let mut batch = Vec::with_capacity(items.len() as usize);
         for item in items.iter() {
             let key = item.get_key();
             let value = match item.get_value() {
                 Ok(value) => value.to_vec(),
                 Err(err) => return Promise::err(err),
             };
-            self.data.put(key, &value);
+            batch.push((key, value));
         }
-
-        Promise::ok(())
+        let data = self.data.clone();
+        Promise::from_future(async move {
+            task::spawn_blocking(move || {
+                for (key, value) in batch {
+                    data.put(key, &value);
+                }
+            })
+            .await
+            .map_err(map_join_error)?;
+            Ok(())
+        })
     }
 
 }
@@ -137,22 +167,36 @@ impl stream::Server for StreamService {
         };
         let remaining = self.keys.len().saturating_sub(self.position);
         let count = remaining.min(max);
-        let mut batch = Vec::with_capacity(count);
-        for key in self.keys[self.position..self.position + count].iter() {
-            if let Some(value) = self.data.get(*key) {
-                batch.push((*key, value));
-            }
-        }
+        let keys = self.keys[self.position..self.position + count].to_vec();
         self.position += count;
-        let mut list = results.get().init_items(batch.len() as u32);
-        for (i, (key, value)) in batch.into_iter().enumerate() {
-            let mut item = list.reborrow().get(i as u32);
-            item.set_key(key);
-            item.set_value(&value);
-        }
-        results.get().set_done(self.position >= self.keys.len());
-        Promise::ok(())
+        let data = self.data.clone();
+        let done = self.position >= self.keys.len();
+        Promise::from_future(async move {
+            let batch = task::spawn_blocking(move || {
+                let mut out = Vec::new();
+                for key in keys {
+                    if let Some(value) = data.get(key) {
+                        out.push((key, value));
+                    }
+                }
+                out
+            })
+            .await
+            .map_err(map_join_error)?;
+            let mut list = results.get().init_items(batch.len() as u32);
+            for (i, (key, value)) in batch.into_iter().enumerate() {
+                let mut item = list.reborrow().get(i as u32);
+                item.set_key(key);
+                item.set_value(&value);
+            }
+            results.get().set_done(done);
+            Ok(())
+        })
     }
+}
+
+fn map_join_error(err: task::JoinError) -> capnp::Error {
+    capnp::Error::failed(format!("storage task failed: {err}"))
 }
 
 impl StorageServer {
