@@ -431,17 +431,157 @@ impl BatchedComputeNode {
     }
 
     pub async fn get_multi(&self, keys: &[String]) -> Result<Vec<Option<Value>>> {
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            out.push(self.get(key).await?);
+        if keys.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let mut out = vec![None; keys.len()];
+        let mut missing_pages: HashSet<PageId> = HashSet::new();
+        let mut pending: Vec<(usize, String, SlotRef)> = Vec::new();
+
+        {
+            let index = self.index.read().unwrap();
+            let page_cache = self.page_cache.read().unwrap();
+            for (idx, key) in keys.iter().cloned().enumerate() {
+                if let Some(slot_ref) = index.get(&key).copied() {
+                    if let Some(page) = page_cache.get(&slot_ref.page_id) {
+                        if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
+                            out[idx] = Some(value);
+                            continue;
+                        }
+                    }
+                    missing_pages.insert(slot_ref.page_id);
+                    pending.push((idx, key, slot_ref));
+                }
+            }
+        }
+
+        if !missing_pages.is_empty() {
+            let fetches = missing_pages
+                .iter()
+                .map(|page_id| self.fetch_page(*page_id))
+                .collect::<Vec<_>>();
+            let pages = try_join_all(fetches).await?;
+            {
+                let mut cache = self.page_cache.write().unwrap();
+                for (page_id, page) in missing_pages.iter().copied().zip(pages.into_iter()) {
+                    if let Some(page) = page {
+                        cache.insert(page_id, page);
+                    }
+                }
+            }
+        }
+
+        let cache = self.page_cache.read().unwrap();
+        for (idx, key, slot_ref) in pending.into_iter() {
+            if let Some(page) = cache.get(&slot_ref.page_id) {
+                if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
+                    out[idx] = Some(value);
+                }
+            }
+        }
+
         Ok(out)
     }
 
     pub async fn put_multi(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
-        for (key, value) in items {
-            self.put(key, value).await?;
+        if items.is_empty() {
+            return Ok(());
         }
+
+        self.operations
+            .fetch_add(items.len(), Ordering::Relaxed);
+
+        let mut modified_pages: HashMap<PageId, Page> = HashMap::new();
+
+        for (key, value) in items {
+            let key = key.clone();
+            let payload_len = payload_len(key.as_bytes(), value)?;
+            let required = payload_len + SLOT_ENTRY_SIZE;
+
+            let mut old_slot = None;
+            {
+                let mut index = self.index.write().unwrap();
+                if let Some(slot_ref) = index.remove(&key) {
+                    old_slot = Some(slot_ref);
+                }
+            }
+
+            if let Some(slot_ref) = old_slot {
+                let page = if let Some(page) = modified_pages.get(&slot_ref.page_id) {
+                    page.clone()
+                } else {
+                    let cached_page = {
+                        self.page_cache
+                            .read()
+                            .unwrap()
+                            .get(&slot_ref.page_id)
+                            .cloned()
+                    };
+                    match cached_page {
+                        Some(page) => page,
+                        None => self.fetch_page(slot_ref.page_id).await?.unwrap_or_else(new_page),
+                    }
+                };
+
+                let mut page = page;
+                clear_slot(&mut page, slot_ref.slot_id);
+                let free = page_free_space(&page);
+                self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
+                modified_pages.insert(slot_ref.page_id, page);
+                self.tree.remove(&key);
+            }
+
+            let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
+            let mut page = if let Some(page) = modified_pages.get(&page_id) {
+                page.clone()
+            } else {
+                let cached_page = {
+                    self.page_cache.read().unwrap().get(&page_id).cloned()
+                };
+                if let Some(page) = cached_page {
+                    page
+                } else if is_new {
+                    new_page()
+                } else {
+                    self.fetch_page(page_id).await?.unwrap_or_else(new_page)
+                }
+            };
+
+            let mut slot_id = insert_record(&mut page, key.as_bytes(), value)?;
+            if slot_id.is_none() {
+                let (fresh_id, _) = self.fsm.lock().unwrap().allocate(PAGE_SIZE);
+                page_id = fresh_id;
+                page = new_page();
+                slot_id = insert_record(&mut page, key.as_bytes(), value)?;
+            }
+
+            let slot_id = slot_id.ok_or_else(|| {
+                Error::InvalidValueSize(value.len(), max_value_size_for_key(key.as_bytes()))
+            })?;
+
+            let free = page_free_space(&page);
+            self.fsm.lock().unwrap().update_page(page_id, free);
+            modified_pages.insert(page_id, page);
+            self.index
+                .write()
+                .unwrap()
+                .insert(key.clone(), SlotRef { page_id, slot_id });
+            self.tree.insert(key);
+        }
+
+        if !modified_pages.is_empty() {
+            let mut cache = self.page_cache.write().unwrap();
+            for (page_id, page) in modified_pages.iter() {
+                cache.insert(*page_id, page.clone());
+            }
+        }
+
+        if let Some(storage) = &self.storage {
+            let batch = modified_pages.into_iter().collect::<Vec<_>>();
+            storage.batch_put(&batch).await?;
+        }
+
         Ok(())
     }
 
@@ -898,17 +1038,157 @@ impl ComputeNode {
     }
 
     pub async fn get_multi(&self, keys: &[String]) -> Result<Vec<Option<Value>>> {
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            out.push(self.get(key).await?);
+        if keys.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let mut out = vec![None; keys.len()];
+        let mut missing_pages: HashSet<PageId> = HashSet::new();
+        let mut pending: Vec<(usize, String, SlotRef)> = Vec::new();
+
+        {
+            let index = self.index.read().unwrap();
+            let page_cache = self.page_cache.read().unwrap();
+            for (idx, key) in keys.iter().cloned().enumerate() {
+                if let Some(slot_ref) = index.get(&key).copied() {
+                    if let Some(page) = page_cache.get(&slot_ref.page_id) {
+                        if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
+                            out[idx] = Some(value);
+                            continue;
+                        }
+                    }
+                    missing_pages.insert(slot_ref.page_id);
+                    pending.push((idx, key, slot_ref));
+                }
+            }
+        }
+
+        if !missing_pages.is_empty() {
+            let fetches = missing_pages
+                .iter()
+                .map(|page_id| self.fetch_page(*page_id))
+                .collect::<Vec<_>>();
+            let pages = try_join_all(fetches).await?;
+            {
+                let mut cache = self.page_cache.write().unwrap();
+                for (page_id, page) in missing_pages.iter().copied().zip(pages.into_iter()) {
+                    if let Some(page) = page {
+                        cache.insert(page_id, page);
+                    }
+                }
+            }
+        }
+
+        let cache = self.page_cache.read().unwrap();
+        for (idx, key, slot_ref) in pending.into_iter() {
+            if let Some(page) = cache.get(&slot_ref.page_id) {
+                if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
+                    out[idx] = Some(value);
+                }
+            }
+        }
+
         Ok(out)
     }
 
     pub async fn put_multi(&self, items: &[(String, Vec<u8>)]) -> Result<()> {
-        for (key, value) in items {
-            self.put(key, value).await?;
+        if items.is_empty() {
+            return Ok(());
         }
+
+        self.operations
+            .fetch_add(items.len(), Ordering::Relaxed);
+
+        let mut modified_pages: HashMap<PageId, Page> = HashMap::new();
+
+        for (key, value) in items {
+            let key = key.clone();
+            let payload_len = payload_len(key.as_bytes(), value)?;
+            let required = payload_len + SLOT_ENTRY_SIZE;
+
+            let mut old_slot = None;
+            {
+                let mut index = self.index.write().unwrap();
+                if let Some(slot_ref) = index.remove(&key) {
+                    old_slot = Some(slot_ref);
+                }
+            }
+
+            if let Some(slot_ref) = old_slot {
+                let page = if let Some(page) = modified_pages.get(&slot_ref.page_id) {
+                    page.clone()
+                } else {
+                    let cached_page = {
+                        self.page_cache
+                            .read()
+                            .unwrap()
+                            .get(&slot_ref.page_id)
+                            .cloned()
+                    };
+                    match cached_page {
+                        Some(page) => page,
+                        None => self.fetch_page(slot_ref.page_id).await?.unwrap_or_else(new_page),
+                    }
+                };
+
+                let mut page = page;
+                clear_slot(&mut page, slot_ref.slot_id);
+                let free = page_free_space(&page);
+                self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
+                modified_pages.insert(slot_ref.page_id, page);
+                self.tree.remove(&key);
+            }
+
+            let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
+            let mut page = if let Some(page) = modified_pages.get(&page_id) {
+                page.clone()
+            } else {
+                let cached_page = {
+                    self.page_cache.read().unwrap().get(&page_id).cloned()
+                };
+                if let Some(page) = cached_page {
+                    page
+                } else if is_new {
+                    new_page()
+                } else {
+                    self.fetch_page(page_id).await?.unwrap_or_else(new_page)
+                }
+            };
+
+            let mut slot_id = insert_record(&mut page, key.as_bytes(), value)?;
+            if slot_id.is_none() {
+                let (fresh_id, _) = self.fsm.lock().unwrap().allocate(PAGE_SIZE);
+                page_id = fresh_id;
+                page = new_page();
+                slot_id = insert_record(&mut page, key.as_bytes(), value)?;
+            }
+
+            let slot_id = slot_id.ok_or_else(|| {
+                Error::InvalidValueSize(value.len(), max_value_size_for_key(key.as_bytes()))
+            })?;
+
+            let free = page_free_space(&page);
+            self.fsm.lock().unwrap().update_page(page_id, free);
+            modified_pages.insert(page_id, page);
+            self.index
+                .write()
+                .unwrap()
+                .insert(key.clone(), SlotRef { page_id, slot_id });
+            self.tree.insert(key);
+        }
+
+        if !modified_pages.is_empty() {
+            let mut cache = self.page_cache.write().unwrap();
+            for (page_id, page) in modified_pages.iter() {
+                cache.insert(*page_id, page.clone());
+            }
+        }
+
+        if let Some(storage) = &self.storage {
+            let batch = modified_pages.into_iter().collect::<Vec<_>>();
+            storage.batch_put(&batch).await?;
+        }
+
         Ok(())
     }
 
