@@ -61,32 +61,6 @@ impl StorageClientPool {
 
 }
 
-/// Sliding window batch sender for RPC requests.
-/// Reduces RPC overhead by allowing in-flight requests and queuing when window is full.
-///
-/// The sender maintains a window of in-flight requests. When the window is full,
-/// new requests are queued until a slot becomes available. This allows batching
-/// of RPC calls without explicitly waiting for batch size thresholds.
-///
-/// # How it works
-/// - Window size = N means up to N requests can be in-flight simultaneously
-/// - When window is full, requests wait in a queue
-/// - When any request completes, a waiting request is sent
-/// - Result: lower latency (≈1 RTT) with high throughput
-///
-/// # Usage
-/// ```ignore
-/// // Create with window size of 16
-/// let sender = Arc::new(BatchSender::new(client, 16));
-///
-/// // Send requests - they are automatically batched via sliding window
-/// for i in 0..100 {
-///     let s = sender.clone();
-///     tokio::spawn(async move {
-///         s.put(i, &data).await;
-///     });
-/// }
-/// ```
 pub struct BatchSender {
     client: Arc<StorageClient>,
     in_flight: Arc<AtomicUsize>,
@@ -290,12 +264,10 @@ impl BatchedComputeNode {
         }
 
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
-        let storage = match &self.storage {
-            Some(storage) => storage,
+        let page = match &self.storage {
+            Some(storage) => storage.get(slot_ref.page_id).await?,
             None => return Ok(None),
         };
-
-        let page = storage.get(slot_ref.page_id).await?;
         if let Some(page) = page {
             let value = read_value(&page, slot_ref.slot_id, key.as_bytes());
             self.page_cache.write().unwrap().insert(slot_ref.page_id, page);
@@ -329,9 +301,9 @@ impl BatchedComputeNode {
                 let free = page_free_space(&page);
                 self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
                 self.page_cache.write().unwrap().insert(slot_ref.page_id, page.clone());
-                if let Some(storage) = &self.storage {
-                    storage.put(slot_ref.page_id, &page).await?;
-                }
+        if let Some(storage) = &self.storage {
+            storage.put(slot_ref.page_id, &page).await?;
+        }
             }
             self.tree.remove(&key);
         }
@@ -571,6 +543,7 @@ pub struct ComputeNode {
     cache_misses: AtomicUsize,
     operations: AtomicUsize,
     storage: Option<StorageClientPool>,
+    batch_sender: Option<Arc<BatchSender>>,
 }
 
 impl ComputeNode {
@@ -584,6 +557,7 @@ impl ComputeNode {
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             storage: None,
+            batch_sender: None,
         }
     }
 
@@ -598,6 +572,7 @@ impl ComputeNode {
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             storage: Some(storage),
+            batch_sender: None,
         })
     }
 
@@ -612,11 +587,28 @@ impl ComputeNode {
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
             storage: Some(storage),
+            batch_sender: None,
         })
     }
 
     pub async fn with_storage_pool(addr: &str, size: usize) -> Result<Self> {
         Self::with_storage_workers(addr, size).await
+    }
+
+    pub async fn with_storage_batched(addr: &str, window_size: usize) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect(addr).await?);
+        let batch_sender = Arc::new(BatchSender::new(client, window_size));
+        Ok(Self {
+            tree: BPlusTree::new(),
+            index: RwLock::new(HashMap::new()),
+            page_cache: RwLock::new(HashMap::new()),
+            fsm: Mutex::new(FreeSpaceMap::new()),
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            storage: None,
+            batch_sender: Some(batch_sender),
+        })
     }
 
     pub async fn get(&self, key: impl AsRef<str>) -> Result<Option<Value>> {
@@ -646,12 +638,13 @@ impl ComputeNode {
         }
 
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
-        let storage = match &self.storage {
-            Some(storage) => storage,
-            None => return Ok(None),
+        let page = if let Some(batch_sender) = &self.batch_sender {
+            batch_sender.client.get(slot_ref.page_id).await?
+        } else if let Some(storage) = &self.storage {
+            storage.get(slot_ref.page_id).await?
+        } else {
+            return Ok(None);
         };
-
-        let page = storage.get(slot_ref.page_id).await?;
         if let Some(page) = page {
             let value = read_value(&page, slot_ref.slot_id, key.as_bytes());
             self.page_cache
@@ -691,7 +684,9 @@ impl ComputeNode {
                     .write()
                     .unwrap()
                     .insert(slot_ref.page_id, page.clone());
-                if let Some(storage) = &self.storage {
+                if let Some(batch_sender) = &self.batch_sender {
+                    batch_sender.put(slot_ref.page_id, &page).await?;
+                } else if let Some(storage) = &self.storage {
                     storage.put(slot_ref.page_id, &page).await?;
                 }
             }
@@ -728,7 +723,9 @@ impl ComputeNode {
             .insert(key.clone(), SlotRef { page_id, slot_id });
         self.tree.insert(key);
 
-        if let Some(storage) = &self.storage {
+        if let Some(batch_sender) = &self.batch_sender {
+            batch_sender.put(page_id, &page).await?;
+        } else if let Some(storage) = &self.storage {
             storage.put(page_id, &page).await?;
         }
 
@@ -759,7 +756,9 @@ impl ComputeNode {
                 .write()
                 .unwrap()
                 .insert(slot_ref.page_id, page.clone());
-            if let Some(storage) = &self.storage {
+            if let Some(batch_sender) = &self.batch_sender {
+                batch_sender.put(slot_ref.page_id, &page).await?;
+            } else if let Some(storage) = &self.storage {
                 storage.put(slot_ref.page_id, &page).await?;
             }
             self.tree.remove(&key);
