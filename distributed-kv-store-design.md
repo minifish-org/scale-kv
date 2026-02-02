@@ -1,88 +1,88 @@
-# 分布式 KV 存储 - TDD 设计文档
+# Distributed KV Store - TDD Design Document
 
-## 一、TDD 流程概述
+## 1. TDD Process Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        TDD 循环                                  │
+│                        TDD Cycle                                │
 │                                                                 │
-│   1. RED    → 写一个失败的测试                                   │
-│   2. GREEN  → 写最少代码让测试通过                               │
-│   3. REFACTOR → 重构代码                                        │
-│   4. 重复   → 下一个测试                                        │
+│   1. RED    → Write a failing test                             │
+│   2. GREEN  → Write minimal code to make the test pass         │
+│   3. REFACTOR → Refactor code                                  │
+│   4. REPEAT → Next test                                        │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## 二、测试金字塔
+## 2. Test Pyramid
 
 ```
-                    YCSB 基准测试
-                  /              \
-           集成测试              冒烟测试
-          /        \            /     \
-       组件交互    网络通信    快速验证  核心路径
+                    YCSB Benchmark
+                   /              \
+            Integration Tests      Smoke Tests
+           /        \            /     \
+    Component Interaction  Network Communication  Quick Verification  Core Path
 ```
 
-## 三、测试分层
+## 3. Test Layering
 
-| 层级 | 文件 | 目的 | 运行频率 |
+| Level | File | Purpose | Running Frequency |
 |------|------|------|----------|
-| **单元测试** | `src/**/*.rs` | 核心逻辑 | 每次提交 |
-| **集成测试** | `tests/**/*.rs` | 组件交互 | 每次提交 |
-| **YCSB 基准** | `benches/**/*.rs` | 性能验证 | 定期 |
-| **冒烟测试** | `tests/smoke.rs` | 快速验证 | 每次 PR |
+| **Unit Tests** | `src/**/*.rs` | Core logic | Every commit |
+| **Integration Tests** | `tests/**/*.rs` | Component interaction | Every commit |
+| **YCSB Benchmark** | `benches/**/*.rs` | Performance verification | Periodic |
+| **Smoke Tests** | `tests/smoke.rs` | Quick verification | Every PR |
 
 ---
 
-## 四、网络开销与使用准则
+## 4. Network Overhead and Usage Guidelines
 
-基于当前架构和基准测试，得到以下明确结论：
+Based on the current architecture and benchmarks, the following conclusions are clear:
 
-1. **网络开销远高于本地访问**，单条 RPC 写入成本极高。
-2. **大粒度批量操作能显著摊薄慢介质成本**，网络和磁盘同理。
-3. **读应尽量本地缓存命中，写应使用大批量接口**（如 16K batch），这是正确使用方式。
+1. **Network overhead is much higher than local access**, making single RPC write costs extremely high.
+2. **Large-granularity batch operations significantly reduce the cost of slow media**, which applies to both network and disk.
+3. **Reads should aim for local cache hits, and writes should use large-batch interfaces** (e.g., 16K batch). This is the correct way to use the system.
 
 ---
 
-## 五、存储与索引选择（当前决策）
+## 5. Storage and Index Selection (Current Decision)
 
-### 5.1 Compute 端（单实例）
-- 选择：**自研 B+tree + 全树 RwLock（并发读、写串行）**
-- Page 管理：**HashMap + RwLock**
-- Free Space Map：**Vec<VecDeque<PageId>> 分桶**（单写线程访问）
-- 状态：**已完成**（B+tree 入口、页缓存、FSM、Slotted Page + defrag）
+### 5.1 Compute Node (Single Instance)
+- Selection: **Self-developed B+tree + Whole-tree RwLock (Concurrent reads, serial writes)**
+- Page Management: **HashMap + RwLock**
+- Free Space Map: **Vec<VecDeque<PageId>> Buckets** (Accessed by a single writer thread)
+- Status: **Completed** (B+tree entry, page cache, FSM, Slotted Page + defrag)
 
-#### 5.1.1 计算层页式模型（决定）
-- KV 对应 Page：**一个 Page 可容纳多个 KV**（slotted page）
-- B+tree：**key -> (page_id, slot_id)**
-- Value：**写入 page payload（key/value 记录）**
-- 说明：页内碎片在写入失败且空间足够时触发 defrag
+#### 5.1.1 Compute Layer Page Model (Decision)
+- KV to Page mapping: **One Page can hold multiple KVs** (Slotted Page)
+- B+tree: **key -> (page_id, slot_id)**
+- Value: **Written to page payload (key/value record)**
+- Note: In-page fragmentation triggers defrag when write fails and space is sufficient.
 
-### 5.2 Storage 端（批量写为主）
-- 选择：**Bitcask 风格**（多文件 append‑only）
-- 内存索引：**HashMap**，存储 `key -> (file_id, offset, len, checksum)`
-- 备注：后台 compaction 分段执行，避免阻塞前台写入
-- 状态：**已完成**（append‑only 段文件、内存索引、段滚动、compaction、manifest + fsync、自动触发策略）
+### 5.2 Storage Node (Batch Write Focus)
+- Selection: **Bitcask-style** (Multi-file append-only)
+- Memory Index: **HashMap**, stores `key -> (file_id, offset, len, checksum)`
+- Note: Background compaction is executed in segments to avoid blocking foreground writes.
+- Status: **Completed** (Append-only segment files, memory index, segment rotation, compaction, manifest + fsync, auto-trigger policy)
 
-### 5.3 远端 WAL 批量写（设计草案）
-- 目标：**用 WAL 批量代替整页写入**，减少 RPC 开销
-- 批量大小：**256KB 固定**（不做超时 flush）
-- 发送策略：**前台不阻塞**，WAL 只入本地队列；后台异步攒批发送并等待 ACK
-- 触发条件：后台线程仅在 **buffer 达到 256KB** 时发送（不做超时 flush）
-- RPC：**新增 appendWal(batch)**（专用 WAL 追加接口）
-- Storage：**WAL 顺序落盘 + segment（A+B：顺序追加 + 分段轮换）**
-- ACK 语义：**Storage 收到 WAL batch 并成功入队后立即 ACK**（不等落盘/回放）
-- Replay：**后台异步回放 WAL → page → Bitcask**（按 page_id 聚合，阈值 8KB）
-- 读取：**只从 Compute 读**（Storage 仅用于持久化与压缩）
-- 崩溃恢复：**启动时扫描 WAL segment，从 wal_state.last_applied_lsn 继续回放**
+### 5.3 Remote WAL Batching (Design Draft)
+- Goal: **Replace whole-page writes with WAL batches** to reduce RPC overhead.
+- Batch size: **Fixed 256KB** (no timeout flush).
+- Sending strategy: **Foreground is non-blocking**, WAL only enters local queue; background asynchronously batches sends and waits for ACK.
+- Trigger condition: Background thread only sends when **buffer reaches 256KB** (no timeout flush).
+- RPC: **New appendWal(batch)** (Dedicated WAL append interface).
+- Storage: **WAL sequential disk persistence + segment (A+B: sequential append + segment rotation)**.
+- ACK Semantics: **Storage node ACKs immediately after receiving the WAL batch and successfully enqueuing it** (does not wait for disk/replay).
+- Replay: **Background asynchronous replay WAL → page → Bitcask** (Aggregated by page_id, 8KB threshold).
+- Read: **Read from Compute Node only** (Storage Node is only for persistence and compaction).
+- Crash Recovery: **Scan WAL segments at startup, continue replay from wal_state.last_applied_lsn**.
 
-#### 5.3.1 WAL 记录最小格式（KV redo）
-- 记录粒度：KV 级别
-- 字段：`lsn | op | page_id | slot_id | key_len | val_len | key | value`
-- 备注：`txn_id/checksum` 可选
+#### 5.3.1 WAL Minimum Record Format (KV redo)
+- Record Granularity: KV level
+- Fields: `lsn | op | page_id | slot_id | key_len | val_len | key | value`
+- Note: `txn_id/checksum` are optional.
 
-#### 5.3.2 写入流程（前台不阻塞）
+#### 5.3.2 Write Flow (Non-blocking foreground)
 ```mermaid
 flowchart TD
     A[Compute put/delete] --> B[append to in-memory WAL buffer]
@@ -94,18 +94,18 @@ flowchart TD
     G --> H[ack]
 ```
 
-#### 5.3.3 Storage 语义（更新：持久 WAL + 早 ACK）
-- `appendWal` 成功 = **已入队（收到即 ACK）**，不代表 durability
-- WAL **顺序 append + segment**（A+B 方案）
-- WAL **落盘后后台 replay**，不阻塞写入吞吐
-- compaction 保留最新值，旧版本清理
+#### 5.3.3 Storage Semantics (Update: Persistent WAL + Early ACK)
+- `appendWal` success = **Enqueued (ACK on receipt)**, does not represent durability.
+- WAL **Sequential append + segment** (A+B scheme).
+- WAL **Background replay after disk persistence**, does not block write throughput.
+- Compaction keeps the latest value, cleans up old versions.
 
-#### 5.3.4 KV + page/slot redo（当前选择：KV redo）
-- 网络传输：**用户 KV + page_id + slot_id + lsn**
-- Storage：按 lsn **回放到 page**，再以 page 为单位写入 Bitcask
-- 作用：网络只发增量，但 Storage 仍维护与 Compute 一致的 page
+#### 5.3.4 KV + page/slot redo (Current Choice: KV redo)
+- Network Transmission: **User KV + page_id + slot_id + lsn**
+- Storage: **Replay to page** by lsn, then write to Bitcask in page units.
+- Effect: Network sends only increments, but Storage still maintains pages consistent with Compute Node.
 
-最小记录格式建议：
+Suggested minimum record format:
 ```
 record {
   lsn: u64
@@ -119,43 +119,43 @@ record {
 }
 ```
 
-关键约束：
-- **page_id/slot_id 由 Compute 单写者生成**（必须全局唯一/有序）
-- **LSN 由 Compute 单写者生成**（严格递增）
-- Storage 按 **lsn 顺序重放**，需要幂等处理（`lsn > last_applied` 才 apply）
+Key Constraints:
+- **page_id/slot_id generated by Compute single-writer** (must be globally unique/ordered).
+- **LSN generated by Compute single-writer** (strictly increasing).
+- Storage **replays in lsn order**, requires idempotent processing (apply only if `lsn > last_applied`).
 
-#### 5.3.5 WAL 落盘与 replay（A+B 方案）
-- **WAL 落盘**：Storage 端顺序 append + segment（如 64MB）
-- **ACK 语义**：Storage 收到 WAL batch 并成功入队后立即 ACK
-- **Replay 线程**：后台读取 WAL，按 lsn 顺序回放更新内存 page，按 `page_id` 聚合后写 Bitcask
-- **聚合阈值**：每 page **8KB** 写回触发（不使用时间触发）
-- **LSN**：严格递增，`lsn > last_applied` 才 apply
-- **wal_state**：回放完成后持久化 `last_applied_lsn`
+#### 5.3.5 WAL Persistence and Replay (A+B Scheme)
+- **WAL Persistence**: Sequential append + segment (e.g., 64MB) on Storage side.
+- **ACK Semantics**: Storage node ACKs immediately after receiving WAL batch and successfully enqueuing.
+- **Replay Thread**: Background reads WAL, replays updates to memory page in lsn order, writes to Bitcask after aggregating by `page_id`.
+- **Aggregation Threshold**: Triggered by **8KB** per page (no time-based trigger).
+- **LSN**: Strictly increasing, apply only if `lsn > last_applied`.
+- **wal_state**: Persist `last_applied_lsn` after replay completion.
 
-### 5.6 滑动窗口攒批方案（2026-02-01）
-- **目标**：降低平均延迟，避免 Group Commit 的"等待攒批"问题
-- **核心洞察**：不是"等攒够再发"，而是"流水线化"
+### 5.6 Sliding Window Batching Scheme (2026-02-01)
+- **Goal**: Reduce average latency, avoid the "waiting for batch" issue of Group Commit.
+- **Core Insight**: Instead of "waiting until full to send", use "pipelining".
 
-**原理对比**：
+**Principle Comparison**:
 
-| 方案 | 发送时机 | 平均延迟 |
+| Scheme | Sending Timing | Average Latency |
 |------|---------|---------|
-| 传统 Group Commit | 攒满 256KB 才发 | 可能等几十 ms |
-| 滑动窗口 | 窗口有空就发 | ≈ 1 个 RTT |
+| Traditional Group Commit | Send only when 256KB full | May wait for tens of ms |
+| Sliding Window | Send whenever window has space | ≈ 1 RTT |
 
-**滑动窗口工作方式**：
+**How Sliding Window Works**:
 ```
-控制参数：窗口大小 N（例如 16 或 32）
+Control parameter: Window size N (e.g., 16 or 32)
 
-时间线示例（窗口=4）：
-T1: 发送 Req1 Req2 Req3 Req4 （窗口满）
-T2: Req1 完成 → 发送 Req5
-T3: Req2 完成 → 发送 Req6
-T4: Req3 完成 → 发送 Req7
+Timeline example (window=4):
+T1: Send Req1 Req2 Req3 Req4 (Window full)
+T2: Req1 completes → Send Req5
+T3: Req2 completes → Send Req6
+T4: Req3 completes → Send Req7
 ...
 ```
 
-**伪代码**：
+**Pseudo-code**:
 ```rust
 struct BatchSender {
     in_flight: Arc<AtomicUsize>,
@@ -169,10 +169,10 @@ impl BatchSender {
         let current = self.in_flight.fetch_add(1, Ordering::AcqRel);
 
         if current < self.max_in_flight {
-            // 窗口有空，直接发送
+            // Window has space, send directly
             self.send_direct(req).await;
         } else {
-            // 窗口满，攒到队列
+            // Window is full, add to pending queue
             let mut pending = self.pending.lock().unwrap();
             pending.push(req);
         }
@@ -181,7 +181,7 @@ impl BatchSender {
     async fn on_complete(&self) {
         self.in_flight.fetch_sub(1, Ordering::Release);
 
-        // 检查是否有等待的请求
+        // Check if there are pending requests
         let req = {
             let mut pending = self.pending.lock().unwrap();
             pending.pop()
@@ -193,36 +193,36 @@ impl BatchSender {
 }
 ```
 
-**Cap'n RPC 配合**：
-- Cap'n RPC 支持 Promise/流水线
-- 需要应用层实现窗口控制
-- 攒批大小可动态调整
+**Cap'n RPC Integration**:
+- Cap'n RPC supports Promises/Pipelining.
+- Requires application-layer window control.
+- Batch size can be dynamically adjusted.
 
-**调优参数**：
-- 窗口大小：16-64 之间，根据 RTT 调整
-- 最佳实践：窗口 × 单请求大小 ≈ 1-2 个 RTT 能发送的数据量
+**Tuning Parameters**:
+- Window size: Between 16-64, adjusted based on RTT.
+- Best Practice: Window × Single Request Size ≈ Data volume that can be sent in 1-2 RTTs.
 
-**预期效果**：
+**Expected Results**:
 ```
-假设：RTT = 0.5ms，单请求 RPC 开销 = 0.1ms
+Assumption: RTT = 0.5ms, Single RPC overhead = 0.1ms
 
-滑动窗口（窗口=16）：
-  - 平均延迟 ≈ 1 个 RTT = 0.5ms
-  - 吞吐量 = 窗口 / RTT = 16 / 0.5ms = 32K QPS
+Sliding Window (window=16):
+  - Average latency ≈ 1 RTT = 0.5ms
+  - Throughput = Window / RTT = 16 / 0.5ms = 32K QPS
 ```
 
-### 5.7 段页式存储重构（PostgreSQL 风格）
+### 5.7 Segment-Page Storage Refactoring (PostgreSQL Style)
 
-#### 5.7.1 问题分析：Bitcask 不适合 Page 存储
+#### 5.7.1 Problem Analysis: Bitcask Unsuitable for Page Storage
 
-当前 Storage 端使用 Bitcask 风格存储 page：
+Current Storage side uses Bitcask-style storage for pages:
 
 ```
-当前架构：
+Current Architecture:
 ┌──────────────────────────────────────────────────────────────┐
 │  Compute                                                      │
 │  ┌────────────────────────────────────────────────────────┐  │
-│  │  HashMap<PageId, Page>  (原地更新)                      │  │
+│  │  HashMap<PageId, Page>  (In-place update)              │  │
 │  │  B+tree index                                           │  │
 │  └────────────────────────────────────────────────────────┘  │
 │                         │ WAL batch (KV redo)                 │
@@ -233,41 +233,41 @@ impl BatchSender {
 ┌──────────────────────────────────────────────────────────────┐
 │  Storage (Bitcask)                                            │
 │  ┌────────────────────────────────────────────────────────┐  │
-│  │  HashMap<PageId, IndexEntry>  (内存索引)                │  │
+│  │  HashMap<PageId, IndexEntry>  (Memory Index)             │  │
 │  │  segment-*.log (append-only)                            │  │
-│  │  每次 page 更新 → 追加完整 16KB                          │  │
+│  │  Each page update → Append full 16KB                    │  │
 │  └────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**问题**：
+**Issues**:
 
-| 问题 | 原因 | 影响 |
+| Problem | Cause | Impact |
 |------|------|------|
-| **空间放大** | 每次更新追加完整 page | 1 个 page 更新 10 次 = 160KB 磁盘占用 |
-| **Compaction 压力** | stale entries 累积 | 后台 compaction 阻塞、抖动 |
-| **架构不对称** | Compute 原地更新，Storage 追加 | 复杂度高，难以理解 |
-| **恢复依赖扫描** | 启动时扫描所有 segment 重建索引 | 数据量大时启动慢 |
+| **Space Amplification** | Appending full page on every update | 1 page updated 10 times = 160KB disk usage |
+| **Compaction Pressure** | Stale entries accumulate | Background compaction blocks/jitters |
+| **Architectural Asymmetry** | Compute uses in-place updates, Storage appends | High complexity, hard to understand |
+| **Recovery Scans** | Scans all segments to rebuild index at startup | Slow startup for large data volumes |
 
-**Bitcask 适合的场景**：
-- 小 value（< 1KB）
-- 写多读少
-- 需要版本历史
+**Bitcask Suitable Scenarios**:
+- Small values (< 1KB)
+- Write-heavy, read-light
+- Version history needed
 
-**Page 存储的特点**：
-- 固定大小（16KB）
-- 更新频繁
-- 不需要多版本
-- 与 Compute 端模型一致
+**Page Storage Characteristics**:
+- Fixed size (16KB)
+- Frequent updates
+- Multi-versioning not required
+- Consistent with Compute Node model
 
-#### 5.7.2 目标：段页式模型（PostgreSQL 风格）
+#### 5.7.2 Goal: Segment-Page Model (PostgreSQL Style)
 
 ```
-改造后架构：
+Refactored Architecture:
 ┌──────────────────────────────────────────────────────────────┐
 │  Compute                                                      │
 │  ┌────────────────────────────────────────────────────────┐  │
-│  │  HashMap<PageId, Page>  (原地更新)                      │  │
+│  │  HashMap<PageId, Page>  (In-place update)              │  │
 │  │  B+tree index                                           │  │
 │  └────────────────────────────────────────────────────────┘  │
 │                         │ WAL batch (KV redo)                 │
@@ -276,73 +276,73 @@ impl BatchSender {
                           │
                           ▼
 ┌──────────────────────────────────────────────────────────────┐
-│  Storage (段页式)                                             │
+│  Storage (Segment-Page)                                       │
 │  ┌────────────────────────────────────────────────────────┐  │
-│  │  HashMap<PageId, Page>  (buffer pool, 原地更新)         │  │
-│  │  page_file (固定偏移: page_id × PAGE_SIZE)              │  │
-│  │  WAL segments (崩溃恢复用，复用现有实现)                  │  │
+│  │  HashMap<PageId, Page>  (buffer pool, In-place update)  │  │
+│  │  page_file (Fixed offset: page_id × PAGE_SIZE)          │  │
+│  │  WAL segments (For crash recovery, reuse existing impl)  │  │
 │  └────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**核心改变**：
-1. **去掉 Bitcask**：不再使用 append-only segment + 内存索引
-2. **固定偏移页文件**：`page_file[page_id × 16KB]`，原地覆盖写
-3. **Buffer Pool**：内存缓存 dirty pages，批量刷盘
-4. **WAL 复用**：现有 WAL 机制不变，用于崩溃恢复
+**Core Changes**:
+1. **Remove Bitcask**: No longer use append-only segments + memory index.
+2. **Fixed Offset Page File**: `page_file[page_id × 16KB]`, in-place overwrite.
+3. **Buffer Pool**: Cache dirty pages in memory, batch flush to disk.
+4. **WAL Reuse**: Existing WAL mechanism unchanged, used for Crash Recovery.
 
-#### 5.7.3 数据结构设计
+#### 5.7.3 Data Structure Design
 
 ```rust
-/// 段页式存储节点
+/// Segment-Page Storage Node
 pub struct PageStore {
     dir: PathBuf,
     
-    /// Buffer pool: 内存中的 pages
-    /// - 读取时先查 buffer，miss 则从磁盘加载
-    /// - 写入时更新 buffer，标记 dirty
+    /// Buffer pool: pages in memory
+    /// - Check buffer first on read, load from disk on miss
+    /// - Update buffer on write, mark as dirty
     buffer_pool: RwLock<HashMap<PageId, BufferPage>>,
     
-    /// 页文件: 固定偏移，page_id × PAGE_SIZE
-    /// - 单文件，支持稀疏文件（未写入的 page 不占磁盘空间）
-    /// - 或多文件分段（每 1GB 一个文件）
+    /// Page file: Fixed offset, page_id × PAGE_SIZE
+    /// - Single file, supports sparse files (unwritten pages don't take disk space)
+    /// - Or multi-file segments (e.g., 1GB per file)
     page_file: Mutex<PageFile>,
     
-    /// WAL writer: 复用现有实现
+    /// WAL writer: reuse existing implementation
     wal_sender: Mutex<Option<Sender<WalBatch>>>,
     
-    /// Checkpoint 状态
+    /// Checkpoint state
     checkpoint_lsn: AtomicU64,
     
-    /// 已分配的最大 page_id（用于分配新 page）
+    /// Max allocated page_id (for new page allocation)
     max_page_id: AtomicU64,
 }
 
-/// Buffer pool 中的单个 page
+/// Individual page in Buffer pool
 struct BufferPage {
-    /// 页面数据
+    /// Page data
     data: Box<[u8; PAGE_SIZE]>,
     
-    /// 是否为脏页（需要刷盘）
+    /// Whether it is a dirty page (needs flushing)
     dirty: bool,
     
-    /// 页面的 LSN（用于 WAL 恢复判断）
+    /// Page LSN (for WAL recovery judgment)
     lsn: u64,
 }
 
-/// 页文件抽象
+/// Page file abstraction
 struct PageFile {
-    /// 单文件模式: 一个大文件
+    /// Single file mode: one large file
     file: File,
     
-    /// 文件当前大小（用于判断是否需要扩展）
+    /// Current file size (for determining expansion needs)
     size: u64,
 }
 ```
 
-#### 5.7.4 页文件布局
+#### 5.7.4 Page File Layout
 
-**方案 A：单文件（简单，推荐先实现）**
+**Scheme A: Single File (Simple, recommended for first implementation)**
 
 ```
 page_file:
@@ -353,13 +353,13 @@ page_file:
               │
               └── offset = page_id × PAGE_SIZE
 
-特点：
-- 简单直接
-- 依赖文件系统稀疏文件支持（Linux ext4/xfs, macOS APFS）
-- page_id 不连续时，中间空洞不占磁盘空间
+Features:
+- Simple and direct
+- Relies on file system sparse file support (Linux ext4/xfs, macOS APFS)
+- Holes in non-contiguous page_ids don't take disk space
 ```
 
-**方案 B：分段文件（可选，大数据量时）**
+**Scheme B: Segmented Files (Optional, for large data volumes)**
 
 ```
 data/
@@ -367,74 +367,74 @@ data/
 ├── pages-0000000001.dat    # page_id 65536 ~ 131071
 └── pages-0000000002.dat    # ...
 
-每个文件: 65536 × 16KB = 1GB
-文件内偏移: (page_id % 65536) × PAGE_SIZE
+Each file: 65536 × 16KB = 1GB
+In-file offset: (page_id % 65536) × PAGE_SIZE
 ```
 
-**当前选择**：方案 A（单文件），简单且够用。
+**Current Choice**: Scheme A (Single File), simple and sufficient.
 
-#### 5.7.5 读写流程
+#### 5.7.5 Read/Write Flow
 
-**读取流程**：
+**Read Flow**:
 
 ```
 get(page_id) -> Option<Page>
     │
     ▼
 ┌─────────────────────────┐
-│ 1. 查 buffer_pool       │
+│ 1. Check buffer_pool    │
 │    RwLock::read()       │
 └───────────┬─────────────┘
             │
     ┌───────┴───────┐
     │ hit?          │
     ▼               ▼
-  返回 data    ┌─────────────────────────┐
-               │ 2. 从 page_file 读取     │
-               │    seek(page_id × 16KB) │
-               │    read_exact(16KB)     │
-               └───────────┬─────────────┘
-                           │
-                           ▼
-               ┌─────────────────────────┐
-               │ 3. 插入 buffer_pool     │
-               │    dirty = false        │
-               └───────────┬─────────────┘
-                           │
-                           ▼
-                        返回 data
+  Return data    ┌─────────────────────────┐
+                │ 2. Read from page_file   │
+                │    seek(page_id × 16KB) │
+                │    read_exact(16KB)     │
+                └───────────┬─────────────┘
+                            │
+                            ▼
+                ┌─────────────────────────┐
+                │ 3. Insert into buffer_pool│
+                │    dirty = false        │
+                └───────────┬─────────────┘
+                            │
+                            ▼
+                         Return data
 ```
 
-**写入流程（WAL replay 触发）**：
+**Write Flow (Triggered by WAL replay)**:
 
 ```
 put(page_id, data, lsn)
     │
     ▼
 ┌─────────────────────────┐
-│ 1. 更新 buffer_pool     │
+│ 1. Update buffer_pool    │
 │    RwLock::write()      │
 │    dirty = true         │
 │    lsn = lsn            │
 └───────────┬─────────────┘
             │
             ▼
-        返回 Ok(())
+        Return Ok(())
 
-注意：
-- 写入只更新 buffer，不立即刷盘
-- 刷盘由 checkpoint 触发
-- WAL 已经持久化，buffer 丢失可恢复
+Note:
+- Writes only update the buffer and don't flush immediately
+- Flushing is triggered by checkpoint
+- WAL is already persistent, buffer loss is recoverable
 ```
 
-**Checkpoint 流程**：
+**Checkpoint Flow**:
 
 ```
 checkpoint()
     │
     ▼
 ┌─────────────────────────────────────────┐
-│ 1. 收集所有 dirty pages                  │
+│ 1. Collect all dirty pages               │
 │    let dirty_pages = buffer_pool        │
 │        .iter()                          │
 │        .filter(|p| p.dirty)             │
@@ -443,13 +443,13 @@ checkpoint()
                     │
                     ▼
 ┌─────────────────────────────────────────┐
-│ 2. 按 page_id 排序（顺序写优化）          │
+│ 2. Sort by page_id (Sequential write opt)│
 │    dirty_pages.sort_by_key(|p| p.id);   │
 └───────────────────┬─────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────┐
-│ 3. 批量写入 page_file                    │
+│ 3. Batch write to page_file              │
 │    for page in dirty_pages:             │
 │        seek(page_id × PAGE_SIZE)        │
 │        write_all(page.data)             │
@@ -458,38 +458,38 @@ checkpoint()
                     │
                     ▼
 ┌─────────────────────────────────────────┐
-│ 4. fsync + 更新 checkpoint_lsn          │
+│ 4. fsync + update checkpoint_lsn         │
 │    page_file.sync_all()                 │
 │    checkpoint_lsn = max(dirty lsn)      │
 │    write_checkpoint_state()             │
 └───────────────────┬─────────────────────┘
                     │
                     ▼
-                返回 Ok(())
+                Return Ok(())
 ```
 
-#### 5.7.6 崩溃恢复
+#### 5.7.6 Crash Recovery
 
-**恢复流程**：
+**Recovery Flow**:
 
 ```
 open(dir) -> Result<PageStore>
     │
     ▼
 ┌─────────────────────────────────────────┐
-│ 1. 读取 checkpoint_state                 │
+│ 1. Read checkpoint_state                 │
 │    checkpoint_lsn = read_checkpoint()   │
 └───────────────────┬─────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────┐
-│ 2. 打开 page_file                        │
+│ 2. Open page_file                        │
 │    max_page_id = file_size / PAGE_SIZE  │
 └───────────────────┬─────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────┐
-│ 3. 重放 WAL（复用现有逻辑）               │
+│ 3. Replay WAL (Reuse existing logic)     │
 │    for record in wal where              │
 │        record.lsn > checkpoint_lsn:     │
 │        apply_record(record)             │
@@ -497,31 +497,31 @@ open(dir) -> Result<PageStore>
                     │
                     ▼
 ┌─────────────────────────────────────────┐
-│ 4. 启动后台 WAL replay 线程              │
+│ 4. Start background WAL replay thread    │
 │    start_wal_replay()                   │
 └───────────────────┬─────────────────────┘
                     │
                     ▼
-                返回 Ok(store)
+                Return Ok(store)
 ```
 
-**关键点**：
-- `checkpoint_lsn` 之前的 WAL 可安全删除
-- 恢复只需重放 `checkpoint_lsn` 之后的 WAL
-- 无需扫描 page_file 重建索引（与 Bitcask 不同）
+**Key Points**:
+- WAL before `checkpoint_lsn` can be safely deleted.
+- Recovery only requires replaying WAL after `checkpoint_lsn`.
+- No need to scan page_file to rebuild index (unlike Bitcask).
 
-#### 5.7.7 Checkpoint 策略
+#### 5.7.7 Checkpoint Strategy
 
-**触发条件**（满足任一）：
+**Trigger Conditions** (any one):
 
-| 条件 | 阈值 | 说明 |
+| Condition | Threshold | Description |
 |------|------|------|
-| **Dirty pages 数量** | > 1000 | 避免 buffer 过大 |
-| **Dirty bytes 总量** | > 64MB | 控制内存使用 |
-| **时间间隔** | > 60s | 定期刷盘 |
-| **WAL 大小** | > 256MB | 允许清理旧 WAL |
+| **Number of dirty pages** | > 1000 | Prevent excessive buffer size |
+| **Total dirty bytes** | > 64MB | Control memory usage |
+| **Time interval** | > 60s | Periodic flush |
+| **WAL size** | > 256MB | Allow cleaning old WAL |
 
-**实现**：
+**Implementation**:
 
 ```rust
 impl PageStore {
@@ -540,83 +540,83 @@ impl PageStore {
 }
 ```
 
-#### 5.7.8 与现有代码的关系
+#### 5.7.8 Relationship with Existing Code
 
-**保留**：
-- `WalBatch`, `WalRecord` 结构
-- `WalWriter`, `wal_writer_loop` 逻辑
-- WAL segment 格式和读写
-- `wal_state` 持久化
+**Retained**:
+- `WalBatch`, `WalRecord` structures
+- `WalWriter`, `wal_writer_loop` logic
+- WAL segment format and read/write
+- `wal_state` persistence
 
-**移除**：
-- Bitcask segment 文件（`segment-*.log`）
-- `IndexEntry { file_id, offset }` 内存索引
-- `compact()` 和相关逻辑
-- `stale_entries` 统计
+**Removed**:
+- Bitcask segment files (`segment-*.log`)
+- `IndexEntry { file_id, offset }` memory index
+- `compact()` and related logic
+- `stale_entries` statistics
 
-**修改**：
-- `StorageNode` → `PageStore`（或保留名称，替换实现）
-- `put(page_id, data)` → 更新 buffer，标记 dirty
-- `get(page_id)` → buffer pool 查找 + 磁盘回退
-- 崩溃恢复逻辑简化
+**Modified**:
+- `StorageNode` → `PageStore` (or retain name, replace implementation)
+- `put(page_id, data)` → update buffer, mark dirty
+- `get(page_id)` → buffer pool lookup + disk fallback
+- Simplified Crash Recovery logic
 
-#### 5.7.9 对比分析
+#### 5.7.9 Comparative Analysis
 
-| 方面 | Bitcask (当前) | 段页式 (改造后) |
+| Aspect | Bitcask (Current) | Segment-Page (Refactored) |
 |------|---------------|----------------|
-| **更新开销** | 追加 16KB | 原地覆盖 16KB |
-| **空间放大** | 高（多版本累积） | 无（1:1） |
-| **Compaction** | 必须，定期执行 | 不需要 |
-| **启动恢复** | 扫描所有 segment | 只重放 WAL 增量 |
-| **内存索引** | `HashMap<PageId, IndexEntry>` | 无需（固定偏移计算） |
-| **代码复杂度** | 高（compaction, manifest） | 低 |
-| **与 Compute 对称** | 否 | 是 |
+| **Update Cost** | Append 16KB | In-place overwrite 16KB |
+| **Space Amplification** | High (Multi-version accumulation) | None (1:1) |
+| **Compaction** | Required, periodic | Not required |
+| **Startup Recovery** | Scans all segments | Replays only WAL increments |
+| **Memory Index** | `HashMap<PageId, IndexEntry>` | Not needed (Fixed offset calculation) |
+| **Code Complexity** | High (compaction, manifest) | Low |
+| **Symmetry with Compute** | No | Yes |
 
-#### 5.7.10 实现步骤
+#### 5.7.10 Implementation Steps
 
-1. **Phase 1: PageStore 基础结构**
-   - 新建 `PageStore` 结构
-   - 实现 `open()`, `get()`, `put()`
-   - 单文件 page_file 读写
+1. **Phase 1: PageStore Basic Structure**
+   - New `PageStore` structure
+   - Implement `open()`, `get()`, `put()`
+   - Single-file page_file read/write
 
 2. **Phase 2: Buffer Pool**
-   - 实现 `BufferPage` 和 dirty 跟踪
-   - 实现 `checkpoint()`
-   - `checkpoint_state` 持久化
+   - Implement `BufferPage` and dirty tracking
+   - Implement `checkpoint()`
+   - `checkpoint_state` persistence
 
-3. **Phase 3: WAL 集成**
-   - 复用现有 `WalWriter`
-   - 修改 `wal_replay_loop` 调用 `PageStore`
-   - 崩溃恢复测试
+3. **Phase 3: WAL Integration**
+   - Reuse existing `WalWriter`
+   - Modify `wal_replay_loop` to call `PageStore`
+   - Crash Recovery testing
 
-4. **Phase 4: 迁移**
-   - 替换 `StorageNode` 实现
-   - 更新 `StorageServer` RPC 处理
-   - 清理 Bitcask 相关代码
+4. **Phase 4: Migration**
+   - Replace `StorageNode` implementation
+   - Update `StorageServer` RPC handling
+   - Clean up Bitcask-related code
 
-5. **Phase 5: 测试验证**
-   - 现有测试通过
-   - 新增 checkpoint 测试
-   - 崩溃恢复测试
-   - 性能对比
+5. **Phase 5: Verification**
+   - Pass existing tests
+   - Add checkpoint tests
+   - Crash Recovery tests
+   - Performance comparison
 
-#### 5.7.11 文件布局（改造后）
+#### 5.7.11 File Layout (Refactored)
 
 ```
 data/
-├── pages.dat           # 页文件（固定偏移）
+├── pages.dat           # Page file (fixed offset)
 ├── checkpoint_state    # checkpoint LSN
-├── wal-*.log           # WAL segments（复用）
-└── wal_state           # WAL 回放状态（复用）
+├── wal-*.log           # WAL segments (reused)
+└── wal_state           # WAL replay state (reused)
 ```
 
-### 5.8 页式 B+tree（索引即 page）方案
+### 5.8 Paged B+tree (Index-as-Page) Scheme
 
-- 目标：索引节点本身就是固定 16KB page，root page_id 持久化
-- Storage 仅提供 `page_id -> page bytes`（可复用段页式存储）
-- Compute 维护 buffer pool（页缓存 + dirty flush）
+- Goal: Index nodes themselves are fixed 16KB pages, root page_id is persisted.
+- Storage only provides `page_id -> page bytes` (can reuse Segment-Page storage).
+- Compute Node maintains buffer pool (page cache + dirty flush).
 
-**页头建议：**
+**Suggested Page Header:**
 ```
 PageHeader {
   page_id: u64
@@ -625,64 +625,64 @@ PageHeader {
   key_count: u16
   free_start: u16
   free_end: u16
-  lsn: u64         // redo 顺序
+  lsn: u64         // redo order
 }
 ```
 
-**Leaf Page：**
-- 记录 `(key, value)` 或 `(key, slot_ref)`
+**Leaf Page:**
+- Records `(key, value)` or `(key, slot_ref)`
 
-**Internal Page：**
-- `keys[]` + `child_page_id[]`（数量 = key_count + 1）
+**Internal Page:**
+- `keys[]` + `child_page_id[]` (count = key_count + 1)
 
-**WAL（必须）：**
-- page 修改写 redo
-- commit 时 WAL durable，再刷脏页
+**WAL (Required):**
+- Write redo on page modification
+- WAL durable at commit, then flush dirty pages
 
-**最小实现路径：**
-1) page 格式 + 序列化
-2) leaf‑only B+tree（无 internal）
+**Minimum Implementation Path:**
+1) Page format + serialization
+2) leaf-only B+tree (no internal)
 3) internal + split
 4) buffer pool + dirty flush
 5) WAL redo + recovery
 
-#### 约束
-- **存储为单写者模型**，写入串行
-- 内存索引为 HashMap（无锁），由单写者线程更新
+#### Constraints
+- **Storage is single-writer model**, serial writes
+- Memory index is HashMap (lock-free), updated by single writer thread
 
 ---
 
-### 5.9 代码审查结果（2026-02-01）
+### 5.9 Code Review Results (2026-02-01)
 
-#### 5.9.1 严重问题
+#### 5.9.1 Critical Issues
 
-| 严重程度 | 问题 | 位置 | 影响 |
+| Severity | Issue | Location | Impact |
 |---------|------|------|------|
-| 🔴 | Cap'n RPC 同步使用 | client.rs:287 | RPC 开销高，延迟大 |
-| 🔴 | B+Tree 无叶子链表 | bptree.rs:10-18 | Range scan 效率低 |
-| 🔴 | 同步文件 I/O 阻塞 async | node.rs:156 | 阻塞 tokio 线程池 |
-| 🔴 | `spawn_local` 兼容性 | server.rs:165 | 可能在 multi-thread runtime 中异常 |
+| 🔴 | Synchronous Cap'n RPC use | client.rs:287 | High RPC overhead, large latency |
+| 🔴 | B+Tree missing leaf linked list | bptree.rs:10-18 | Inefficient range scan |
+| 🔴 | Synchronous file I/O blocks async | node.rs:156 | Blocks tokio thread pool |
+| 🔴 | `spawn_local` compatibility | server.rs:165 | Potential abnormal behavior in multi-thread runtime |
 
-#### 5.9.2 详细问题说明
+#### 5.9.2 Detailed Issue Description
 
-**Cap'n RPC 同步使用**：
+**Synchronous Cap'n RPC use**:
 ```rust
-// 当前：每条 RPC 阻塞等待
+// Current: Blocking wait for each RPC
 if let Some(storage) = &self.storage {
-    storage.put(page_id, &page).await?;  // ← 逐条等待
+    storage.put(page_id, &page).await?;  // ← Wait one by one
 }
 
-// 滑动窗口方案（5.3.5）：窗口有空就发，无空就排队
+// Sliding window scheme (5.3.5): Send if window has space, otherwise queue
 ```
 
-**B+Tree 无叶子链表**：
+**B+Tree missing leaf linked list**:
 ```rust
-// 当前：只有 keys
+// Current: only keys
 Node::Leaf {
     keys: Vec<K>,
 },
 
-// 建议：添加兄弟指针
+// Suggestion: Add sibling pointers
 Node::Leaf {
     keys: Vec<K>,
     prev: Option<Box<Node<K>>>,
@@ -690,73 +690,73 @@ Node::Leaf {
 },
 ```
 
-**同步文件 I/O**：
+**Synchronous file I/O**:
 ```rust
-// 当前：使用 std::fs::File（阻塞）
+// Current: using std::fs::File (blocking)
 writer.file.write_all(value)?;
 
-// 建议：改用 tokio 异步 API
+// Suggestion: switch to tokio async API
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 ```
 
-**spawn_local 兼容性**：
+**spawn_local compatibility**:
 ```rust
-// 当前：混用 spawn_local + features = ["full"]
+// Current: mixing spawn_local + features = ["full"]
 tokio::task::spawn_local(async move { ... });
-// features = ["full"] 包含 rt-multi-thread
+// features = ["full"] includes rt-multi-thread
 
-// 方案 A：统一用 spawn
+// Scheme A: use spawn uniformly
 tokio::task::spawn(async move { ... });
 
-// 方案 B：用 current_thread runtime
+// Scheme B: use current_thread runtime
 // Cargo.toml: features = ["rt-current-thread", "net"]
 ```
 
-#### 5.9.3 中等问题
+#### 5.9.3 Medium Issues
 
-| 严重程度 | 问题 | 位置 | 修复建议 |
+| Severity | Issue | Location | Repair Suggestion |
 |---------|------|------|----------|
-| 🟡 | 锁内异步 I/O | client.rs:230-251 | 先释放锁，再做 I/O |
-| 🟡 | MAX_KEYS = 8 太小 | bptree.rs:3 | 根据 page 大小动态调整 |
-| 🟡 | 批量操作未并发 | client.rs:387 | 用 `join_all` 并发执行 |
+| 🟡 | Async I/O within lock | client.rs:230-251 | Release lock before I/O |
+| 🟡 | MAX_KEYS = 8 too small | bptree.rs:3 | Dynamic adjustment based on page size |
+| 🟡 | Batch operations not concurrent | client.rs:387 | Use `join_all` for concurrent execution |
 
-#### 5.9.4 轻微问题
+#### 5.9.4 Minor Issues
 
-| 严重程度 | 问题 | 位置 | 修复建议 |
+| Severity | Issue | Location | Repair Suggestion |
 |---------|------|------|----------|
-| 🟢 | 未使用 dashmap | Cargo.toml:11 | 移除依赖 |
-| 🟢 | tokio features 过量 | Cargo.toml:14 | 用 `rt-multi-thread + net` |
+| 🟢 | Unused dashmap | Cargo.toml:11 | Remove dependency |
+| 🟢 | Excessive tokio features | Cargo.toml:14 | Use `rt-multi-thread + net` |
 
-#### 5.9.5 修复优先级
+#### 5.9.5 Fix Priorities
 
-| 优先级 | 问题 | 预计改动 |
+| Priority | Issue | Estimated Change |
 |--------|------|----------|
-| **P0** | 同步文件 I/O → 异步 | node.rs 较大改动 |
-| **P0** | Cap'n RPC 滑动窗口 | client.rs 中等改动 |
-| **P1** | spawn_local 兼容性 | server.rs 小改动 |
-| **P2** | B+Tree 叶子链表 | bptree.rs 中等改动 |
-| **P3** | 清理依赖 | Cargo.toml |
+| **P0** | Synchronous file I/O → Async | Significant changes in node.rs |
+| **P0** | Cap'n RPC Sliding Window | Medium changes in client.rs |
+| **P1** | spawn_local compatibility | Small changes in server.rs |
+| **P2** | B+Tree leaf linked list | Medium changes in bptree.rs |
+| **P3** | Clean up dependencies | Cargo.toml |
 
 ---
 
-## 四、存储节点 - 单元测试
+## 4. Storage Node - Unit Tests
 
-### 4.1 测试文件结构
+### 4.1 Test File Structure
 
 ```
 src/storage/
 ├── mod.rs
-├── node.rs              # 存储节点核心逻辑（DashMap）
-├── lock_table.rs        # 锁表实现
+├── node.rs              # Storage Node core logic (DashMap)
+├── lock_table.rs        # Lock table implementation
 └── tests/
     ├── mod.rs
-    ├── basic.rs         # 基础读写测试
-    ├── concurrent.rs    # 并发测试
-    └── lock.rs          # 锁测试
+    ├── basic.rs         # Basic read/write tests
+    ├── concurrent.rs    # Concurrent tests
+    └── lock.rs          # Lock tests
 ```
 
-### 4.2 基础读写测试
+### 4.2 Basic Read/Write Tests
 
 ```rust
 // src/storage/tests/basic.rs
@@ -765,10 +765,10 @@ use crate::storage::StorageNode;
 
 #[test]
 fn test_put_and_get() {
-    // RED: 先写测试，期望失败
+    // RED: write test first, expect failure
     let node = StorageNode::new();
     
-    // GREEN: 实现代码后测试通过
+    // GREEN: test passes after implementation
     node.put("foo", b"bar");
     
     let value = node.get("foo");
@@ -826,14 +826,14 @@ fn test_large_value() {
 fn test_many_keys() {
     let node = StorageNode::new();
     
-    // 插入 10000 个 key
+    // Insert 10,000 keys
     for i in 0..10_000 {
         node.put(&format!("key_{}", i), &format!("value_{}", i));
     }
     
     assert_eq!(node.len(), 10_000);
     
-    // 验证随机读取
+    // Verify random reads
     for i in (0..10_000).step_by(1000) {
         let value = node.get(&format!("key_{}", i)).unwrap();
         assert_eq!(value, format!("value_{}").as_bytes());
@@ -841,7 +841,7 @@ fn test_many_keys() {
 }
 ```
 
-### 4.3 并发测试
+### 4.3 Concurrent Tests
 
 ```rust
 // src/storage/tests/concurrent.rs
@@ -906,7 +906,7 @@ fn test_concurrent_put_same_key() {
     
     handles.into_iter().for_each(|h| h.join().unwrap());
     
-    // 最终值应该是某次写入的结果
+    // Final value should be result of one of the writes
     let value = node.get("key").unwrap();
     assert!(value.starts_with(b"value_"));
 }
@@ -915,14 +915,14 @@ fn test_concurrent_put_same_key() {
 fn test_concurrent_mixed_operations() {
     let node = Arc::new(StorageNode::new());
     
-    // 预先插入一些数据
+    // Pre-insert some data
     for i in 0..1000 {
         node.put(&format!("key_{}", i), b"initial");
     }
     
     let mut handles = Vec::new();
     
-    // 读线程
+    // Read threads
     for _ in 0..5 {
         let node = node.clone();
         handles.push(thread::spawn(move || {
@@ -933,7 +933,7 @@ fn test_concurrent_mixed_operations() {
         }));
     }
     
-    // 写线程
+    // Write threads
     for i in 0..5 {
         let node = node.clone();
         handles.push(thread::spawn(move || {
@@ -947,7 +947,7 @@ fn test_concurrent_mixed_operations() {
 }
 ```
 
-### 4.4 锁测试
+### 4.4 Lock Tests
 
 ```rust
 // src/storage/tests/lock.rs
@@ -962,13 +962,13 @@ fn test_lock_blocks_other_writer() {
     
     let guard = node.lock("key").unwrap();
     
-    // 另一个锁应该失败或阻塞
+    // Another lock should fail or block
     let result = node.try_lock("key");
     assert!(result.is_err());
     
     drop(guard);
     
-    // 释放后应该能获取锁
+    // Should be able to acquire lock after release
     let guard2 = node.lock("key");
     assert!(guard2.is_ok());
 }
@@ -978,7 +978,7 @@ fn test_different_keys_no_contention() {
     let node = StorageNode::new();
     
     let guard1 = node.lock("key1").unwrap();
-    let guard2 = node.lock("key2").unwrap();  // 不应该阻塞
+    let guard2 = node.lock("key2").unwrap();  // Should not block
     
     drop(guard1);
     drop(guard2);
@@ -989,13 +989,13 @@ fn test_lock_with_operations() {
     let node = StorageNode::new();
     node.put("key", b"old_value");
     
-    // 加锁后执行操作
+    // Execute operations after locking
     {
         let _guard = node.lock("key").unwrap();
         node.put("key", b"new_value");
     }
     
-    // 解锁后验证
+    // Verify after unlocking
     let value = node.get("key").unwrap();
     assert_eq!(value, b"new_value");
 }
@@ -1028,29 +1028,29 @@ fn test_concurrent_lock_contention() {
     
     handles.into_iter().for_each(|h| h.join().unwrap());
     
-    // 至少有一个成功获取锁
+    // At least one successful lock acquisition
     assert!(success_count.load(Ordering::SeqCst) > 0);
 }
 ```
 
 ---
 
-## 五、计算节点 - 单元测试
+## 5. Compute Node - Unit Tests
 
-### 5.1 测试文件结构
+### 5.1 Test File Structure
 
 ```
 src/compute/
 ├── mod.rs
-├── node.rs              # 计算节点核心逻辑
-├── client.rs            # 网络客户端
+├── node.rs              # Compute Node core logic
+├── client.rs            # Network client
 └── tests/
     ├── mod.rs
-    ├── basic.rs         # 基础读写测试
-    └── cache.rs         # 缓存测试
+    ├── basic.rs         # Basic read/write tests
+    └── cache.rs         # Cache tests
 ```
 
-### 5.2 基础读写测试
+### 5.2 Basic Read/Write Tests
 
 ```rust
 // src/compute/tests/basic.rs
@@ -1123,7 +1123,7 @@ fn test_compute_multiple_keys() {
 }
 ```
 
-### 5.3 缓存测试
+### 5.3 Cache Tests
 
 ```rust
 // src/compute/tests/cache.rs
@@ -1153,12 +1153,12 @@ fn test_cache_hit_miss() {
     let (_storage, addr) = setup();
     let mut compute = ComputeNode::new(&addr);
     
-    // 第一次读 - 缓存未命中
+    // First read - cache miss
     let _ = compute.get("key");
     assert_eq!(compute.cache_misses(), 1);
     assert_eq!(compute.cache_hits(), 0);
     
-    // 第二次读 - 缓存命中
+    // Second read - cache hit
     let _ = compute.get("key");
     assert_eq!(compute.cache_hits(), 1);
 }
@@ -1168,17 +1168,17 @@ fn test_cache_invalidation_on_write() {
     let (_storage, addr) = setup();
     let mut compute = ComputeNode::new(&addr);
     
-    // 写入数据
+    // Write data
     compute.put("key", b"v1").unwrap();
     
-    // 读入缓存
+    // Read into cache
     let _ = compute.get("key");
     assert_eq!(compute.cache_hits(), 1);
     
-    // 再次写入 - 应该使缓存失效
+    // Write again - should invalidate cache
     compute.put("key", b"v2").unwrap();
     
-    // 下一次读应该重新从存储节点获取
+    // Next read should fetch from Storage Node again
     let _ = compute.get("key");
     assert_eq!(compute.cache_misses(), 2);
 }
@@ -1188,12 +1188,12 @@ fn test_cache_statistics() {
     let (_storage, addr) = setup();
     let mut compute = ComputeNode::new(&addr);
     
-    // 初始状态
+    // Initial state
     assert_eq!(compute.cache_hits(), 0);
     assert_eq!(compute.cache_misses(), 0);
     assert_eq!(compute.cache_size(), 0);
     
-    // 多次读写
+    // Multiple reads and writes
     for i in 0..10 {
         compute.put(&format!("key_{}", i), &format!("value_{}", i)).unwrap();
     }
@@ -1202,22 +1202,22 @@ fn test_cache_statistics() {
         let _ = compute.get(&format!("key_{}", i));
     }
     
-    // 5 个 key 读两次（命中 5 次）
+    // Read 5 keys twice (5 hits)
     for i in 0..5 {
         let _ = compute.get(&format!("key_{}", i));
     }
     
     assert_eq!(compute.cache_hits(), 5);
-    assert_eq!(compute.cache_misses(), 10);  // 10 个 key 各 miss 一次
+    assert_eq!(compute.cache_misses(), 10);  // 1 miss for each of the 10 keys
     assert_eq!(compute.cache_size(), 10);
 }
 ```
 
 ---
 
-## 六、集成测试
+## 6. Integration Tests
 
-### 6.1 完整工作流测试
+### 6.1 Full Workflow Test
 
 ```rust
 // tests/integration.rs
@@ -1246,22 +1246,22 @@ fn setup() -> (Arc<StorageNode>, String) {
 fn test_full_workflow() {
     let (storage, addr) = setup();
     
-    // 创建两个计算节点
+    // Create two compute nodes
     let mut compute1 = ComputeNode::new(&addr);
     let mut compute2 = ComputeNode::new(&addr);
     
-    // 计算节点 1 写入
+    // Compute Node 1 writes
     compute1.put("key1", b"value1").unwrap();
     compute1.put("key2", b"value2").unwrap();
     
-    // 计算节点 2 读取
+    // Compute Node 2 reads
     let v1 = compute2.get("key1").unwrap().unwrap();
     let v2 = compute2.get("key2").unwrap().unwrap();
     
     assert_eq!(v1, b"value1");
     assert_eq!(v2, b"value2");
     
-    // 验证存储节点数据
+    // Verify storage node data
     assert_eq!(storage.get("key1"), Some(b"value1".to_vec()));
     assert_eq!(storage.get("key2"), Some(b"value2".to_vec()));
 }
@@ -1284,7 +1284,7 @@ fn test_concurrent_computes() {
     
     handles.into_iter().for_each(|h| h.join().unwrap());
     
-    // 验证存储节点数据完整性
+    // Verify storage node data integrity
     assert_eq!(storage.len(), 400);
 }
 
@@ -1295,17 +1295,17 @@ fn test_cross_node_consistency() {
     let mut compute1 = ComputeNode::new(&addr);
     let mut compute2 = ComputeNode::new(&addr);
     
-    // 计算节点 1 写入
+    // Compute Node 1 writes
     compute1.put("shared", b"from_compute1").unwrap();
     
-    // 计算节点 2 读取
+    // Compute Node 2 reads
     let value = compute2.get("shared").unwrap().unwrap();
     assert_eq!(value, b"from_compute1");
     
-    // 计算节点 2 更新
+    // Compute Node 2 updates
     compute2.put("shared", b"from_compute2").unwrap();
     
-    // 计算节点 1 读取最新值
+    // Compute Node 1 reads the latest value
     let value = compute1.get("shared").unwrap().unwrap();
     assert_eq!(value, b"from_compute2");
 }
@@ -1313,9 +1313,9 @@ fn test_cross_node_consistency() {
 
 ---
 
-## 七、YCSB 基准测试
+## 7. YCSB Benchmark
 
-### 7.1 YCSB 工作负载定义
+### 7.1 YCSB Workload Definition
 
 ```rust
 // benches/ycsb.rs
@@ -1428,10 +1428,10 @@ fn run_ycsb_workload(ops: usize, threads: usize, workload: Workload) {
 }
 ```
 
-### 7.2 YCSB 基准测试定义
+### 7.2 YCSB Benchmark Definition
 
 ```rust
-// benches/ycsb.rs (使用 criterion)
+// benches/ycsb.rs (using criterion)
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
@@ -1461,7 +1461,7 @@ criterion_main!(benches);
 
 ---
 
-## 八、冒烟测试
+## 8. Smoke Tests
 
 ```rust
 // tests/smoke.rs
@@ -1486,18 +1486,18 @@ fn setup() -> (Arc<StorageNode>, String) {
     (storage, format!("127.0.0.1:{}", addr.port()))
 }
 
-/// 快速冒烟测试，每个 PR 必须通过
+/// Fast smoke test, must pass for every PR
 #[test]
 fn test_smoke() {
     let (_storage, addr) = setup();
     let mut compute = ComputeNode::new(&addr);
     
-    // 基础操作
+    // Basic operations
     compute.put("key1", b"value1").unwrap();
     assert_eq!(compute.get("key1").unwrap(), Some(b"value1".to_vec()));
     
-    compute", b"value2").unwrap();
-.put("key1    assert_eq!(compute.get("key1").unwrap(), Some(b"value2".to_vec()));
+    compute.put("key1", b"value2").unwrap();
+    assert_eq!(compute.get("key1").unwrap(), Some(b"value2".to_vec()));
     
     compute.put("key2", b"value2").unwrap();
     assert_eq!(compute.get("key2").unwrap(), Some(b"value2".to_vec()));
@@ -1508,58 +1508,58 @@ fn test_smoke() {
 
 ---
 
-## 九、运行测试
+## 9. Running Tests
 
 ```bash
-# 运行所有测试
+# Run all tests
 cargo test
 
-# 运行单元测试
+# Run unit tests
 cargo test --lib
 
-# 运行集成测试
+# Run integration tests
 cargo test --test integration
 
-# 运行 YCSB 基准测试
+# Run YCSB benchmark
 cargo bench ycsb
 
-# 运行冒烟测试
+# Run smoke tests
 cargo test --test smoke
 
-# 带日志运行
+# Run with logs
 RUST_LOG=debug cargo test
 
-# 并发测试
+# Concurrent tests
 cargo test concurrent --release
 
-# 运行特定测试
+# Run specific tests
 cargo test test_put_and_get
 cargo test test_compute_put_get
 ```
 
 ---
 
-## 十、测试覆盖率
+## 10. Test Coverage
 
 ```bash
-# 安装 tarpaulin
+# Install tarpaulin
 cargo install cargo-tarpaulin
 
-# 运行覆盖率
+# Run coverage
 cargo tarpaulin --out Html
 
-# 查看覆盖率报告
+# View coverage report
 open tarpaulin-report.html
 ```
 
 ---
 
-## 十一、TDD 步骤
+## 11. TDD Steps
 
-### 步骤 1：写存储节点单元测试
+### Step 1: Write Storage Node Unit Test
 
 ```rust
-// tests/storage_basic_test.rs (RED - 期望失败)
+// tests/storage_basic_test.rs (RED - expected to fail)
 #[test]
 fn test_storage_put_get() {
     let node = StorageNode::new();
@@ -1568,10 +1568,10 @@ fn test_storage_put_get() {
 }
 ```
 
-### 步骤 2：实现存储节点
+### Step 2: Implement Storage Node
 
 ```rust
-// src/storage/node.rs (GREEN - 通过测试)
+// src/storage/node.rs (GREEN - pass test)
 use dashmap::DashMap;
 
 pub struct StorageNode {
@@ -1599,22 +1599,22 @@ impl StorageNode {
 }
 ```
 
-### 步骤 3：重构和添加更多测试
+### Step 3: Refactor and Add More Tests
 
 ```rust
-// 添加更多测试...
-// 重构代码...
+// Add more tests...
+// Refactor code...
 ```
 
 ---
 
-## 十二、总结
+## 12. Summary
 
-| 测试类型 | 位置 | 目的 | 优先级 |
+| Test Type | Location | Purpose | Priority |
 |----------|------|------|--------|
-| **单元测试** | `src/**/*.rs` | 核心逻辑 | ⭐⭐⭐ |
-| **集成测试** | `tests/**/*.rs` | 组件交互 | ⭐⭐⭐ |
-| **YCSB** | `benches/ycsb.rs` | 性能基准 | ⭐⭐ |
-| **冒烟** | `tests/smoke.rs` | 快速验证 | ⭐⭐⭐ |
+| **Unit Tests** | `src/**/*.rs` | Core logic | ⭐⭐⭐ |
+| **Integration Tests** | `tests/**/*.rs` | Component interaction | ⭐⭐⭐ |
+| **YCSB** | `benches/ycsb.rs` | Performance benchmark | ⭐⭐ |
+| **Smoke Tests** | `tests/smoke.rs` | Quick verification | ⭐⭐⭐ |
 
-**TDD 流程**：先写测试 → 实现代码 → 重构 → 重复
+**TDD Process**: Write test first → Implement code → Refactor → Repeat

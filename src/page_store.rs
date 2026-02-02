@@ -583,7 +583,7 @@ mod tests {
     async fn test_checkpoint_persists() {
         let dir = temp_dir().await;
 
-        // 写入并 checkpoint
+        // Write and checkpoint
         {
             let store = PageStore::open(&dir).await.unwrap();
             let page1 = make_page(1);
@@ -595,7 +595,7 @@ mod tests {
             assert_eq!(store.checkpoint_lsn(), 101);
         }
 
-        // 重新打开，验证数据持久化
+        // Reopen and verify data persistence
         {
             let store = PageStore::open(&dir).await.unwrap();
             assert_eq!(store.checkpoint_lsn(), 101);
@@ -633,7 +633,7 @@ mod tests {
         let dir = temp_dir().await;
         let store = PageStore::open(&dir).await.unwrap();
 
-        // 写入非连续的 page_id
+        // Write non-consecutive page_ids
         let page1 = make_page(1);
         let page100 = make_page(100);
 
@@ -641,12 +641,12 @@ mod tests {
         store.put(100, &page100, 101).unwrap();
         store.checkpoint().await.unwrap();
 
-        // 重新打开验证
+        // Reopen and verify
         drop(store);
         let store = PageStore::open(&dir).await.unwrap();
 
         assert!(store.get(1).await.is_some());
-        assert!(store.get(50).await.is_none()); // 中间的 page 不存在
+        assert!(store.get(50).await.is_none()); // Middle page doesn't exist
         assert!(store.get(100).await.is_some());
         cleanup_dir(&dir).await;
     }
@@ -670,7 +670,7 @@ mod tests {
         let dir = temp_dir().await;
         let store = PageStore::open(&dir).await.unwrap();
 
-        let bad_page = vec![0u8; 100]; // 错误的大小
+        let bad_page = vec![0u8; 100]; // Wrong size
         let result = store.put(1, &bad_page, 100);
         assert!(result.is_err());
         cleanup_dir(&dir).await;
@@ -681,19 +681,19 @@ mod tests {
         let dir = temp_dir().await;
         let store = PageStore::open(&dir).await.unwrap();
 
-        // 第一轮写入
+        // First round of writes
         let page1 = make_page(1);
         store.put(1, &page1, 100).unwrap();
         store.checkpoint().await.unwrap();
         assert_eq!(store.checkpoint_lsn(), 100);
 
-        // 第二轮写入
+        // Second round of writes
         let page2 = make_page(2);
         store.put(2, &page2, 200).unwrap();
         store.checkpoint().await.unwrap();
         assert_eq!(store.checkpoint_lsn(), 200);
 
-        // 验证两个 page 都存在
+        // Verify both pages exist
         assert!(store.get(1).await.is_some());
         assert!(store.get(2).await.is_some());
         cleanup_dir(&dir).await;
