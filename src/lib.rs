@@ -6,15 +6,17 @@
 pub mod common;
 pub use common::*;
 
-mod page_bptree;
+pub mod page_bptree;
+pub use page_bptree::{InMemoryPageProvider, PageBPlusTree, PageProvider, SharedPageProvider, SlotRef as PageSlotRef};
+
+pub mod page_store;
+pub use page_store::{BufferPoolConfig, BufferStats, CheckpointConfig, PageStore};
 
 pub mod node;
 pub use node::StorageNode;
 
 pub mod client;
 pub use client::{BatchSender, BatchedComputeNode, BatchedStorageClientPool, ComputeNode, StorageClient};
-
-pub use page_bptree::{PageBPlusTree, SlotRef as PageSlotRef};
 
 pub mod server;
 pub use server::StorageServer;

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use scale_kv::node::{WalBatch, WalRecord};
-use scale_kv::{StorageClient, StorageNode, StorageServer};
+use scale_kv::{StorageClient, StorageNode, StorageServer, PAGE_SIZE};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -20,19 +20,29 @@ fn cleanup_dir(dir: &PathBuf) {
     let _ = fs::remove_dir_all(dir);
 }
 
+fn make_page(fill: u8) -> Vec<u8> {
+    let mut page = vec![0u8; PAGE_SIZE];
+    page[0] = fill;
+    page[PAGE_SIZE - 1] = fill;
+    page
+}
+
 #[test]
 fn test_storage_crud_persists() {
     let dir = temp_dir();
+    let page1 = make_page(1);
+    let page2 = make_page(2);
     {
         let node = StorageNode::open(&dir).unwrap();
-        node.put(1, b"one");
-        node.put(2, b"two");
-        assert_eq!(node.get(1), Some(b"one".to_vec()));
+        node.put(1, &page1);
+        node.put(2, &page2);
+        assert_eq!(node.get(1).unwrap()[0], 1);
         node.delete(1);
         assert_eq!(node.get(1), None);
+        node.checkpoint().unwrap();
     }
     let node = StorageNode::open(&dir).unwrap();
-    assert_eq!(node.get(2), Some(b"two".to_vec()));
+    assert_eq!(node.get(2).unwrap()[0], 2);
     cleanup_dir(&dir);
 }
 

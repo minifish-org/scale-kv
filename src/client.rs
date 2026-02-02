@@ -1,4 +1,4 @@
-use crate::page_bptree::{PageBPlusTree, SlotRef as PageSlotRef};
+use crate::page_bptree::{PageBPlusTree, SharedPageProvider, SlotRef as PageSlotRef};
 use crate::storage_capnp::storage;
 use crate::{Error, Page, PageId, Result, Value, PAGE_SIZE};
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -297,8 +297,9 @@ impl BatchedStorageClientPool {
 
 /// Compute node that uses batched storage for better RPC performance.
 pub struct BatchedComputeNode {
-    tree: Mutex<PageBPlusTree>,
-    page_cache: RwLock<HashMap<PageId, Page>>,
+    tree: Mutex<PageBPlusTree<SharedPageProvider>>,
+    page_cache: Arc<RwLock<HashMap<PageId, Page>>>,
+    next_page_id: Arc<AtomicU64>,
     fsm: Mutex<FreeSpaceMap>,
     cache_hits: AtomicUsize,
     cache_misses: AtomicUsize,
@@ -309,10 +310,15 @@ pub struct BatchedComputeNode {
 
 impl BatchedComputeNode {
     pub fn new() -> Self {
+        let page_cache = Arc::new(RwLock::new(HashMap::new()));
+        let next_page_id = Arc::new(AtomicU64::new(1));
+        let provider = SharedPageProvider::new(page_cache.clone(), next_page_id.clone());
+        let tree = PageBPlusTree::new_with_provider(provider);
         Self {
-            tree: Mutex::new(PageBPlusTree::new()),
-            page_cache: RwLock::new(HashMap::new()),
-            fsm: Mutex::new(FreeSpaceMap::new()),
+            tree: Mutex::new(tree),
+            page_cache,
+            next_page_id: next_page_id.clone(),
+            fsm: Mutex::new(FreeSpaceMap::new(next_page_id)),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
@@ -329,10 +335,15 @@ impl BatchedComputeNode {
         tokio::task::spawn_local(async move {
             wal_sender_clone.run().await;
         });
+        let page_cache = Arc::new(RwLock::new(HashMap::new()));
+        let next_page_id = Arc::new(AtomicU64::new(1));
+        let provider = SharedPageProvider::new(page_cache.clone(), next_page_id.clone());
+        let tree = PageBPlusTree::new_with_provider(provider);
         Ok(Self {
-            tree: Mutex::new(PageBPlusTree::new()),
-            page_cache: RwLock::new(HashMap::new()),
-            fsm: Mutex::new(FreeSpaceMap::new()),
+            tree: Mutex::new(tree),
+            page_cache,
+            next_page_id: next_page_id.clone(),
+            fsm: Mutex::new(FreeSpaceMap::new(next_page_id)),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
@@ -789,15 +800,15 @@ pub struct ComputeStats {
 struct FreeSpaceMap {
     buckets: Vec<VecDeque<PageId>>,
     free_space: HashMap<PageId, usize>,
-    next_page: PageId,
+    next_page_id: Arc<AtomicU64>,
 }
 
 impl FreeSpaceMap {
-    fn new() -> Self {
+    fn new(next_page_id: Arc<AtomicU64>) -> Self {
         Self {
             buckets: vec![VecDeque::new(); bucket_count()],
             free_space: HashMap::new(),
-            next_page: 1,
+            next_page_id,
         }
     }
 
@@ -813,8 +824,7 @@ impl FreeSpaceMap {
             }
         }
 
-        let page_id = self.next_page;
-        self.next_page += 1;
+        let page_id = self.next_page_id.fetch_add(1, Ordering::Relaxed);
         let free = PAGE_SIZE - PAGE_HEADER_SIZE;
         self.free_space.insert(page_id, free);
         self.buckets[bucket_index(free)].push_back(page_id);
@@ -829,8 +839,9 @@ impl FreeSpaceMap {
 }
 
 pub struct ComputeNode {
-    tree: Mutex<PageBPlusTree>,
-    page_cache: RwLock<HashMap<PageId, Page>>,
+    tree: Mutex<PageBPlusTree<SharedPageProvider>>,
+    page_cache: Arc<RwLock<HashMap<PageId, Page>>>,
+    next_page_id: Arc<AtomicU64>,
     fsm: Mutex<FreeSpaceMap>,
     cache_hits: AtomicUsize,
     cache_misses: AtomicUsize,
@@ -840,12 +851,22 @@ pub struct ComputeNode {
     wal_sender: Option<Arc<WalSender>>,
 }
 
+fn create_shared_tree() -> (Mutex<PageBPlusTree<SharedPageProvider>>, Arc<RwLock<HashMap<PageId, Page>>>, Arc<AtomicU64>) {
+    let page_cache = Arc::new(RwLock::new(HashMap::new()));
+    let next_page_id = Arc::new(AtomicU64::new(1));
+    let provider = SharedPageProvider::new(page_cache.clone(), next_page_id.clone());
+    let tree = PageBPlusTree::new_with_provider(provider);
+    (Mutex::new(tree), page_cache, next_page_id)
+}
+
 impl ComputeNode {
     pub fn new() -> Self {
+        let (tree, page_cache, next_page_id) = create_shared_tree();
         Self {
-            tree: Mutex::new(PageBPlusTree::new()),
-            page_cache: RwLock::new(HashMap::new()),
-            fsm: Mutex::new(FreeSpaceMap::new()),
+            tree,
+            page_cache,
+            next_page_id: next_page_id.clone(),
+            fsm: Mutex::new(FreeSpaceMap::new(next_page_id)),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
@@ -863,10 +884,12 @@ impl ComputeNode {
         tokio::task::spawn_local(async move {
             wal_sender_clone.run().await;
         });
+        let (tree, page_cache, next_page_id) = create_shared_tree();
         Ok(Self {
-            tree: Mutex::new(PageBPlusTree::new()),
-            page_cache: RwLock::new(HashMap::new()),
-            fsm: Mutex::new(FreeSpaceMap::new()),
+            tree,
+            page_cache,
+            next_page_id: next_page_id.clone(),
+            fsm: Mutex::new(FreeSpaceMap::new(next_page_id)),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
@@ -884,10 +907,12 @@ impl ComputeNode {
         tokio::task::spawn_local(async move {
             wal_sender_clone.run().await;
         });
+        let (tree, page_cache, next_page_id) = create_shared_tree();
         Ok(Self {
-            tree: Mutex::new(PageBPlusTree::new()),
-            page_cache: RwLock::new(HashMap::new()),
-            fsm: Mutex::new(FreeSpaceMap::new()),
+            tree,
+            page_cache,
+            next_page_id: next_page_id.clone(),
+            fsm: Mutex::new(FreeSpaceMap::new(next_page_id)),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),
@@ -909,10 +934,12 @@ impl ComputeNode {
         tokio::task::spawn_local(async move {
             wal_sender_clone.run().await;
         });
+        let (tree, page_cache, next_page_id) = create_shared_tree();
         Ok(Self {
-            tree: Mutex::new(PageBPlusTree::new()),
-            page_cache: RwLock::new(HashMap::new()),
-            fsm: Mutex::new(FreeSpaceMap::new()),
+            tree,
+            page_cache,
+            next_page_id: next_page_id.clone(),
+            fsm: Mutex::new(FreeSpaceMap::new(next_page_id)),
             cache_hits: AtomicUsize::new(0),
             cache_misses: AtomicUsize::new(0),
             operations: AtomicUsize::new(0),

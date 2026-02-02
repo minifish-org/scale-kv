@@ -211,9 +211,409 @@ impl BatchSender {
   - 吞吐量 = 窗口 / RTT = 16 / 0.5ms = 32K QPS
 ```
 
-#### 5.4 页式 B+tree（索引即 page）方案
+### 5.7 段页式存储重构（PostgreSQL 风格）
+
+#### 5.7.1 问题分析：Bitcask 不适合 Page 存储
+
+当前 Storage 端使用 Bitcask 风格存储 page：
+
+```
+当前架构：
+┌──────────────────────────────────────────────────────────────┐
+│  Compute                                                      │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  HashMap<PageId, Page>  (原地更新)                      │  │
+│  │  B+tree index                                           │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                         │ WAL batch (KV redo)                 │
+│                         ▼                                     │
+└──────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Storage (Bitcask)                                            │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  HashMap<PageId, IndexEntry>  (内存索引)                │  │
+│  │  segment-*.log (append-only)                            │  │
+│  │  每次 page 更新 → 追加完整 16KB                          │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**问题**：
+
+| 问题 | 原因 | 影响 |
+|------|------|------|
+| **空间放大** | 每次更新追加完整 page | 1 个 page 更新 10 次 = 160KB 磁盘占用 |
+| **Compaction 压力** | stale entries 累积 | 后台 compaction 阻塞、抖动 |
+| **架构不对称** | Compute 原地更新，Storage 追加 | 复杂度高，难以理解 |
+| **恢复依赖扫描** | 启动时扫描所有 segment 重建索引 | 数据量大时启动慢 |
+
+**Bitcask 适合的场景**：
+- 小 value（< 1KB）
+- 写多读少
+- 需要版本历史
+
+**Page 存储的特点**：
+- 固定大小（16KB）
+- 更新频繁
+- 不需要多版本
+- 与 Compute 端模型一致
+
+#### 5.7.2 目标：段页式模型（PostgreSQL 风格）
+
+```
+改造后架构：
+┌──────────────────────────────────────────────────────────────┐
+│  Compute                                                      │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  HashMap<PageId, Page>  (原地更新)                      │  │
+│  │  B+tree index                                           │  │
+│  └────────────────────────────────────────────────────────┘  │
+│                         │ WAL batch (KV redo)                 │
+│                         ▼                                     │
+└──────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Storage (段页式)                                             │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │  HashMap<PageId, Page>  (buffer pool, 原地更新)         │  │
+│  │  page_file (固定偏移: page_id × PAGE_SIZE)              │  │
+│  │  WAL segments (崩溃恢复用，复用现有实现)                  │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**核心改变**：
+1. **去掉 Bitcask**：不再使用 append-only segment + 内存索引
+2. **固定偏移页文件**：`page_file[page_id × 16KB]`，原地覆盖写
+3. **Buffer Pool**：内存缓存 dirty pages，批量刷盘
+4. **WAL 复用**：现有 WAL 机制不变，用于崩溃恢复
+
+#### 5.7.3 数据结构设计
+
+```rust
+/// 段页式存储节点
+pub struct PageStore {
+    dir: PathBuf,
+    
+    /// Buffer pool: 内存中的 pages
+    /// - 读取时先查 buffer，miss 则从磁盘加载
+    /// - 写入时更新 buffer，标记 dirty
+    buffer_pool: RwLock<HashMap<PageId, BufferPage>>,
+    
+    /// 页文件: 固定偏移，page_id × PAGE_SIZE
+    /// - 单文件，支持稀疏文件（未写入的 page 不占磁盘空间）
+    /// - 或多文件分段（每 1GB 一个文件）
+    page_file: Mutex<PageFile>,
+    
+    /// WAL writer: 复用现有实现
+    wal_sender: Mutex<Option<Sender<WalBatch>>>,
+    
+    /// Checkpoint 状态
+    checkpoint_lsn: AtomicU64,
+    
+    /// 已分配的最大 page_id（用于分配新 page）
+    max_page_id: AtomicU64,
+}
+
+/// Buffer pool 中的单个 page
+struct BufferPage {
+    /// 页面数据
+    data: Box<[u8; PAGE_SIZE]>,
+    
+    /// 是否为脏页（需要刷盘）
+    dirty: bool,
+    
+    /// 页面的 LSN（用于 WAL 恢复判断）
+    lsn: u64,
+}
+
+/// 页文件抽象
+struct PageFile {
+    /// 单文件模式: 一个大文件
+    file: File,
+    
+    /// 文件当前大小（用于判断是否需要扩展）
+    size: u64,
+}
+```
+
+#### 5.7.4 页文件布局
+
+**方案 A：单文件（简单，推荐先实现）**
+
+```
+page_file:
+┌─────────────────────────────────────────────────────────────┐
+│ Page 0      │ Page 1      │ Page 2      │ ... │ Page N     │
+│ [0, 16KB)   │ [16KB, 32KB)│ [32KB, 48KB)│     │            │
+└─────────────────────────────────────────────────────────────┘
+              │
+              └── offset = page_id × PAGE_SIZE
+
+特点：
+- 简单直接
+- 依赖文件系统稀疏文件支持（Linux ext4/xfs, macOS APFS）
+- page_id 不连续时，中间空洞不占磁盘空间
+```
+
+**方案 B：分段文件（可选，大数据量时）**
+
+```
+data/
+├── pages-0000000000.dat    # page_id 0 ~ 65535
+├── pages-0000000001.dat    # page_id 65536 ~ 131071
+└── pages-0000000002.dat    # ...
+
+每个文件: 65536 × 16KB = 1GB
+文件内偏移: (page_id % 65536) × PAGE_SIZE
+```
+
+**当前选择**：方案 A（单文件），简单且够用。
+
+#### 5.7.5 读写流程
+
+**读取流程**：
+
+```
+get(page_id) -> Option<Page>
+    │
+    ▼
+┌─────────────────────────┐
+│ 1. 查 buffer_pool       │
+│    RwLock::read()       │
+└───────────┬─────────────┘
+            │
+    ┌───────┴───────┐
+    │ hit?          │
+    ▼               ▼
+  返回 data    ┌─────────────────────────┐
+               │ 2. 从 page_file 读取     │
+               │    seek(page_id × 16KB) │
+               │    read_exact(16KB)     │
+               └───────────┬─────────────┘
+                           │
+                           ▼
+               ┌─────────────────────────┐
+               │ 3. 插入 buffer_pool     │
+               │    dirty = false        │
+               └───────────┬─────────────┘
+                           │
+                           ▼
+                        返回 data
+```
+
+**写入流程（WAL replay 触发）**：
+
+```
+put(page_id, data, lsn)
+    │
+    ▼
+┌─────────────────────────┐
+│ 1. 更新 buffer_pool     │
+│    RwLock::write()      │
+│    dirty = true         │
+│    lsn = lsn            │
+└───────────┬─────────────┘
+            │
+            ▼
+        返回 Ok(())
+
+注意：
+- 写入只更新 buffer，不立即刷盘
+- 刷盘由 checkpoint 触发
+- WAL 已经持久化，buffer 丢失可恢复
+```
+
+**Checkpoint 流程**：
+
+```
+checkpoint()
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 1. 收集所有 dirty pages                  │
+│    let dirty_pages = buffer_pool        │
+│        .iter()                          │
+│        .filter(|p| p.dirty)             │
+│        .collect();                      │
+└───────────────────┬─────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│ 2. 按 page_id 排序（顺序写优化）          │
+│    dirty_pages.sort_by_key(|p| p.id);   │
+└───────────────────┬─────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│ 3. 批量写入 page_file                    │
+│    for page in dirty_pages:             │
+│        seek(page_id × PAGE_SIZE)        │
+│        write_all(page.data)             │
+│        page.dirty = false               │
+└───────────────────┬─────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│ 4. fsync + 更新 checkpoint_lsn          │
+│    page_file.sync_all()                 │
+│    checkpoint_lsn = max(dirty lsn)      │
+│    write_checkpoint_state()             │
+└───────────────────┬─────────────────────┘
+                    │
+                    ▼
+                返回 Ok(())
+```
+
+#### 5.7.6 崩溃恢复
+
+**恢复流程**：
+
+```
+open(dir) -> Result<PageStore>
+    │
+    ▼
+┌─────────────────────────────────────────┐
+│ 1. 读取 checkpoint_state                 │
+│    checkpoint_lsn = read_checkpoint()   │
+└───────────────────┬─────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│ 2. 打开 page_file                        │
+│    max_page_id = file_size / PAGE_SIZE  │
+└───────────────────┬─────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│ 3. 重放 WAL（复用现有逻辑）               │
+│    for record in wal where              │
+│        record.lsn > checkpoint_lsn:     │
+│        apply_record(record)             │
+└───────────────────┬─────────────────────┘
+                    │
+                    ▼
+┌─────────────────────────────────────────┐
+│ 4. 启动后台 WAL replay 线程              │
+│    start_wal_replay()                   │
+└───────────────────┬─────────────────────┘
+                    │
+                    ▼
+                返回 Ok(store)
+```
+
+**关键点**：
+- `checkpoint_lsn` 之前的 WAL 可安全删除
+- 恢复只需重放 `checkpoint_lsn` 之后的 WAL
+- 无需扫描 page_file 重建索引（与 Bitcask 不同）
+
+#### 5.7.7 Checkpoint 策略
+
+**触发条件**（满足任一）：
+
+| 条件 | 阈值 | 说明 |
+|------|------|------|
+| **Dirty pages 数量** | > 1000 | 避免 buffer 过大 |
+| **Dirty bytes 总量** | > 64MB | 控制内存使用 |
+| **时间间隔** | > 60s | 定期刷盘 |
+| **WAL 大小** | > 256MB | 允许清理旧 WAL |
+
+**实现**：
+
+```rust
+impl PageStore {
+    fn maybe_checkpoint(&self) {
+        let stats = self.buffer_stats();
+        
+        let should_checkpoint = 
+            stats.dirty_count > 1000 ||
+            stats.dirty_bytes > 64 * 1024 * 1024 ||
+            stats.since_last_checkpoint > Duration::from_secs(60);
+        
+        if should_checkpoint {
+            let _ = self.checkpoint();
+        }
+    }
+}
+```
+
+#### 5.7.8 与现有代码的关系
+
+**保留**：
+- `WalBatch`, `WalRecord` 结构
+- `WalWriter`, `wal_writer_loop` 逻辑
+- WAL segment 格式和读写
+- `wal_state` 持久化
+
+**移除**：
+- Bitcask segment 文件（`segment-*.log`）
+- `IndexEntry { file_id, offset }` 内存索引
+- `compact()` 和相关逻辑
+- `stale_entries` 统计
+
+**修改**：
+- `StorageNode` → `PageStore`（或保留名称，替换实现）
+- `put(page_id, data)` → 更新 buffer，标记 dirty
+- `get(page_id)` → buffer pool 查找 + 磁盘回退
+- 崩溃恢复逻辑简化
+
+#### 5.7.9 对比分析
+
+| 方面 | Bitcask (当前) | 段页式 (改造后) |
+|------|---------------|----------------|
+| **更新开销** | 追加 16KB | 原地覆盖 16KB |
+| **空间放大** | 高（多版本累积） | 无（1:1） |
+| **Compaction** | 必须，定期执行 | 不需要 |
+| **启动恢复** | 扫描所有 segment | 只重放 WAL 增量 |
+| **内存索引** | `HashMap<PageId, IndexEntry>` | 无需（固定偏移计算） |
+| **代码复杂度** | 高（compaction, manifest） | 低 |
+| **与 Compute 对称** | 否 | 是 |
+
+#### 5.7.10 实现步骤
+
+1. **Phase 1: PageStore 基础结构**
+   - 新建 `PageStore` 结构
+   - 实现 `open()`, `get()`, `put()`
+   - 单文件 page_file 读写
+
+2. **Phase 2: Buffer Pool**
+   - 实现 `BufferPage` 和 dirty 跟踪
+   - 实现 `checkpoint()`
+   - `checkpoint_state` 持久化
+
+3. **Phase 3: WAL 集成**
+   - 复用现有 `WalWriter`
+   - 修改 `wal_replay_loop` 调用 `PageStore`
+   - 崩溃恢复测试
+
+4. **Phase 4: 迁移**
+   - 替换 `StorageNode` 实现
+   - 更新 `StorageServer` RPC 处理
+   - 清理 Bitcask 相关代码
+
+5. **Phase 5: 测试验证**
+   - 现有测试通过
+   - 新增 checkpoint 测试
+   - 崩溃恢复测试
+   - 性能对比
+
+#### 5.7.11 文件布局（改造后）
+
+```
+data/
+├── pages.dat           # 页文件（固定偏移）
+├── checkpoint_state    # checkpoint LSN
+├── wal-*.log           # WAL segments（复用）
+└── wal_state           # WAL 回放状态（复用）
+```
+
+### 5.8 页式 B+tree（索引即 page）方案
+
 - 目标：索引节点本身就是固定 16KB page，root page_id 持久化
-- Storage 仅提供 `page_id -> page bytes`（可复用 Bitcask）
+- Storage 仅提供 `page_id -> page bytes`（可复用段页式存储）
 - Compute 维护 buffer pool（页缓存 + dirty flush）
 
 **页头建议：**
@@ -247,12 +647,14 @@ PageHeader {
 5) WAL redo + recovery
 
 #### 约束
-- **存储为单写者模型**（append‑only log），写入串行
+- **存储为单写者模型**，写入串行
 - 内存索引为 HashMap（无锁），由单写者线程更新
 
-#### 5.5 代码审查结果（2026-02-01）
+---
 
-##### 5.5.1 严重问题
+### 5.9 代码审查结果（2026-02-01）
+
+#### 5.9.1 严重问题
 
 | 严重程度 | 问题 | 位置 | 影响 |
 |---------|------|------|------|
@@ -261,7 +663,7 @@ PageHeader {
 | 🔴 | 同步文件 I/O 阻塞 async | node.rs:156 | 阻塞 tokio 线程池 |
 | 🔴 | `spawn_local` 兼容性 | server.rs:165 | 可能在 multi-thread runtime 中异常 |
 
-##### 5.5.2 详细问题说明
+#### 5.9.2 详细问题说明
 
 **Cap'n RPC 同步使用**：
 ```rust
@@ -311,7 +713,7 @@ tokio::task::spawn(async move { ... });
 // Cargo.toml: features = ["rt-current-thread", "net"]
 ```
 
-##### 5.5.3 中等问题
+#### 5.9.3 中等问题
 
 | 严重程度 | 问题 | 位置 | 修复建议 |
 |---------|------|------|----------|
@@ -319,14 +721,14 @@ tokio::task::spawn(async move { ... });
 | 🟡 | MAX_KEYS = 8 太小 | bptree.rs:3 | 根据 page 大小动态调整 |
 | 🟡 | 批量操作未并发 | client.rs:387 | 用 `join_all` 并发执行 |
 
-##### 5.5.4 轻微问题
+#### 5.9.4 轻微问题
 
 | 严重程度 | 问题 | 位置 | 修复建议 |
 |---------|------|------|----------|
 | 🟢 | 未使用 dashmap | Cargo.toml:11 | 移除依赖 |
 | 🟢 | tokio features 过量 | Cargo.toml:14 | 用 `rt-multi-thread + net` |
 
-##### 5.5.5 修复优先级
+#### 5.9.5 修复优先级
 
 | 优先级 | 问题 | 预计改动 |
 |--------|------|----------|
