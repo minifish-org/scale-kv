@@ -1,12 +1,13 @@
 use crate::page_store::PageStore;
 use crate::{Page, PageId, Result, Value, PAGE_SIZE};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Error, ErrorKind, Read, Write};
+use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::Mutex;
 
 const PAGE_HEADER_SIZE: usize = 6;
 const SLOT_ENTRY_SIZE: usize = 4;
@@ -33,7 +34,7 @@ struct ReplayBuffer {
 struct PageStoreReplay {
     page_store: Arc<PageStore>,
     dir: PathBuf,
-    last_applied_lsn: Mutex<u64>,
+    last_applied_lsn: std::sync::Mutex<u64>,
 }
 
 impl PageStoreReplay {
@@ -41,7 +42,7 @@ impl PageStoreReplay {
         Self {
             page_store,
             dir,
-            last_applied_lsn: Mutex::new(last_applied_lsn),
+            last_applied_lsn: std::sync::Mutex::new(last_applied_lsn),
         }
     }
 
@@ -50,32 +51,39 @@ impl PageStoreReplay {
         Ok(())
     }
 
-    fn read_page(&self, page_id: PageId) -> Option<Page> {
-        self.page_store.get(page_id)
+    async fn read_page(&self, page_id: PageId) -> Option<Page> {
+        self.page_store.get(page_id).await
     }
 
     fn last_applied(&self) -> u64 {
         *self.last_applied_lsn.lock().unwrap()
     }
 
-    fn update_last_applied(&self, lsn: u64) {
-        let mut last_applied = self.last_applied_lsn.lock().unwrap();
-        if lsn > *last_applied {
-            *last_applied = lsn;
-            let _ = write_wal_state(&self.dir, *last_applied);
+    async fn update_last_applied(&self, lsn: u64) {
+        let should_write = {
+            let mut last_applied = self.last_applied_lsn.lock().unwrap();
+            if lsn > *last_applied {
+                *last_applied = lsn;
+                true
+            } else {
+                false
+            }
+        };
+        if should_write {
+            let _ = write_wal_state(&self.dir, lsn).await;
         }
     }
 
-    fn apply_record(&self, record: WalRecord) -> Result<()> {
+    async fn apply_record(&self, record: WalRecord) -> Result<()> {
         let page_id = record.page_id;
         let lsn = record.lsn;
         let page = self
-            .read_page(page_id)
+            .read_page(page_id).await
             .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
         let mut page = page;
         apply_wal_record(&mut page, &record)?;
         self.write_page(page_id, &page, lsn)?;
-        self.update_last_applied(lsn);
+        self.update_last_applied(lsn).await;
         Ok(())
     }
 }
@@ -104,18 +112,18 @@ impl ReplayBuffer {
 }
 
 impl WalWriter {
-    fn open(dir: PathBuf) -> Result<Self> {
-        let mut segments = list_wal_segments(&dir)?;
+    async fn open(dir: PathBuf) -> Result<Self> {
+        let mut segments = list_wal_segments(&dir).await?;
         let (file_id, file, size) = if segments.is_empty() {
             let file_id = 1u64;
-            let file = create_wal_segment(&dir, file_id)?;
+            let file = create_wal_segment(&dir, file_id).await?;
             (file_id, file, 0u64)
         } else {
             segments.sort_unstable();
             let file_id = *segments.last().unwrap();
             let path = wal_segment_path(&dir, file_id);
-            let file = OpenOptions::new().append(true).read(true).open(path)?;
-            let size = file.metadata()?.len();
+            let file = OpenOptions::new().append(true).read(true).open(path).await?;
+            let size = file.metadata().await?.len();
             (file_id, file, size)
         };
         Ok(Self {
@@ -126,23 +134,23 @@ impl WalWriter {
         })
     }
 
-    fn rotate_if_needed(&mut self) -> Result<()> {
+    async fn rotate_if_needed(&mut self) -> Result<()> {
         if self.size < MAX_SEGMENT_SIZE {
             return Ok(());
         }
         self.file_id += 1;
-        self.file = create_wal_segment(&self.dir, self.file_id)?;
+        self.file = create_wal_segment(&self.dir, self.file_id).await?;
         self.size = 0;
         Ok(())
     }
 
-    fn append_batch(&mut self, batch: &WalBatch) -> Result<()> {
-        self.rotate_if_needed()?;
+    async fn append_batch(&mut self, batch: &WalBatch) -> Result<()> {
+        self.rotate_if_needed().await?;
         let mut buf = Vec::new();
         encode_wal_batch(batch, &mut buf)?;
-        self.file.write_all(&buf)?;
+        self.file.write_all(&buf).await?;
         self.size += buf.len() as u64;
-        self.file.sync_data()?;
+        self.file.sync_data().await?;
         Ok(())
     }
 }
@@ -164,20 +172,21 @@ fn wal_segment_path(dir: &Path, file_id: u64) -> PathBuf {
     dir.join(format!("{}-{:020}.log", WAL_SEGMENT_PREFIX, file_id))
 }
 
-fn create_wal_segment(dir: &Path, file_id: u64) -> Result<File> {
+async fn create_wal_segment(dir: &Path, file_id: u64) -> Result<File> {
     let path = wal_segment_path(dir, file_id);
     Ok(OpenOptions::new()
         .create(true)
         .write(true)
         .read(true)
         .truncate(true)
-        .open(path)?)
+        .open(path)
+        .await?)
 }
 
-fn list_wal_segments(dir: &Path) -> Result<Vec<u64>> {
+async fn list_wal_segments(dir: &Path) -> Result<Vec<u64>> {
     let mut segments = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    let mut entries = fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if let Some(rest) = name.strip_prefix(&format!("{}-", WAL_SEGMENT_PREFIX)) {
@@ -192,13 +201,13 @@ fn list_wal_segments(dir: &Path) -> Result<Vec<u64>> {
     Ok(segments)
 }
 
-fn get_wal_segment_max_lsn(dir: &Path, file_id: u64) -> Result<u64> {
+async fn get_wal_segment_max_lsn(dir: &Path, file_id: u64) -> Result<u64> {
     let path = wal_segment_path(dir, file_id);
-    let mut file = File::open(&path)?;
+    let mut file = File::open(&path).await?;
     let mut max_lsn = 0u64;
 
     loop {
-        match read_wal_batch(&mut file) {
+        match read_wal_batch(&mut file).await {
             Ok(Some(batch)) => {
                 if batch.end_lsn > max_lsn {
                     max_lsn = batch.end_lsn;
@@ -212,18 +221,18 @@ fn get_wal_segment_max_lsn(dir: &Path, file_id: u64) -> Result<u64> {
     Ok(max_lsn)
 }
 
-fn truncate_wal_segments(dir: &Path, checkpoint_lsn: u64) -> Result<usize> {
-    let segments = list_wal_segments(dir)?;
+async fn truncate_wal_segments(dir: &Path, checkpoint_lsn: u64) -> Result<usize> {
+    let segments = list_wal_segments(dir).await?;
     if segments.len() <= 1 {
         return Ok(0);
     }
 
     let mut deleted = 0;
     for &file_id in &segments[..segments.len() - 1] {
-        let max_lsn = get_wal_segment_max_lsn(dir, file_id).unwrap_or(0);
+        let max_lsn = get_wal_segment_max_lsn(dir, file_id).await.unwrap_or(0);
         if max_lsn > 0 && max_lsn <= checkpoint_lsn {
             let path = wal_segment_path(dir, file_id);
-            if fs::remove_file(&path).is_ok() {
+            if fs::remove_file(&path).await.is_ok() {
                 deleted += 1;
             }
         }
@@ -273,35 +282,35 @@ fn encode_wal_batch(batch: &WalBatch, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-fn start_wal_writer(dir: PathBuf) -> Result<(Sender<WalBatch>, Receiver<WalBatch>)> {
-    let (tx, rx) = mpsc::channel::<WalBatch>();
-    let (replay_tx, replay_rx) = mpsc::channel::<WalBatch>();
-    thread::spawn(move || wal_writer_loop(dir, rx, replay_tx));
+async fn start_wal_writer(dir: PathBuf) -> Result<(Sender<WalBatch>, Receiver<WalBatch>)> {
+    let (tx, rx) = mpsc::channel::<WalBatch>(1024);
+    let (replay_tx, replay_rx) = mpsc::channel::<WalBatch>(1024);
+    tokio::spawn(wal_writer_loop(dir, rx, replay_tx));
     Ok((tx, replay_rx))
 }
 
-fn wal_writer_loop(dir: PathBuf, rx: Receiver<WalBatch>, replay_tx: Sender<WalBatch>) {
-    let mut writer = match WalWriter::open(dir) {
+async fn wal_writer_loop(dir: PathBuf, mut rx: Receiver<WalBatch>, replay_tx: Sender<WalBatch>) {
+    let mut writer = match WalWriter::open(dir).await {
         Ok(writer) => writer,
         Err(_) => return,
     };
-    for batch in rx {
-        if writer.append_batch(&batch).is_ok() {
-            let _ = replay_tx.send(batch);
+    while let Some(batch) = rx.recv().await {
+        if writer.append_batch(&batch).await.is_ok() {
+            let _ = replay_tx.send(batch).await;
         }
     }
 }
 
-fn read_wal_batch(file: &mut File) -> Result<Option<WalBatch>> {
+async fn read_wal_batch(file: &mut File) -> Result<Option<WalBatch>> {
     let mut len_buf = [0u8; 4];
-    match file.read_exact(&mut len_buf) {
-        Ok(()) => {}
+    match file.read_exact(&mut len_buf).await {
+        Ok(_) => {}
         Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
         Err(err) => return Err(err.into()),
     }
     let total_len = u32::from_le_bytes(len_buf) as usize;
     let mut buf = vec![0u8; total_len];
-    file.read_exact(&mut buf)?;
+    file.read_exact(&mut buf).await?;
     let mut cursor = 0usize;
 
     let start_lsn = read_u64_from(&buf, &mut cursor)?;
@@ -377,9 +386,9 @@ fn read_u8_from(buf: &[u8], cursor: &mut usize) -> Result<u8> {
     Ok(value)
 }
 
-fn wal_replay_loop(replay: PageStoreReplay, rx: Receiver<WalBatch>) {
+async fn wal_replay_loop(replay: PageStoreReplay, mut rx: Receiver<WalBatch>) {
     let mut buffers: HashMap<PageId, ReplayBuffer> = HashMap::new();
-    for batch in rx {
+    while let Some(batch) = rx.recv().await {
         let mut last_seen = replay.last_applied();
         for record in batch.records.into_iter() {
             if record.lsn <= last_seen {
@@ -394,18 +403,18 @@ fn wal_replay_loop(replay: PageStoreReplay, rx: Receiver<WalBatch>) {
             buffer.push(record);
             if buffer.should_flush() {
                 let records = buffer.take();
-                let _ = replay_page_records(&replay, page_id, records);
+                let _ = replay_page_records(&replay, page_id, records).await;
             }
         }
     }
 
     for (page_id, mut buffer) in buffers.into_iter() {
         let records = buffer.take();
-        let _ = replay_page_records(&replay, page_id, records);
+        let _ = replay_page_records(&replay, page_id, records).await;
     }
 }
 
-fn replay_page_records(
+async fn replay_page_records(
     replay: &PageStoreReplay,
     page_id: PageId,
     records: Vec<WalRecord>,
@@ -415,7 +424,7 @@ fn replay_page_records(
     }
     let mut max_lsn = 0u64;
     let page = replay
-        .read_page(page_id)
+        .read_page(page_id).await
         .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
     let mut page = page;
     for record in records {
@@ -425,16 +434,16 @@ fn replay_page_records(
         apply_wal_record(&mut page, &record)?;
     }
     replay.write_page(page_id, &page, max_lsn)?;
-    replay.update_last_applied(max_lsn);
+    replay.update_last_applied(max_lsn).await;
     Ok(())
 }
 
-fn replay_wal_segments_to_store(
+async fn replay_wal_segments_to_store(
     dir: &Path,
     page_store: Arc<PageStore>,
     last_applied_lsn: u64,
 ) -> Result<()> {
-    let mut segments = list_wal_segments(dir)?;
+    let mut segments = list_wal_segments(dir).await?;
     segments.sort_unstable();
     if segments.is_empty() {
         return Ok(());
@@ -442,9 +451,9 @@ fn replay_wal_segments_to_store(
     let replay = PageStoreReplay::new(page_store, dir.to_path_buf(), last_applied_lsn);
     for file_id in segments {
         let path = wal_segment_path(dir, file_id);
-        let mut file = File::open(&path)?;
+        let mut file = File::open(&path).await?;
         loop {
-            let batch = match read_wal_batch(&mut file)? {
+            let batch = match read_wal_batch(&mut file).await? {
                 Some(batch) => batch,
                 None => break,
             };
@@ -452,7 +461,7 @@ fn replay_wal_segments_to_store(
                 if record.lsn <= replay.last_applied() {
                     continue;
                 }
-                replay.apply_record(record)?;
+                replay.apply_record(record).await?;
             }
         }
     }
@@ -605,24 +614,24 @@ fn write_u16(page: &mut [u8], offset: usize, value: u16) {
 }
 
 impl StorageNode {
-    pub fn new() -> Self {
+    pub async fn new() -> Self {
         let dir = std::env::var("SCALE_KV_DATA_DIR").unwrap_or_else(|_| "data".to_string());
-        Self::open(dir).expect("failed to open storage")
+        Self::open(dir).await.expect("failed to open storage")
     }
 
-    pub fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
+    pub async fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir).await?;
 
-        let page_store = PageStore::open(&dir)?;
+        let page_store = PageStore::open(&dir).await?;
         let checkpoint_lsn = page_store.checkpoint_lsn();
 
-        let wal_state = read_wal_state(&dir).unwrap_or(WalState {
+        let wal_state = read_wal_state(&dir).await.unwrap_or(WalState {
             last_applied_lsn: 0,
         });
         let last_applied_lsn = wal_state.last_applied_lsn.max(checkpoint_lsn);
 
-        let (wal_sender, wal_replay_rx) = start_wal_writer(dir.clone())?;
+        let (wal_sender, wal_replay_rx) = start_wal_writer(dir.clone()).await?;
 
         let page_store = Arc::new(page_store);
         let node = Self {
@@ -632,15 +641,15 @@ impl StorageNode {
             wal_replay_rx: Mutex::new(Some(wal_replay_rx)),
         };
 
-        replay_wal_segments_to_store(&dir, Arc::clone(&page_store), last_applied_lsn)?;
-        node.start_wal_replay(last_applied_lsn);
+        replay_wal_segments_to_store(&dir, Arc::clone(&page_store), last_applied_lsn).await?;
+        node.start_wal_replay(last_applied_lsn).await;
         Ok(node)
     }
 
-    pub fn append_wal_batch(&self, batch: WalBatch) -> Result<()> {
-        let sender = self.wal_sender.lock().unwrap();
+    pub async fn append_wal_batch(&self, batch: WalBatch) -> Result<()> {
+        let sender = self.wal_sender.lock().await;
         match sender.as_ref() {
-            Some(sender) => Ok(sender.send(batch).map_err(|_| {
+            Some(sender) => Ok(sender.send(batch).await.map_err(|_| {
                 crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal queue closed"))
             })?),
             None => Err(crate::Error::Io(Error::new(
@@ -650,8 +659,8 @@ impl StorageNode {
         }
     }
 
-    pub fn start_wal_replay(&self, last_applied_lsn: u64) {
-        let rx = self.wal_replay_rx.lock().unwrap().take();
+    pub async fn start_wal_replay(&self, last_applied_lsn: u64) {
+        let rx = self.wal_replay_rx.lock().await.take();
         if rx.is_none() {
             return;
         }
@@ -661,13 +670,13 @@ impl StorageNode {
             self.dir.clone(),
             last_applied_lsn,
         );
-        thread::spawn(move || {
-            wal_replay_loop(replay, rx);
+        tokio::spawn(async move {
+            wal_replay_loop(replay, rx).await;
         });
     }
 
-    pub fn checkpoint(&self) -> Result<()> {
-        self.page_store.checkpoint()
+    pub async fn checkpoint(&self) -> Result<()> {
+        self.page_store.checkpoint().await
     }
 
     pub fn len(&self) -> usize {
@@ -682,40 +691,40 @@ impl StorageNode {
         let _ = self.page_store.put_direct(key, value);
     }
 
-    pub fn get(&self, key: PageId) -> Option<Value> {
-        self.page_store.get(key)
+    pub async fn get(&self, key: PageId) -> Option<Value> {
+        self.page_store.get(key).await
     }
 
     pub fn delete(&self, key: PageId) {
         self.page_store.delete(key);
     }
 
-    pub fn contains(&self, key: PageId) -> bool {
-        self.page_store.contains(key)
+    pub async fn contains(&self, key: PageId) -> bool {
+        self.page_store.contains(key).await
     }
 
     pub fn keys(&self) -> Vec<PageId> {
         self.page_store.keys()
     }
 
-    pub fn compact(&self) -> Result<()> {
-        self.page_store.checkpoint()
+    pub async fn compact(&self) -> Result<()> {
+        self.page_store.checkpoint().await
     }
 
-    pub fn truncate_wal(&self) -> Result<usize> {
+    pub async fn truncate_wal(&self) -> Result<usize> {
         let checkpoint_lsn = self.page_store.checkpoint_lsn();
-        truncate_wal_segments(&self.dir, checkpoint_lsn)
+        truncate_wal_segments(&self.dir, checkpoint_lsn).await
     }
 
-    pub fn checkpoint_and_truncate(&self) -> Result<usize> {
-        self.page_store.checkpoint()?;
-        self.truncate_wal()
+    pub async fn checkpoint_and_truncate(&self) -> Result<usize> {
+        self.page_store.checkpoint().await?;
+        self.truncate_wal().await
     }
 
     pub fn start_background_checkpoint(
         &self,
         config: crate::page_store::CheckpointConfig,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> tokio::task::JoinHandle<()> {
         self.start_background_checkpoint_with_truncate(config, false)
     }
 
@@ -723,26 +732,26 @@ impl StorageNode {
         &self,
         config: crate::page_store::CheckpointConfig,
         truncate_wal: bool,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> tokio::task::JoinHandle<()> {
         let page_store = Arc::clone(&self.page_store);
         let dir = self.dir.clone();
         let poll_interval = config.interval.min(std::time::Duration::from_secs(1));
 
-        thread::spawn(move || {
+        tokio::spawn(async move {
             while !page_store.is_shutdown() {
-                thread::sleep(poll_interval);
+                tokio::time::sleep(poll_interval).await;
                 if page_store.is_shutdown() {
                     break;
                 }
-                if page_store.maybe_checkpoint(&config).unwrap_or(false) && truncate_wal {
+                if page_store.maybe_checkpoint(&config).await.unwrap_or(false) && truncate_wal {
                     let checkpoint_lsn = page_store.checkpoint_lsn();
-                    let _ = truncate_wal_segments(&dir, checkpoint_lsn);
+                    let _ = truncate_wal_segments(&dir, checkpoint_lsn).await;
                 }
             }
-            let _ = page_store.checkpoint();
+            let _ = page_store.checkpoint().await;
             if truncate_wal {
                 let checkpoint_lsn = page_store.checkpoint_lsn();
-                let _ = truncate_wal_segments(&dir, checkpoint_lsn);
+                let _ = truncate_wal_segments(&dir, checkpoint_lsn).await;
             }
         })
     }
@@ -756,15 +765,9 @@ impl StorageNode {
     }
 }
 
-impl Default for StorageNode {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn read_wal_state(dir: &Path) -> Result<WalState> {
+async fn read_wal_state(dir: &Path) -> Result<WalState> {
     let path = dir.join(WAL_STATE_FILE);
-    let mut file = match File::open(path) {
+    let mut file = match File::open(path).await {
         Ok(file) => file,
         Err(err) if err.kind() == ErrorKind::NotFound => {
             return Ok(WalState {
@@ -774,12 +777,12 @@ fn read_wal_state(dir: &Path) -> Result<WalState> {
         Err(err) => return Err(err.into()),
     };
     let mut buf = [0u8; 8];
-    file.read_exact(&mut buf)?;
+    file.read_exact(&mut buf).await?;
     let last_applied_lsn = u64::from_le_bytes(buf);
     Ok(WalState { last_applied_lsn })
 }
 
-fn write_wal_state(dir: &Path, last_applied_lsn: u64) -> Result<()> {
+async fn write_wal_state(dir: &Path, last_applied_lsn: u64) -> Result<()> {
     let tmp_path = dir.join(WAL_STATE_TMP_FILE);
     let path = dir.join(WAL_STATE_FILE);
     {
@@ -787,33 +790,33 @@ fn write_wal_state(dir: &Path, last_applied_lsn: u64) -> Result<()> {
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&tmp_path)?;
-        file.write_all(&last_applied_lsn.to_le_bytes())?;
-        file.sync_all()?;
+            .open(&tmp_path)
+            .await?;
+        file.write_all(&last_applied_lsn.to_le_bytes()).await?;
+        file.sync_all().await?;
     }
-    fs::rename(tmp_path, path)?;
+    fs::rename(tmp_path, path).await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    fn temp_dir() -> PathBuf {
+    async fn temp_dir() -> PathBuf {
         let mut dir = std::env::temp_dir();
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         dir.push(format!("scale-kv-test-{}-{}", std::process::id(), id));
-        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        fs::create_dir_all(&dir).await.expect("failed to create temp dir");
         dir
     }
 
-    fn cleanup_dir(dir: &Path) {
-        let _ = fs::remove_dir_all(dir);
+    async fn cleanup_dir(dir: &Path) {
+        let _ = fs::remove_dir_all(dir).await;
     }
 
     fn make_page(fill: u8) -> Vec<u8> {
@@ -823,58 +826,58 @@ mod tests {
         page
     }
 
-    #[test]
-    fn test_put_and_get() {
-        let dir = temp_dir();
-        let node = StorageNode::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_put_and_get() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
         let page = make_page(1);
         node.put(1, &page);
-        let result = node.get(1).unwrap();
+        let result = node.get(1).await.unwrap();
         assert_eq!(result[0], 1);
         assert_eq!(result[PAGE_SIZE - 1], 1);
         drop(node);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_get_missing() {
-        let dir = temp_dir();
-        let node = StorageNode::open(&dir).unwrap();
-        assert_eq!(node.get(999), None);
+    #[tokio::test]
+    async fn test_get_missing() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
+        assert_eq!(node.get(999).await, None);
         drop(node);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_overwrite() {
-        let dir = temp_dir();
-        let node = StorageNode::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_overwrite() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
         let page1 = make_page(1);
         let page2 = make_page(2);
         node.put(1, &page1);
         node.put(1, &page2);
-        let result = node.get(1).unwrap();
+        let result = node.get(1).await.unwrap();
         assert_eq!(result[0], 2);
         drop(node);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_delete() {
-        let dir = temp_dir();
-        let node = StorageNode::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_delete() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
         let page = make_page(1);
         node.put(1, &page);
         node.delete(1);
-        assert_eq!(node.get(1), None);
+        assert_eq!(node.get(1).await, None);
         drop(node);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_len() {
-        let dir = temp_dir();
-        let node = StorageNode::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_len() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
         assert_eq!(node.len(), 0);
         let page1 = make_page(1);
         let page2 = make_page(2);
@@ -882,85 +885,85 @@ mod tests {
         node.put(2, &page2);
         assert_eq!(node.len(), 2);
         drop(node);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_contains() {
-        let dir = temp_dir();
-        let node = StorageNode::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_contains() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
         let page = make_page(1);
         node.put(1, &page);
-        assert!(node.contains(1));
-        assert!(!node.contains(999));
+        assert!(node.contains(1).await);
+        assert!(!node.contains(999).await);
         drop(node);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_reopen_persists() {
-        let dir = temp_dir();
+    #[tokio::test]
+    async fn test_reopen_persists() {
+        let dir = temp_dir().await;
         let page1 = make_page(1);
         let page2 = make_page(2);
         {
-            let node = StorageNode::open(&dir).unwrap();
+            let node = StorageNode::open(&dir).await.unwrap();
             node.put(1, &page1);
             node.put(2, &page2);
-            node.checkpoint().unwrap();
+            node.checkpoint().await.unwrap();
         }
-        let node = StorageNode::open(&dir).unwrap();
-        assert_eq!(node.get(1).unwrap()[0], 1);
-        assert_eq!(node.get(2).unwrap()[0], 2);
+        let node = StorageNode::open(&dir).await.unwrap();
+        assert_eq!(node.get(1).await.unwrap()[0], 1);
+        assert_eq!(node.get(2).await.unwrap()[0], 2);
         drop(node);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_checkpoint_persists_data() {
-        let dir = temp_dir();
+    #[tokio::test]
+    async fn test_checkpoint_persists_data() {
+        let dir = temp_dir().await;
         let page1 = make_page(1);
         let page2 = make_page(2);
         {
-            let node = StorageNode::open(&dir).unwrap();
+            let node = StorageNode::open(&dir).await.unwrap();
             node.put(1, &page1);
             node.put(2, &page2);
-            node.checkpoint().unwrap();
+            node.checkpoint().await.unwrap();
         }
         {
-            let node = StorageNode::open(&dir).unwrap();
-            assert_eq!(node.get(1).unwrap()[0], 1);
-            assert_eq!(node.get(2).unwrap()[0], 2);
+            let node = StorageNode::open(&dir).await.unwrap();
+            assert_eq!(node.get(1).await.unwrap()[0], 1);
+            assert_eq!(node.get(2).await.unwrap()[0], 2);
         }
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_compact_is_checkpoint() {
-        let dir = temp_dir();
+    #[tokio::test]
+    async fn test_compact_is_checkpoint() {
+        let dir = temp_dir().await;
         let page = make_page(1);
-        let node = StorageNode::open(&dir).unwrap();
+        let node = StorageNode::open(&dir).await.unwrap();
         node.put(1, &page);
-        node.compact().unwrap();
+        node.compact().await.unwrap();
         drop(node);
 
-        let node = StorageNode::open(&dir).unwrap();
-        assert_eq!(node.get(1).unwrap()[0], 1);
+        let node = StorageNode::open(&dir).await.unwrap();
+        assert_eq!(node.get(1).await.unwrap()[0], 1);
         drop(node);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_wal_state_roundtrip() {
-        let dir = temp_dir();
-        write_wal_state(&dir, 42).unwrap();
-        let state = read_wal_state(&dir).unwrap();
+    #[tokio::test]
+    async fn test_wal_state_roundtrip() {
+        let dir = temp_dir().await;
+        write_wal_state(&dir, 42).await.unwrap();
+        let state = read_wal_state(&dir).await.unwrap();
         assert_eq!(state.last_applied_lsn, 42);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_wal_encode_decode_roundtrip() {
-        let dir = temp_dir();
+    #[tokio::test]
+    async fn test_wal_encode_decode_roundtrip() {
+        let dir = temp_dir().await;
         let path = dir.join("wal-test.log");
         let batch = WalBatch {
             start_lsn: 1,
@@ -986,25 +989,25 @@ mod tests {
         };
         let mut buf = Vec::new();
         encode_wal_batch(&batch, &mut buf).unwrap();
-        let mut file = File::create(&path).unwrap();
-        file.write_all(&buf).unwrap();
-        file.sync_all().unwrap();
+        let mut file = File::create(&path).await.unwrap();
+        file.write_all(&buf).await.unwrap();
+        file.sync_all().await.unwrap();
         drop(file);
 
-        let mut file = File::open(&path).unwrap();
-        let decoded = read_wal_batch(&mut file).unwrap().unwrap();
+        let mut file = File::open(&path).await.unwrap();
+        let decoded = read_wal_batch(&mut file).await.unwrap().unwrap();
         assert_eq!(decoded.start_lsn, 1);
         assert_eq!(decoded.end_lsn, 2);
         assert_eq!(decoded.records.len(), 2);
         assert_eq!(decoded.records[0].key, b"k1".to_vec());
         assert_eq!(decoded.records[0].value, b"v1".to_vec());
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_replay_page_records_applies_updates() {
-        let dir = temp_dir();
-        let page_store = Arc::new(PageStore::open(&dir).unwrap());
+    #[tokio::test]
+    async fn test_replay_page_records_applies_updates() {
+        let dir = temp_dir().await;
+        let page_store = Arc::new(PageStore::open(&dir).await.unwrap());
         let mut page = vec![0u8; PAGE_SIZE];
         write_header(&mut page, 0, PAGE_HEADER_SIZE as u16, PAGE_SIZE as u16);
         page_store.put_direct(10, &page).unwrap();
@@ -1028,8 +1031,8 @@ mod tests {
                 value: b"v2".to_vec(),
             },
         ];
-        replay_page_records(&replay, 10, records).unwrap();
-        let page = page_store.get(10).unwrap();
+        replay_page_records(&replay, 10, records).await.unwrap();
+        let page = page_store.get(10).await.unwrap();
         let read_slot = |page: &[u8], slot_id: u16| -> Vec<u8> {
             let offset = slot_offset(slot_id);
             let pos = read_u16(page, offset) as usize;
@@ -1045,7 +1048,7 @@ mod tests {
         };
         assert_eq!(read_slot(&page, 0), b"v1");
         assert_eq!(read_slot(&page, 1), b"v2");
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
     #[test]
@@ -1057,35 +1060,35 @@ mod tests {
         assert!(format!("{err}").contains("wal replay slot key mismatch"));
     }
 
-    #[test]
-    fn test_wal_truncation_keeps_current_segment() {
-        let dir = temp_dir();
-        let node = StorageNode::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_wal_truncation_keeps_current_segment() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
 
         let page = make_page(1);
         node.put(1, &page);
-        node.checkpoint().unwrap();
+        node.checkpoint().await.unwrap();
 
-        let segments_before = list_wal_segments(&dir).unwrap();
+        let segments_before = list_wal_segments(&dir).await.unwrap();
         assert_eq!(segments_before.len(), 1);
 
-        let deleted = node.truncate_wal().unwrap();
+        let deleted = node.truncate_wal().await.unwrap();
         assert_eq!(deleted, 0);
 
-        let segments_after = list_wal_segments(&dir).unwrap();
+        let segments_after = list_wal_segments(&dir).await.unwrap();
         assert_eq!(segments_after.len(), 1);
 
         drop(node);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_wal_truncation_deletes_old_segments() {
-        let dir = temp_dir();
+    #[tokio::test]
+    async fn test_wal_truncation_deletes_old_segments() {
+        let dir = temp_dir().await;
 
-        create_wal_segment(&dir, 1).unwrap();
-        create_wal_segment(&dir, 2).unwrap();
-        create_wal_segment(&dir, 3).unwrap();
+        create_wal_segment(&dir, 1).await.unwrap();
+        create_wal_segment(&dir, 2).await.unwrap();
+        create_wal_segment(&dir, 3).await.unwrap();
 
         {
             let batch1 = WalBatch {
@@ -1109,70 +1112,73 @@ mod tests {
             let mut file1 = OpenOptions::new()
                 .write(true)
                 .open(wal_segment_path(&dir, 1))
+                .await
                 .unwrap();
-            file1.write_all(&buf1).unwrap();
+            file1.write_all(&buf1).await.unwrap();
 
             let mut buf2 = Vec::new();
             encode_wal_batch(&batch2, &mut buf2).unwrap();
             let mut file2 = OpenOptions::new()
                 .write(true)
                 .open(wal_segment_path(&dir, 2))
+                .await
                 .unwrap();
-            file2.write_all(&buf2).unwrap();
+            file2.write_all(&buf2).await.unwrap();
 
             let mut buf3 = Vec::new();
             encode_wal_batch(&batch3, &mut buf3).unwrap();
             let mut file3 = OpenOptions::new()
                 .write(true)
                 .open(wal_segment_path(&dir, 3))
+                .await
                 .unwrap();
-            file3.write_all(&buf3).unwrap();
+            file3.write_all(&buf3).await.unwrap();
         }
 
-        let segments = list_wal_segments(&dir).unwrap();
+        let segments = list_wal_segments(&dir).await.unwrap();
         assert_eq!(segments, vec![1, 2, 3]);
 
-        let deleted = truncate_wal_segments(&dir, 15).unwrap();
+        let deleted = truncate_wal_segments(&dir, 15).await.unwrap();
         assert_eq!(deleted, 1);
 
-        let segments = list_wal_segments(&dir).unwrap();
+        let segments = list_wal_segments(&dir).await.unwrap();
         assert_eq!(segments, vec![2, 3]);
 
-        let deleted = truncate_wal_segments(&dir, 25).unwrap();
+        let deleted = truncate_wal_segments(&dir, 25).await.unwrap();
         assert_eq!(deleted, 1);
 
-        let segments = list_wal_segments(&dir).unwrap();
+        let segments = list_wal_segments(&dir).await.unwrap();
         assert_eq!(segments, vec![3]);
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_checkpoint_and_truncate() {
-        let dir = temp_dir();
-        let node = StorageNode::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_checkpoint_and_truncate() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
 
         let page = make_page(1);
         node.put(1, &page);
 
-        let deleted = node.checkpoint_and_truncate().unwrap();
+        let deleted = node.checkpoint_and_truncate().await.unwrap();
         assert_eq!(deleted, 0);
 
-        assert!(node.page_store().checkpoint_lsn() == 0 || node.get(1).is_some());
+        assert!(node.page_store().checkpoint_lsn() == 0 || node.get(1).await.is_some());
 
         drop(node);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_background_checkpoint_with_truncate() {
+    #[tokio::test]
+    async fn test_background_checkpoint_with_truncate() {
         use crate::page_store::CheckpointConfig;
         use std::time::Duration;
 
-        let dir = temp_dir();
+        let dir = temp_dir().await;
 
-        create_wal_segment(&dir, 1).unwrap();
-        create_wal_segment(&dir, 2).unwrap();
+        create_wal_segment(&dir, 1).await.unwrap();
+        create_wal_segment(&dir, 2).await.unwrap();
         {
             let batch1 = WalBatch {
                 start_lsn: 1,
@@ -1189,19 +1195,21 @@ mod tests {
             let mut file1 = OpenOptions::new()
                 .write(true)
                 .open(wal_segment_path(&dir, 1))
+                .await
                 .unwrap();
-            file1.write_all(&buf1).unwrap();
+            file1.write_all(&buf1).await.unwrap();
 
             let mut buf2 = Vec::new();
             encode_wal_batch(&batch2, &mut buf2).unwrap();
             let mut file2 = OpenOptions::new()
                 .write(true)
                 .open(wal_segment_path(&dir, 2))
+                .await
                 .unwrap();
-            file2.write_all(&buf2).unwrap();
+            file2.write_all(&buf2).await.unwrap();
         }
 
-        let page_store = Arc::new(PageStore::open(&dir).unwrap());
+        let page_store = Arc::new(PageStore::open(&dir).await.unwrap());
 
         for i in 0..15u64 {
             let page = make_page(i as u8);
@@ -1216,30 +1224,30 @@ mod tests {
 
         let store_clone = Arc::clone(&page_store);
         let dir_clone = dir.clone();
-        let handle = thread::spawn(move || {
+        let handle = tokio::spawn(async move {
             while !store_clone.is_shutdown() {
-                thread::sleep(Duration::from_millis(20));
+                tokio::time::sleep(Duration::from_millis(20)).await;
                 if store_clone.is_shutdown() {
                     break;
                 }
-                if store_clone.maybe_checkpoint(&config).unwrap_or(false) {
+                if store_clone.maybe_checkpoint(&config).await.unwrap_or(false) {
                     let checkpoint_lsn = store_clone.checkpoint_lsn();
-                    let _ = truncate_wal_segments(&dir_clone, checkpoint_lsn);
+                    let _ = truncate_wal_segments(&dir_clone, checkpoint_lsn).await;
                 }
             }
-            let _ = store_clone.checkpoint();
+            let _ = store_clone.checkpoint().await;
             let checkpoint_lsn = store_clone.checkpoint_lsn();
-            let _ = truncate_wal_segments(&dir_clone, checkpoint_lsn);
+            let _ = truncate_wal_segments(&dir_clone, checkpoint_lsn).await;
         });
 
-        thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         page_store.shutdown();
-        handle.join().unwrap();
+        handle.await.unwrap();
 
-        let segments = list_wal_segments(&dir).unwrap();
+        let segments = list_wal_segments(&dir).await.unwrap();
         assert!(segments.len() <= 2);
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 }

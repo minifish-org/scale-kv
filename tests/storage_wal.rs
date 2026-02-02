@@ -27,22 +27,22 @@ fn make_page(fill: u8) -> Vec<u8> {
     page
 }
 
-#[test]
-fn test_storage_crud_persists() {
+#[tokio::test]
+async fn test_storage_crud_persists() {
     let dir = temp_dir();
     let page1 = make_page(1);
     let page2 = make_page(2);
     {
-        let node = StorageNode::open(&dir).unwrap();
+        let node = StorageNode::open(&dir).await.unwrap();
         node.put(1, &page1);
         node.put(2, &page2);
-        assert_eq!(node.get(1).unwrap()[0], 1);
+        assert_eq!(node.get(1).await.unwrap()[0], 1);
         node.delete(1);
-        assert_eq!(node.get(1), None);
-        node.checkpoint().unwrap();
+        assert_eq!(node.get(1).await, None);
+        node.checkpoint().await.unwrap();
     }
-    let node = StorageNode::open(&dir).unwrap();
-    assert_eq!(node.get(2).unwrap()[0], 2);
+    let node = StorageNode::open(&dir).await.unwrap();
+    assert_eq!(node.get(2).await.unwrap()[0], 2);
     cleanup_dir(&dir);
 }
 

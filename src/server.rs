@@ -35,9 +35,7 @@ impl storage::Server for StorageService {
 
         let data = self.data.clone();
         Promise::from_future(async move {
-            let value = task::spawn_blocking(move || data.get(key))
-                .await
-                .map_err(map_join_error)?;
+            let value = data.get(key).await;
             if let Some(value) = value {
                 let mut res = results.get();
                 res.set_found(true);
@@ -84,14 +82,8 @@ impl storage::Server for StorageService {
         };
         let data = self.data.clone();
         Promise::from_future(async move {
-            let data_for_get = data.clone();
-            let existed = task::spawn_blocking(move || data_for_get.get(key).is_some())
-                .await
-                .map_err(map_join_error)?;
-            let data_for_delete = data.clone();
-            task::spawn_blocking(move || data_for_delete.delete(key))
-                .await
-                .map_err(map_join_error)?;
+            let existed = data.contains(key).await;
+            data.delete(key);
             results.get().set_found(existed);
             Ok(())
         })
@@ -181,9 +173,8 @@ impl storage::Server for StorageService {
 
         let data = self.data.clone();
         Promise::from_future(async move {
-            task::spawn_blocking(move || data.append_wal_batch(batch))
+            data.append_wal_batch(batch)
                 .await
-                .map_err(map_join_error)?
                 .map_err(|err| capnp::Error::failed(err.to_string()))?;
             Ok(())
         })
@@ -199,7 +190,7 @@ impl StorageServer {
     pub async fn start(addr: SocketAddr) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
-        let data = Arc::new(StorageNode::new());
+        let data = Arc::new(StorageNode::new().await);
 
         let data_clone = data.clone();
         tokio::task::spawn_local(async move {
@@ -222,7 +213,7 @@ impl StorageServer {
     pub async fn start_with_dir(addr: SocketAddr, dir: PathBuf) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
-        let data = Arc::new(StorageNode::open(dir)?);
+        let data = Arc::new(StorageNode::open(dir).await?);
 
         let data_clone = data.clone();
         tokio::task::spawn_local(async move {

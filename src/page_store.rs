@@ -1,12 +1,13 @@
 use crate::{Page, PageId, Result, PAGE_SIZE};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 const PAGE_FILE_NAME: &str = "pages.dat";
 const CHECKPOINT_STATE_FILE: &str = "checkpoint_state";
@@ -107,27 +108,29 @@ struct PageFile {
 }
 
 impl PageFile {
-    fn open(path: &Path) -> Result<Self> {
+    async fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(path)?;
-        let size = file.metadata()?.len();
+            .open(path)
+            .await?;
+        let size = file.metadata().await?.len();
         Ok(Self { file, size })
     }
 
-    fn read_page(&mut self, page_id: PageId) -> Result<Option<Page>> {
+    async fn read_page(&mut self, page_id: PageId) -> Result<Option<Page>> {
+        use std::io::SeekFrom;
         let offset = page_id * PAGE_SIZE as u64;
 
         if offset + PAGE_SIZE as u64 > self.size {
             return Ok(None);
         }
 
-        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.seek(SeekFrom::Start(offset)).await?;
         let mut buf = vec![0u8; PAGE_SIZE];
-        match self.file.read_exact(&mut buf) {
-            Ok(()) => {
+        match self.file.read_exact(&mut buf).await {
+            Ok(_) => {
                 if buf.iter().all(|&b| b == 0) {
                     return Ok(None);
                 }
@@ -138,7 +141,8 @@ impl PageFile {
         }
     }
 
-    fn write_page(&mut self, page_id: PageId, data: &[u8]) -> Result<()> {
+    async fn write_page(&mut self, page_id: PageId, data: &[u8]) -> Result<()> {
+        use std::io::SeekFrom;
         if data.len() != PAGE_SIZE {
             return Err(crate::Error::InvalidPageSize(data.len(), PAGE_SIZE));
         }
@@ -147,17 +151,17 @@ impl PageFile {
         let required_size = offset + PAGE_SIZE as u64;
 
         if required_size > self.size {
-            self.file.set_len(required_size)?;
+            self.file.set_len(required_size).await?;
             self.size = required_size;
         }
 
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(data)?;
+        self.file.seek(SeekFrom::Start(offset)).await?;
+        self.file.write_all(data).await?;
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<()> {
-        self.file.sync_all()?;
+    async fn sync(&mut self) -> Result<()> {
+        self.file.sync_all().await?;
         Ok(())
     }
 }
@@ -176,18 +180,18 @@ pub struct PageStore {
     page_file: Mutex<PageFile>,
     checkpoint_lsn: AtomicU64,
     max_page_id: AtomicU64,
-    last_checkpoint: Mutex<Instant>,
+    last_checkpoint: std::sync::Mutex<Instant>,
     shutdown: AtomicBool,
 }
 
 impl PageStore {
-    pub fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
+    pub async fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(&dir).await?;
 
-        let checkpoint_lsn = read_checkpoint_state(&dir).unwrap_or(0);
+        let checkpoint_lsn = read_checkpoint_state(&dir).await.unwrap_or(0);
         let page_file_path = dir.join(PAGE_FILE_NAME);
-        let page_file = PageFile::open(&page_file_path)?;
+        let page_file = PageFile::open(&page_file_path).await?;
 
         let max_page_id = if page_file.size > 0 {
             (page_file.size / PAGE_SIZE as u64).saturating_sub(1)
@@ -201,12 +205,12 @@ impl PageStore {
             page_file: Mutex::new(page_file),
             checkpoint_lsn: AtomicU64::new(checkpoint_lsn),
             max_page_id: AtomicU64::new(max_page_id),
-            last_checkpoint: Mutex::new(Instant::now()),
+            last_checkpoint: std::sync::Mutex::new(Instant::now()),
             shutdown: AtomicBool::new(false),
         })
     }
 
-    pub fn get(&self, page_id: PageId) -> Option<Page> {
+    pub async fn get(&self, page_id: PageId) -> Option<Page> {
         {
             let mut pool = self.buffer_pool.write().unwrap();
             if let Some(bp) = pool.get_mut(&page_id) {
@@ -215,8 +219,8 @@ impl PageStore {
             }
         }
 
-        let mut pf = self.page_file.lock().unwrap();
-        match pf.read_page(page_id) {
+        let mut pf = self.page_file.lock().await;
+        match pf.read_page(page_id).await {
             Ok(Some(data)) => Some(data),
             Ok(None) => None,
             Err(_) => None,
@@ -243,8 +247,8 @@ impl PageStore {
         pool.remove(&page_id);
     }
 
-    pub fn contains(&self, page_id: PageId) -> bool {
-        self.get(page_id).is_some()
+    pub async fn contains(&self, page_id: PageId) -> bool {
+        self.get(page_id).await.is_some()
     }
 
     pub fn buffer_stats(&self) -> BufferStats {
@@ -273,7 +277,7 @@ impl PageStore {
         self.max_page_id.load(Ordering::Relaxed)
     }
 
-    pub fn checkpoint(&self) -> Result<()> {
+    pub async fn checkpoint(&self) -> Result<()> {
         let dirty_pages: Vec<(PageId, Vec<u8>, u64)> = {
             let pool = self.buffer_pool.read().unwrap();
             let mut pages: Vec<_> = pool
@@ -291,14 +295,14 @@ impl PageStore {
 
         let mut max_lsn = 0u64;
         {
-            let mut pf = self.page_file.lock().unwrap();
+            let mut pf = self.page_file.lock().await;
             for (page_id, data, lsn) in &dirty_pages {
-                pf.write_page(*page_id, data)?;
+                pf.write_page(*page_id, data).await?;
                 if *lsn > max_lsn {
                     max_lsn = *lsn;
                 }
             }
-            pf.sync()?;
+            pf.sync().await?;
         }
 
         {
@@ -312,7 +316,7 @@ impl PageStore {
 
         if max_lsn > self.checkpoint_lsn.load(Ordering::Acquire) {
             self.checkpoint_lsn.store(max_lsn, Ordering::Release);
-            write_checkpoint_state(&self.dir, max_lsn)?;
+            write_checkpoint_state(&self.dir, max_lsn).await?;
         }
 
         *self.last_checkpoint.lock().unwrap() = Instant::now();
@@ -329,16 +333,16 @@ impl PageStore {
             || elapsed > config.interval
     }
 
-    pub fn maybe_checkpoint(&self, config: &CheckpointConfig) -> Result<bool> {
+    pub async fn maybe_checkpoint(&self, config: &CheckpointConfig) -> Result<bool> {
         if self.should_checkpoint(config) {
-            self.checkpoint()?;
+            self.checkpoint().await?;
             Ok(true)
         } else {
             Ok(false)
         }
     }
 
-    pub fn evict_cold_pages(&self, config: &BufferPoolConfig) -> Result<usize> {
+    pub async fn evict_cold_pages(&self, config: &BufferPoolConfig) -> Result<usize> {
         let current_count = self.buffer_pool.read().unwrap().len();
         if current_count <= config.max_pages {
             return Ok(0);
@@ -371,11 +375,11 @@ impl PageStore {
         }
 
         if !dirty_to_flush.is_empty() {
-            let mut pf = self.page_file.lock().unwrap();
+            let mut pf = self.page_file.lock().await;
             for (page_id, data) in &dirty_to_flush {
-                pf.write_page(*page_id, data)?;
+                pf.write_page(*page_id, data).await?;
             }
-            pf.sync()?;
+            pf.sync().await?;
         }
 
         {
@@ -390,10 +394,10 @@ impl PageStore {
         Ok(evicted)
     }
 
-    pub fn maybe_evict(&self, config: &BufferPoolConfig) -> Result<usize> {
+    pub async fn maybe_evict(&self, config: &BufferPoolConfig) -> Result<usize> {
         let current_count = self.buffer_pool.read().unwrap().len();
         if current_count > config.max_pages {
-            self.evict_cold_pages(config)
+            self.evict_cold_pages(config).await
         } else {
             Ok(0)
         }
@@ -414,15 +418,15 @@ impl PageStore {
         let store = Arc::clone(self);
         let poll_interval = config.interval.min(Duration::from_secs(1));
 
-        thread::spawn(move || {
+        tokio::spawn(async move {
             while !store.is_shutdown() {
-                thread::sleep(poll_interval);
+                tokio::time::sleep(poll_interval).await;
                 if store.is_shutdown() {
                     break;
                 }
-                let _ = store.maybe_checkpoint(&config);
+                let _ = store.maybe_checkpoint(&config).await;
             }
-            let _ = store.checkpoint();
+            let _ = store.checkpoint().await;
         })
     }
 
@@ -434,16 +438,16 @@ impl PageStore {
         let store = Arc::clone(self);
         let poll_interval = checkpoint_config.interval.min(Duration::from_secs(1));
 
-        thread::spawn(move || {
+        tokio::spawn(async move {
             while !store.is_shutdown() {
-                thread::sleep(poll_interval);
+                tokio::time::sleep(poll_interval).await;
                 if store.is_shutdown() {
                     break;
                 }
-                let _ = store.maybe_checkpoint(&checkpoint_config);
-                let _ = store.maybe_evict(&buffer_config);
+                let _ = store.maybe_checkpoint(&checkpoint_config).await;
+                let _ = store.maybe_evict(&buffer_config).await;
             }
-            let _ = store.checkpoint();
+            let _ = store.checkpoint().await;
         })
     }
 
@@ -464,20 +468,22 @@ impl PageStore {
     }
 }
 
-fn read_checkpoint_state(dir: &Path) -> Result<u64> {
+async fn read_checkpoint_state(dir: &Path) -> Result<u64> {
+    use tokio::io::AsyncReadExt;
     let path = dir.join(CHECKPOINT_STATE_FILE);
-    let mut file = match File::open(&path) {
+    let mut file = match File::open(&path).await {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e.into()),
     };
 
     let mut buf = [0u8; 8];
-    file.read_exact(&mut buf)?;
+    file.read_exact(&mut buf).await?;
     Ok(u64::from_le_bytes(buf))
 }
 
-fn write_checkpoint_state(dir: &Path, lsn: u64) -> Result<()> {
+async fn write_checkpoint_state(dir: &Path, lsn: u64) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
     let tmp_path = dir.join(CHECKPOINT_STATE_TMP);
     let path = dir.join(CHECKPOINT_STATE_FILE);
 
@@ -486,12 +492,13 @@ fn write_checkpoint_state(dir: &Path, lsn: u64) -> Result<()> {
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&tmp_path)?;
-        file.write_all(&lsn.to_le_bytes())?;
-        file.sync_all()?;
+            .open(&tmp_path)
+            .await?;
+        file.write_all(&lsn.to_le_bytes()).await?;
+        file.sync_all().await?;
     }
 
-    fs::rename(tmp_path, path)?;
+    fs::rename(tmp_path, path).await?;
     Ok(())
 }
 
@@ -502,7 +509,7 @@ mod tests {
 
     static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-    fn temp_dir() -> PathBuf {
+    async fn temp_dir() -> PathBuf {
         let mut dir = std::env::temp_dir();
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         dir.push(format!(
@@ -510,12 +517,12 @@ mod tests {
             std::process::id(),
             id
         ));
-        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        fs::create_dir_all(&dir).await.expect("failed to create temp dir");
         dir
     }
 
-    fn cleanup_dir(dir: &Path) {
-        let _ = fs::remove_dir_all(dir);
+    async fn cleanup_dir(dir: &Path) {
+        let _ = fs::remove_dir_all(dir).await;
     }
 
     fn make_page(fill: u8) -> Vec<u8> {
@@ -525,41 +532,41 @@ mod tests {
         page
     }
 
-    #[test]
-    fn test_open_empty() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_open_empty() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
         assert_eq!(store.len(), 0);
         assert!(store.is_empty());
         assert_eq!(store.checkpoint_lsn(), 0);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_put_and_get() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_put_and_get() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
 
         let page1 = make_page(1);
         store.put(1, &page1, 100).unwrap();
 
-        let retrieved = store.get(1).unwrap();
+        let retrieved = store.get(1).await.unwrap();
         assert_eq!(retrieved, page1);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_get_missing() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
-        assert!(store.get(999).is_none());
-        cleanup_dir(&dir);
+    #[tokio::test]
+    async fn test_get_missing() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
+        assert!(store.get(999).await.is_none());
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_overwrite() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_overwrite() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
 
         let page1 = make_page(1);
         let page2 = make_page(2);
@@ -567,45 +574,45 @@ mod tests {
         store.put(1, &page1, 100).unwrap();
         store.put(1, &page2, 101).unwrap();
 
-        let retrieved = store.get(1).unwrap();
+        let retrieved = store.get(1).await.unwrap();
         assert_eq!(retrieved, page2);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_checkpoint_persists() {
-        let dir = temp_dir();
+    #[tokio::test]
+    async fn test_checkpoint_persists() {
+        let dir = temp_dir().await;
 
         // 写入并 checkpoint
         {
-            let store = PageStore::open(&dir).unwrap();
+            let store = PageStore::open(&dir).await.unwrap();
             let page1 = make_page(1);
             let page2 = make_page(2);
             store.put(1, &page1, 100).unwrap();
             store.put(2, &page2, 101).unwrap();
-            store.checkpoint().unwrap();
+            store.checkpoint().await.unwrap();
 
             assert_eq!(store.checkpoint_lsn(), 101);
         }
 
         // 重新打开，验证数据持久化
         {
-            let store = PageStore::open(&dir).unwrap();
+            let store = PageStore::open(&dir).await.unwrap();
             assert_eq!(store.checkpoint_lsn(), 101);
 
-            let page1 = store.get(1).unwrap();
-            let page2 = store.get(2).unwrap();
+            let page1 = store.get(1).await.unwrap();
+            let page2 = store.get(2).await.unwrap();
             assert_eq!(page1[0], 1);
             assert_eq!(page2[0], 2);
         }
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_dirty_tracking() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_dirty_tracking() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
 
         let page = make_page(1);
         store.put(1, &page, 100).unwrap();
@@ -614,17 +621,17 @@ mod tests {
         assert_eq!(stats.dirty_count, 1);
         assert_eq!(stats.dirty_bytes, PAGE_SIZE);
 
-        store.checkpoint().unwrap();
+        store.checkpoint().await.unwrap();
 
         let stats = store.buffer_stats();
         assert_eq!(stats.dirty_count, 0);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_sparse_pages() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_sparse_pages() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
 
         // 写入非连续的 page_id
         let page1 = make_page(1);
@@ -632,22 +639,22 @@ mod tests {
 
         store.put(1, &page1, 100).unwrap();
         store.put(100, &page100, 101).unwrap();
-        store.checkpoint().unwrap();
+        store.checkpoint().await.unwrap();
 
         // 重新打开验证
         drop(store);
-        let store = PageStore::open(&dir).unwrap();
+        let store = PageStore::open(&dir).await.unwrap();
 
-        assert!(store.get(1).is_some());
-        assert!(store.get(50).is_none()); // 中间的 page 不存在
-        assert!(store.get(100).is_some());
-        cleanup_dir(&dir);
+        assert!(store.get(1).await.is_some());
+        assert!(store.get(50).await.is_none()); // 中间的 page 不存在
+        assert!(store.get(100).await.is_some());
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_max_page_id() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_max_page_id() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
 
         let page = make_page(1);
         store.put(5, &page, 100).unwrap();
@@ -655,47 +662,47 @@ mod tests {
         store.put(3, &page, 102).unwrap();
 
         assert_eq!(store.max_page_id(), 10);
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_invalid_page_size() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_invalid_page_size() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
 
         let bad_page = vec![0u8; 100]; // 错误的大小
         let result = store.put(1, &bad_page, 100);
         assert!(result.is_err());
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_multiple_checkpoints() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_multiple_checkpoints() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
 
         // 第一轮写入
         let page1 = make_page(1);
         store.put(1, &page1, 100).unwrap();
-        store.checkpoint().unwrap();
+        store.checkpoint().await.unwrap();
         assert_eq!(store.checkpoint_lsn(), 100);
 
         // 第二轮写入
         let page2 = make_page(2);
         store.put(2, &page2, 200).unwrap();
-        store.checkpoint().unwrap();
+        store.checkpoint().await.unwrap();
         assert_eq!(store.checkpoint_lsn(), 200);
 
         // 验证两个 page 都存在
-        assert!(store.get(1).is_some());
-        assert!(store.get(2).is_some());
-        cleanup_dir(&dir);
+        assert!(store.get(1).await.is_some());
+        assert!(store.get(2).await.is_some());
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_should_checkpoint_by_dirty_count() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_should_checkpoint_by_dirty_count() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
         let config = CheckpointConfig {
             interval: Duration::from_secs(3600),
             max_dirty_pages: 5,
@@ -714,13 +721,13 @@ mod tests {
         }
         assert!(store.should_checkpoint(&config));
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_should_checkpoint_by_dirty_bytes() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_should_checkpoint_by_dirty_bytes() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
         let config = CheckpointConfig {
             interval: Duration::from_secs(3600),
             max_dirty_pages: 1000,
@@ -739,13 +746,13 @@ mod tests {
         store.put(3, &page, 3).unwrap();
         assert!(store.should_checkpoint(&config));
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_should_checkpoint_by_interval() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_should_checkpoint_by_interval() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
         let config = CheckpointConfig {
             interval: Duration::from_millis(50),
             max_dirty_pages: 1000,
@@ -756,16 +763,16 @@ mod tests {
         store.put(1, &page, 1).unwrap();
         assert!(!store.should_checkpoint(&config));
 
-        thread::sleep(Duration::from_millis(60));
+        tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(store.should_checkpoint(&config));
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_maybe_checkpoint() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_maybe_checkpoint() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
         let config = CheckpointConfig {
             interval: Duration::from_secs(3600),
             max_dirty_pages: 2,
@@ -774,24 +781,24 @@ mod tests {
 
         let page = make_page(1);
         store.put(1, &page, 100).unwrap();
-        assert_eq!(store.maybe_checkpoint(&config).unwrap(), false);
+        assert_eq!(store.maybe_checkpoint(&config).await.unwrap(), false);
         assert_eq!(store.buffer_stats().dirty_count, 1);
 
         let page = make_page(2);
         store.put(2, &page, 101).unwrap();
         let page = make_page(3);
         store.put(3, &page, 102).unwrap();
-        assert_eq!(store.maybe_checkpoint(&config).unwrap(), true);
+        assert_eq!(store.maybe_checkpoint(&config).await.unwrap(), true);
         assert_eq!(store.buffer_stats().dirty_count, 0);
         assert_eq!(store.checkpoint_lsn(), 102);
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_background_checkpoint() {
-        let dir = temp_dir();
-        let store = Arc::new(PageStore::open(&dir).unwrap());
+    #[tokio::test]
+    async fn test_background_checkpoint() {
+        let dir = temp_dir().await;
+        let store = Arc::new(PageStore::open(&dir).await.unwrap());
         let config = CheckpointConfig::for_test();
 
         let handle = store.start_background_checkpoint(config);
@@ -801,21 +808,21 @@ mod tests {
             store.put(i, &page, i + 1).unwrap();
         }
 
-        thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert_eq!(store.buffer_stats().dirty_count, 0);
         assert!(store.checkpoint_lsn() >= 15);
 
         store.shutdown();
-        handle.join().unwrap();
+        handle.await.unwrap();
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_shutdown_flushes_dirty_pages() {
-        let dir = temp_dir();
-        let store = Arc::new(PageStore::open(&dir).unwrap());
+    #[tokio::test]
+    async fn test_shutdown_flushes_dirty_pages() {
+        let dir = temp_dir().await;
+        let store = Arc::new(PageStore::open(&dir).await.unwrap());
         let config = CheckpointConfig {
             interval: Duration::from_secs(3600),
             max_dirty_pages: 1000,
@@ -829,18 +836,18 @@ mod tests {
         assert_eq!(store.buffer_stats().dirty_count, 1);
 
         store.shutdown();
-        handle.join().unwrap();
+        handle.await.unwrap();
 
         assert_eq!(store.buffer_stats().dirty_count, 0);
         assert_eq!(store.checkpoint_lsn(), 100);
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_evict_cold_pages_removes_oldest() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_evict_cold_pages_removes_oldest() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
         let config = BufferPoolConfig {
             max_pages: 5,
             eviction_batch_size: 2,
@@ -849,29 +856,29 @@ mod tests {
         for i in 0..10u64 {
             let page = make_page(i as u8);
             store.put(i, &page, i + 1).unwrap();
-            thread::sleep(Duration::from_millis(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
         assert_eq!(store.len(), 10);
 
-        let evicted = store.evict_cold_pages(&config).unwrap();
+        let evicted = store.evict_cold_pages(&config).await.unwrap();
         assert_eq!(evicted, 7);
         assert_eq!(store.len(), 3);
 
-        store.checkpoint().unwrap();
+        store.checkpoint().await.unwrap();
 
         let pool_keys: std::collections::HashSet<_> = store.keys().into_iter().collect();
         assert!(pool_keys.contains(&7));
         assert!(pool_keys.contains(&8));
         assert!(pool_keys.contains(&9));
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_evict_flushes_dirty_before_remove() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_evict_flushes_dirty_before_remove() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
         let config = BufferPoolConfig {
             max_pages: 3,
             eviction_batch_size: 1,
@@ -880,28 +887,28 @@ mod tests {
         for i in 0..5u64 {
             let page = make_page((i + 1) as u8);
             store.put(i, &page, i + 1).unwrap();
-            thread::sleep(Duration::from_millis(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
         assert_eq!(store.buffer_stats().dirty_count, 5);
 
-        let evicted = store.evict_cold_pages(&config).unwrap();
+        let evicted = store.evict_cold_pages(&config).await.unwrap();
         assert!(evicted > 0);
 
         drop(store);
-        let store2 = PageStore::open(&dir).unwrap();
+        let store2 = PageStore::open(&dir).await.unwrap();
 
-        let page0 = store2.get(0);
+        let page0 = store2.get(0).await;
         assert!(page0.is_some(), "Evicted dirty page should be on disk");
         assert_eq!(page0.unwrap()[0], 1);
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_maybe_evict() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_maybe_evict() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
         let config = BufferPoolConfig {
             max_pages: 5,
             eviction_batch_size: 2,
@@ -912,7 +919,7 @@ mod tests {
             store.put(i, &page, i + 1).unwrap();
         }
 
-        let evicted = store.maybe_evict(&config).unwrap();
+        let evicted = store.maybe_evict(&config).await.unwrap();
         assert_eq!(evicted, 0);
         assert_eq!(store.len(), 4);
 
@@ -922,17 +929,17 @@ mod tests {
         }
         assert_eq!(store.len(), 8);
 
-        let evicted = store.maybe_evict(&config).unwrap();
+        let evicted = store.maybe_evict(&config).await.unwrap();
         assert!(evicted > 0);
         assert!(store.len() <= config.max_pages + config.eviction_batch_size);
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_background_checkpoint_with_eviction() {
-        let dir = temp_dir();
-        let store = Arc::new(PageStore::open(&dir).unwrap());
+    #[tokio::test]
+    async fn test_background_checkpoint_with_eviction() {
+        let dir = temp_dir().await;
+        let store = Arc::new(PageStore::open(&dir).await.unwrap());
         let checkpoint_config = CheckpointConfig::for_test();
         let buffer_config = BufferPoolConfig {
             max_pages: 10,
@@ -947,7 +954,7 @@ mod tests {
             store.put(i, &page, i + 1).unwrap();
         }
 
-        thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(
             store.len() <= buffer_config.max_pages + buffer_config.eviction_batch_size,
@@ -958,15 +965,15 @@ mod tests {
         assert_eq!(store.buffer_stats().dirty_count, 0);
 
         store.shutdown();
-        handle.join().unwrap();
+        handle.await.unwrap();
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 
-    #[test]
-    fn test_evict_no_op_when_under_limit() {
-        let dir = temp_dir();
-        let store = PageStore::open(&dir).unwrap();
+    #[tokio::test]
+    async fn test_evict_no_op_when_under_limit() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
         let config = BufferPoolConfig {
             max_pages: 100,
             eviction_batch_size: 10,
@@ -977,10 +984,10 @@ mod tests {
             store.put(i, &page, i + 1).unwrap();
         }
 
-        let evicted = store.evict_cold_pages(&config).unwrap();
+        let evicted = store.evict_cold_pages(&config).await.unwrap();
         assert_eq!(evicted, 0);
         assert_eq!(store.len(), 5);
 
-        cleanup_dir(&dir);
+        cleanup_dir(&dir).await;
     }
 }
