@@ -957,10 +957,10 @@ mod tests {
 
     #[test]
     fn test_shared_page_provider() {
-        use super::SharedPageProvider;
+        use super::{PageCache, SharedPageProvider};
         use std::sync::Arc;
 
-        let pages = Arc::new(RwLock::new(HashMap::new()));
+        let pages = Arc::new(PageCache::new(4));
         let next_page_id = Arc::new(AtomicU64::new(1));
 
         let provider = SharedPageProvider::new(pages.clone(), next_page_id.clone());
@@ -975,6 +975,6 @@ mod tests {
         tree.insert(key.clone(), slot).unwrap();
         assert_eq!(tree.get(&key), Some(slot));
 
-        assert!(pages.read().unwrap().len() >= 1);
+        assert!(pages.len() >= 1);
     }
 }
