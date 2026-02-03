@@ -1,5 +1,5 @@
 use crate::page_store::PageStore;
-use crate::{Page, PageId, Result, Value, PAGE_SIZE};
+use crate::{Page, PageId, Result, Value, KEY_SIZE, PAGE_SIZE, VALUE_SIZE};
 use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -533,8 +533,14 @@ fn insert_record_at_slot(page: &mut [u8], slot_id: u16, key: &[u8], value: &[u8]
     if page.len() != PAGE_SIZE {
         return Err(crate::Error::InvalidPageSize(page.len(), PAGE_SIZE));
     }
+    if key.len() != KEY_SIZE {
+        return Err(crate::Error::InvalidKeySize(key.len(), KEY_SIZE));
+    }
+    if value.len() != VALUE_SIZE {
+        return Err(crate::Error::InvalidValueSize(value.len(), VALUE_SIZE));
+    }
     let (mut slots, mut free_start, mut free_end) = read_header(page);
-    let payload_len = 4 + key.len() + value.len();
+    let payload_len = KEY_SIZE + VALUE_SIZE;
 
     let free_slot = if slot_id < slots {
         Some(slot_id)
@@ -558,12 +564,10 @@ fn insert_record_at_slot(page: &mut [u8], slot_id: u16, key: &[u8], value: &[u8]
     }
 
     let payload_offset = (free_end as usize).saturating_sub(payload_len) as u16;
-    write_u16(page, payload_offset as usize, key.len() as u16);
-    write_u16(page, payload_offset as usize + 2, value.len() as u16);
-    let mut cursor = payload_offset as usize + 4;
-    page[cursor..cursor + key.len()].copy_from_slice(key);
-    cursor += key.len();
-    page[cursor..cursor + value.len()].copy_from_slice(value);
+    let mut cursor = payload_offset as usize;
+    page[cursor..cursor + KEY_SIZE].copy_from_slice(key);
+    cursor += KEY_SIZE;
+    page[cursor..cursor + VALUE_SIZE].copy_from_slice(value);
 
     write_slot(page, slot_id, payload_offset, payload_len as u16);
     free_end = payload_offset;
@@ -585,13 +589,10 @@ fn insert_record_at_slot_checked(
         let (offset, len) = read_slot(page, slot_id);
         if len != 0 {
             let offset = offset as usize;
-            if offset + 4 <= PAGE_SIZE {
-                let key_len = read_u16(page, offset) as usize;
-                let value_len = read_u16(page, offset + 2) as usize;
-                let key_start = offset + 4;
-                let key_end = key_start + key_len;
-                let value_end = key_end + value_len;
-                if value_end <= PAGE_SIZE {
+            if offset + KEY_SIZE <= PAGE_SIZE {
+                let key_start = offset;
+                let key_end = key_start + KEY_SIZE;
+                if key_end <= PAGE_SIZE {
                     let old_key = &page[key_start..key_end];
                     if old_key != key {
                         return Err(crate::Error::Capnp(
@@ -860,6 +861,15 @@ mod tests {
         let _ = fs::remove_dir_all(dir).await;
     }
 
+    fn fixed_key_bytes(raw: &[u8]) -> Vec<u8> {
+        let mut out = raw.to_vec();
+        while out.len() < KEY_SIZE {
+            out.push(b'_');
+        }
+        out.truncate(KEY_SIZE);
+        out
+    }
+
     fn make_page(fill: u8) -> Vec<u8> {
         let mut page = vec![0u8; PAGE_SIZE];
         page[0] = fill;
@@ -1065,16 +1075,16 @@ mod tests {
                 op: 1,
                 page_id: 10,
                 slot_id: 0,
-                key: b"k1".to_vec(),
-                value: b"v1".to_vec(),
+                key: fixed_key_bytes(b"k1"),
+                value: vec![b'v'; VALUE_SIZE],
             },
             WalRecord {
                 lsn: 2,
                 op: 1,
                 page_id: 10,
                 slot_id: 1,
-                key: b"k2".to_vec(),
-                value: b"v2".to_vec(),
+                key: fixed_key_bytes(b"k2"),
+                value: vec![b'w'; VALUE_SIZE],
             },
         ];
         replay_page_records(&replay, 10, records).await.unwrap();
@@ -1086,14 +1096,12 @@ mod tests {
             if len == 0 {
                 return Vec::new();
             }
-            let key_len = read_u16(page, pos) as usize;
-            let value_len = read_u16(page, pos + 2) as usize;
-            let value_start = pos + 4 + key_len;
-            let value_end = value_start + value_len;
+            let value_start = pos + KEY_SIZE;
+            let value_end = value_start + VALUE_SIZE;
             page[value_start..value_end].to_vec()
         };
-        assert_eq!(read_slot(&page, 0), b"v1");
-        assert_eq!(read_slot(&page, 1), b"v2");
+        assert_eq!(read_slot(&page, 0), vec![b'v'; VALUE_SIZE]);
+        assert_eq!(read_slot(&page, 1), vec![b'w'; VALUE_SIZE]);
         cleanup_dir(&dir).await;
     }
 
@@ -1101,8 +1109,8 @@ mod tests {
     fn test_wal_slot_key_mismatch_is_rejected() {
         let mut page = vec![0u8; PAGE_SIZE];
         write_header(&mut page, 0, PAGE_HEADER_SIZE as u16, PAGE_SIZE as u16);
-        insert_record_at_slot_checked(&mut page, 0, b"k1", b"v1").unwrap();
-        let err = insert_record_at_slot_checked(&mut page, 0, b"k2", b"v2").unwrap_err();
+        insert_record_at_slot_checked(&mut page, 0, &fixed_key_bytes(b"k1"), &vec![b'v'; VALUE_SIZE]).unwrap();
+        let err = insert_record_at_slot_checked(&mut page, 0, &fixed_key_bytes(b"k2"), &vec![b'w'; VALUE_SIZE]).unwrap_err();
         assert!(format!("{err}").contains("wal replay slot key mismatch"));
     }
 

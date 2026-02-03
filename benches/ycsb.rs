@@ -16,7 +16,8 @@ use tokio::task::LocalSet;
 
 const NUM_RECORDS: usize = 10_000;
 const OPERATIONS: usize = 1_000;
-const VALUE_SIZE: usize = 1024;
+const VALUE_SIZE: usize = scale_kv::VALUE_SIZE;
+const KEY_SIZE: usize = scale_kv::KEY_SIZE;
 const BATCH_SIZE: usize = 16_384;
 const SCAN_LENGTH: usize = 10;
 
@@ -40,7 +41,12 @@ impl ZipfianGenerator {
 }
 
 fn key_for(id: u64) -> String {
-    format!("user{:06}", id)
+    key_for_prefix("user", id)
+}
+
+fn key_for_prefix(prefix: &str, id: u64) -> String {
+    let width = KEY_SIZE.saturating_sub(prefix.len());
+    format!("{prefix}{id:0width$}", width = width)
 }
 
 fn latest_key_from_rank(rank: u64) -> String {
@@ -98,7 +104,7 @@ fn setup_bptree() -> PageBPlusTree<InMemoryPageProvider> {
 fn setup_bptree_u64() -> PageBPlusTree<InMemoryPageProvider> {
     let mut tree = PageBPlusTree::new();
     for i in 0..NUM_RECORDS {
-        let key = (i as u64).to_le_bytes().to_vec();
+        let key = u64_key_bytes(i as u64).to_vec();
         let slot_ref = BptreeSlotRef {
             page_id: i as u64,
             slot_id: 0,
@@ -145,19 +151,25 @@ fn pregen_range_keys_str_from_ranks(ranks: &[u64]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn pregen_range_keys_u64_from_ranks(ranks: &[u64]) -> Vec<([u8; 8], [u8; 8])> {
+fn u64_key_bytes(value: u64) -> [u8; KEY_SIZE] {
+    let mut buf = [0u8; KEY_SIZE];
+    buf[..8].copy_from_slice(&value.to_le_bytes());
+    buf
+}
+
+fn pregen_range_keys_u64_from_ranks(ranks: &[u64]) -> Vec<([u8; KEY_SIZE], [u8; KEY_SIZE])> {
     ranks
         .iter()
         .map(|&rank| {
             let start = rank;
             let end = rank.saturating_add(SCAN_LENGTH as u64);
-            (start.to_le_bytes(), end.to_le_bytes())
+            (u64_key_bytes(start), u64_key_bytes(end))
         })
         .collect()
 }
 
-fn pregen_u64_keys_bytes_from_ranks(ranks: &[u64]) -> Vec<[u8; 8]> {
-    ranks.iter().map(|&rank| rank.to_le_bytes()).collect()
+fn pregen_u64_keys_bytes_from_ranks(ranks: &[u64]) -> Vec<[u8; KEY_SIZE]> {
+    ranks.iter().map(|&rank| u64_key_bytes(rank)).collect()
 }
 
 fn pregen_all_keys_str() -> Vec<String> {
@@ -481,7 +493,7 @@ fn bench_throughput_put(c: &mut Criterion) {
             local.block_on(&rt, async move {
                 let value = vec![0u8; VALUE_SIZE];
                 for i in 0..OPERATIONS {
-                    let key = format!("key{:08}", i);
+                    let key = key_for_prefix("key", i as u64);
                     compute.put(&key, &value).await.unwrap();
                 }
             })
@@ -537,7 +549,7 @@ fn bench_batch_put(c: &mut Criterion) {
             local.block_on(&rt, async move {
                 let mut items = Vec::with_capacity(BATCH_SIZE);
                 for i in 0..BATCH_SIZE {
-                    let key = format!("batch{:08}", i);
+                    let key = key_for_prefix("batch", i as u64);
                     let value = vec![0u8; VALUE_SIZE];
                     items.push((key, value));
                 }
@@ -873,7 +885,7 @@ fn bench_sled_throughput_put(c: &mut Criterion) {
         b.iter(|| {
             let value = vec![0u8; VALUE_SIZE];
             for i in 0..OPERATIONS {
-                let key = format!("key{:08}", i);
+                let key = key_for_prefix("key", i as u64);
                 let _ = db.insert(key.as_bytes(), value.as_slice());
             }
         })
@@ -920,7 +932,7 @@ fn bench_sled_batch_put(c: &mut Criterion) {
         b.iter(|| {
             let mut batch = sled::Batch::default();
             for i in 0..BATCH_SIZE {
-                let key = format!("batch{:08}", i);
+                let key = key_for_prefix("batch", i as u64);
                 let value = vec![0u8; VALUE_SIZE];
                 batch.insert(key.as_bytes(), value);
             }

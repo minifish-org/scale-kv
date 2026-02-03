@@ -1,4 +1,4 @@
-use crate::{Error, Page, PageId, Result, PAGE_SIZE};
+use crate::{Error, Page, PageId, Result, KEY_SIZE, PAGE_SIZE};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,6 +8,9 @@ const PAGE_TYPE_INTERNAL: u8 = 1;
 const PAGE_TYPE_LEAF: u8 = 2;
 
 const HEADER_SIZE: usize = 1 + 1 + 2 + 8 + 8; // type, level, key_count, next_leaf, left_child
+const OFFSET_ENTRY_SIZE: usize = 2;
+const SLOT_REF_SIZE: usize = 10;
+const CHILD_ID_SIZE: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotRef {
@@ -86,16 +89,59 @@ impl PageProvider for InMemoryPageProvider {
     }
 }
 
+pub const DEFAULT_PAGE_CACHE_SHARDS: usize = 64;
+
+pub struct PageCache {
+    shards: Vec<RwLock<HashMap<PageId, Page>>>,
+}
+
+impl PageCache {
+    pub fn new(shards: usize) -> Self {
+        let count = shards.max(1);
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(RwLock::new(HashMap::new()));
+        }
+        Self { shards: out }
+    }
+
+    fn shard(&self, page_id: PageId) -> usize {
+        (page_id as usize) % self.shards.len()
+    }
+
+    pub fn get(&self, page_id: PageId) -> Option<Page> {
+        let idx = self.shard(page_id);
+        self.shards[idx].read().unwrap().get(&page_id).cloned()
+    }
+
+    pub fn insert(&self, page_id: PageId, page: Page) {
+        let idx = self.shard(page_id);
+        self.shards[idx].write().unwrap().insert(page_id, page);
+    }
+
+    pub fn contains(&self, page_id: PageId) -> bool {
+        let idx = self.shard(page_id);
+        self.shards[idx].read().unwrap().contains_key(&page_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.read().unwrap().len())
+            .sum()
+    }
+}
+
 /// Shared page provider that wraps Arc<RwLock<HashMap>>.
 /// Used by ComputeNode to share page_cache between B+Tree and data pages.
 pub struct SharedPageProvider {
-    pages: Arc<RwLock<HashMap<PageId, Page>>>,
+    pages: Arc<PageCache>,
     next_page_id: Arc<AtomicU64>,
     root: AtomicU64,
 }
 
 impl SharedPageProvider {
-    pub fn new(pages: Arc<RwLock<HashMap<PageId, Page>>>, next_page_id: Arc<AtomicU64>) -> Self {
+    pub fn new(pages: Arc<PageCache>, next_page_id: Arc<AtomicU64>) -> Self {
         Self {
             pages,
             next_page_id,
@@ -104,17 +150,17 @@ impl SharedPageProvider {
     }
 
     pub fn page_count(&self) -> usize {
-        self.pages.read().unwrap().len()
+        self.pages.len()
     }
 }
 
 impl PageProvider for SharedPageProvider {
     fn read_page(&self, page_id: PageId) -> Option<Page> {
-        self.pages.read().unwrap().get(&page_id).cloned()
+        self.pages.get(page_id)
     }
 
     fn write_page(&self, page_id: PageId, page: Page) {
-        self.pages.write().unwrap().insert(page_id, page);
+        self.pages.insert(page_id, page);
     }
 
     fn alloc_page_id(&self) -> PageId {
@@ -197,24 +243,39 @@ impl<P: PageProvider> PageBPlusTree<P> {
     }
 
     pub fn insert(&mut self, key: Vec<u8>, slot_ref: SlotRef) -> Result<()> {
+        if key.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
+        }
         let (leaf_id, stack) = self.find_leaf(&key);
         let mut leaf = self.provider.read_page(leaf_id).unwrap();
-        let mut entries = decode_entries(&leaf);
-        match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key.as_slice())) {
-            Ok(pos) => entries[pos].1 = encode_slot_ref(slot_ref),
-            Err(pos) => {
-                entries.insert(pos, (key, encode_slot_ref(slot_ref)));
-                self.len += 1;
-            }
-        }
+        let header = leaf_page_header(&leaf);
+        let (found, pos) = match find_key_pos(&leaf, &key) {
+            Some(result) => result,
+            None => (false, 0),
+        };
+        let encoded = encode_slot_ref(slot_ref);
 
-        if fits_in_page(&entries) {
-            let header = leaf_page_header(&leaf);
-            encode_entries(&mut leaf, &entries, header)?;
+        if found {
+            let offset = entry_offset_at(&leaf, pos).ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
+            let value_offset = offset + KEY_SIZE;
+            leaf[value_offset..value_offset + SLOT_REF_SIZE].copy_from_slice(&encoded);
             self.provider.write_page(leaf_id, leaf);
             return Ok(());
         }
 
+        let total = header.key_count as usize + 1;
+        let size = HEADER_SIZE
+            + total * OFFSET_ENTRY_SIZE
+            + total * entry_size(PAGE_TYPE_LEAF);
+        if size <= PAGE_SIZE {
+            let rebuilt = rebuild_page_with_insert(&leaf, header, pos, &key, &encoded)?;
+            self.provider.write_page(leaf_id, rebuilt);
+            self.len += 1;
+            return Ok(());
+        }
+
+        let mut entries = collect_entries(&leaf);
+        entries.insert(pos, (key, encoded));
         let (separator, right_page) = split_leaf(&leaf, &entries)?;
         let right_id = self.provider.alloc_page_id();
         let mut left_page = right_page.0;
@@ -224,19 +285,22 @@ impl<P: PageProvider> PageBPlusTree<P> {
         write_header(&mut left_page, left_header);
         self.provider.write_page(leaf_id, left_page);
         self.provider.write_page(right_id, right_page_buf);
+        self.len += 1;
         self.insert_into_parent(leaf_id, right_id, separator, stack)
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Result<()> {
         let (leaf_id, _) = self.find_leaf(key);
         let mut leaf = self.provider.read_page(leaf_id).unwrap();
-        let mut entries = decode_entries(&leaf);
-        if let Ok(pos) = entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-            entries.remove(pos);
-            self.len = self.len.saturating_sub(1);
+        let (found, pos) = match find_key_pos(&leaf, key) {
+            Some(result) => result,
+            None => (false, 0),
+        };
+        if found {
             let header = leaf_page_header(&leaf);
-            encode_entries(&mut leaf, &entries, header)?;
-            self.provider.write_page(leaf_id, leaf);
+            let rebuilt = rebuild_page_with_remove(&leaf, header, pos)?;
+            self.len = self.len.saturating_sub(1);
+            self.provider.write_page(leaf_id, rebuilt);
         }
         Ok(())
     }
@@ -264,23 +328,28 @@ impl<P: PageProvider> PageBPlusTree<P> {
                 None => break,
             };
             let header = leaf_page_header(&page);
-            let mut stop = false;
-            for_each_entry(&page, |k, v| {
-                if k < start {
-                    return true;
+            let mut idx = if page_id == leaf_id {
+                lower_bound_in_leaf(&page, start)
+            } else {
+                0
+            };
+            let key_count = header.key_count as usize;
+            while idx < key_count {
+                let key = match entry_key_at(&page, idx) {
+                    Some(key) => key,
+                    None => break,
+                };
+                if key > end {
+                    return;
                 }
-                if k > end {
-                    stop = true;
-                    return false;
+                let value = match entry_value_at(&page, idx) {
+                    Some(value) => value,
+                    None => break,
+                };
+                if !f(key, decode_slot_ref(value)) {
+                    return;
                 }
-                if !f(k, decode_slot_ref(v)) {
-                    stop = true;
-                    return false;
-                }
-                true
-            });
-            if stop {
-                return;
+                idx += 1;
             }
             current = header.next_leaf;
         }
@@ -296,14 +365,23 @@ impl<P: PageProvider> PageBPlusTree<P> {
                 return (current, stack);
             }
             stack.push(current);
-            let mut child = header.left_child;
-            for_each_entry(&page, |k, v| {
-                if key < k {
-                    return false;
+            let mut lo = 0usize;
+            let mut hi = header.key_count as usize;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let mid_key = entry_key_at(&page, mid).unwrap();
+                if key < mid_key {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
                 }
-                child = decode_child_id(v);
-                true
-            });
+            }
+            let child = if lo == 0 {
+                header.left_child
+            } else {
+                let value = entry_value_at(&page, lo - 1).unwrap();
+                decode_child_id(value)
+            };
             current = child;
         }
     }
@@ -329,27 +407,35 @@ impl<P: PageProvider> PageBPlusTree<P> {
 
         let parent_id = stack.pop().unwrap();
         let mut parent = self.provider.read_page(parent_id).unwrap();
-        let mut entries = decode_entries(&parent);
-        let pos = entries
-            .iter()
-            .position(|(_, v)| decode_child_id(v) == left_id)
-            .map(|p| p + 1)
-            .unwrap_or_else(|| {
-                if page_header(&parent).left_child == left_id {
-                    0
-                } else {
-                    entries.len()
+        let header = page_header(&parent);
+        let mut pos = if header.left_child == left_id { 0 } else { usize::MAX };
+        if pos == usize::MAX {
+            let key_count = header.key_count as usize;
+            for idx in 0..key_count {
+                let value = entry_value_at(&parent, idx).unwrap();
+                if decode_child_id(value) == left_id {
+                    pos = idx + 1;
+                    break;
                 }
-            });
-        entries.insert(pos, (separator, encode_child_id(right_id)));
+            }
+            if pos == usize::MAX {
+                pos = key_count;
+            }
+        }
 
-        if fits_in_page(&entries) {
-            let header = page_header(&parent);
-            encode_entries(&mut parent, &entries, header)?;
-            self.provider.write_page(parent_id, parent);
+        let total = header.key_count as usize + 1;
+        let size = HEADER_SIZE
+            + total * OFFSET_ENTRY_SIZE
+            + total * entry_size(PAGE_TYPE_INTERNAL);
+        if size <= PAGE_SIZE {
+            let encoded = encode_child_id(right_id);
+            let rebuilt = rebuild_page_with_insert(&parent, header, pos, &separator, &encoded)?;
+            self.provider.write_page(parent_id, rebuilt);
             return Ok(());
         }
 
+        let mut entries = collect_entries(&parent);
+        entries.insert(pos, (separator, encode_child_id(right_id)));
         let (sep, right_page) = split_internal(&parent, &entries)?;
         let new_right_id = self.provider.alloc_page_id();
         self.provider.write_page(parent_id, right_page.0);
@@ -412,18 +498,49 @@ fn new_page(page_type: u8, level: u8) -> Page {
     page
 }
 
+fn entry_value_size(page_type: u8) -> usize {
+    match page_type {
+        PAGE_TYPE_LEAF => SLOT_REF_SIZE,
+        PAGE_TYPE_INTERNAL => CHILD_ID_SIZE,
+        _ => 0,
+    }
+}
+
+fn entry_size(page_type: u8) -> usize {
+    KEY_SIZE + entry_value_size(page_type)
+}
+
+fn data_start(key_count: u16) -> usize {
+    HEADER_SIZE + key_count as usize * OFFSET_ENTRY_SIZE
+}
+
+fn read_u16(page: &[u8], offset: usize) -> u16 {
+    let mut buf = [0u8; 2];
+    buf.copy_from_slice(&page[offset..offset + 2]);
+    u16::from_le_bytes(buf)
+}
+
+fn write_u16(page: &mut [u8], offset: usize, value: u16) {
+    let bytes = value.to_le_bytes();
+    page[offset..offset + 2].copy_from_slice(&bytes);
+}
+
 fn decode_entries(page: &Page) -> Vec<(Vec<u8>, Vec<u8>)> {
     let header = page_header(page);
     let mut entries = Vec::with_capacity(header.key_count as usize);
-    let mut cursor = HEADER_SIZE;
-    for _ in 0..header.key_count {
-        let key_len = u16::from_le_bytes([page[cursor], page[cursor + 1]]) as usize;
-        let val_len = u16::from_le_bytes([page[cursor + 2], page[cursor + 3]]) as usize;
-        cursor += 4;
-        let key = page[cursor..cursor + key_len].to_vec();
-        cursor += key_len;
-        let val = page[cursor..cursor + val_len].to_vec();
-        cursor += val_len;
+    let value_size = entry_value_size(header.page_type);
+    let start = data_start(header.key_count);
+    for index in 0..header.key_count as usize {
+        let offset_pos = HEADER_SIZE + index * OFFSET_ENTRY_SIZE;
+        let rel = read_u16(page, offset_pos) as usize;
+        let entry_offset = start + rel;
+        let key_end = entry_offset + KEY_SIZE;
+        let value_end = key_end + value_size;
+        if value_end > PAGE_SIZE {
+            break;
+        }
+        let key = page[entry_offset..key_end].to_vec();
+        let val = page[key_end..value_end].to_vec();
         entries.push((key, val));
     }
     entries
@@ -434,31 +551,216 @@ fn for_each_entry<'a>(
     mut f: impl FnMut(&'a [u8], &'a [u8]) -> bool,
 ) {
     let header = page_header(page);
-    let mut cursor = HEADER_SIZE;
-    for _ in 0..header.key_count {
-        let key_len = u16::from_le_bytes([page[cursor], page[cursor + 1]]) as usize;
-        let val_len = u16::from_le_bytes([page[cursor + 2], page[cursor + 3]]) as usize;
-        cursor += 4;
-        let key = &page[cursor..cursor + key_len];
-        cursor += key_len;
-        let val = &page[cursor..cursor + val_len];
-        cursor += val_len;
+    let value_size = entry_value_size(header.page_type);
+    let start = data_start(header.key_count);
+    for index in 0..header.key_count as usize {
+        let offset_pos = HEADER_SIZE + index * OFFSET_ENTRY_SIZE;
+        let rel = read_u16(page, offset_pos) as usize;
+        let entry_offset = start + rel;
+        let key_end = entry_offset + KEY_SIZE;
+        let value_end = key_end + value_size;
+        if value_end > PAGE_SIZE {
+            break;
+        }
+        let key = &page[entry_offset..key_end];
+        let val = &page[key_end..value_end];
         if !f(key, val) {
             break;
         }
     }
 }
 
-fn find_in_leaf(page: &Page, key: &[u8]) -> Option<SlotRef> {
-    let mut found = None;
-    for_each_entry(page, |k, v| {
-        if k == key {
-            found = Some(decode_slot_ref(v));
-            return false;
+fn entry_key_at<'a>(page: &'a Page, index: usize) -> Option<&'a [u8]> {
+    let header = page_header(page);
+    if index >= header.key_count as usize {
+        return None;
+    }
+    let start = data_start(header.key_count);
+    let offset_pos = HEADER_SIZE + index * OFFSET_ENTRY_SIZE;
+    let rel = read_u16(page, offset_pos) as usize;
+    let entry_offset = start + rel;
+    let key_end = entry_offset + KEY_SIZE;
+    if key_end > PAGE_SIZE {
+        return None;
+    }
+    Some(&page[entry_offset..key_end])
+}
+
+fn entry_value_at<'a>(page: &'a Page, index: usize) -> Option<&'a [u8]> {
+    let header = page_header(page);
+    if index >= header.key_count as usize {
+        return None;
+    }
+    let value_size = entry_value_size(header.page_type);
+    let start = data_start(header.key_count);
+    let offset_pos = HEADER_SIZE + index * OFFSET_ENTRY_SIZE;
+    let rel = read_u16(page, offset_pos) as usize;
+    let entry_offset = start + rel;
+    let key_end = entry_offset + KEY_SIZE;
+    let value_end = key_end + value_size;
+    if value_end > PAGE_SIZE {
+        return None;
+    }
+    Some(&page[key_end..value_end])
+}
+
+fn collect_entries(page: &Page) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let header = page_header(page);
+    let mut entries = Vec::with_capacity(header.key_count as usize);
+    for index in 0..header.key_count as usize {
+        let key = match entry_key_at(page, index) {
+            Some(key) => key.to_vec(),
+            None => break,
+        };
+        let value = match entry_value_at(page, index) {
+            Some(value) => value.to_vec(),
+            None => break,
+        };
+        entries.push((key, value));
+    }
+    entries
+}
+
+fn entry_offset_at(page: &Page, index: usize) -> Option<usize> {
+    let header = page_header(page);
+    if index >= header.key_count as usize {
+        return None;
+    }
+    let start = data_start(header.key_count);
+    let offset_pos = HEADER_SIZE + index * OFFSET_ENTRY_SIZE;
+    let rel = read_u16(page, offset_pos) as usize;
+    let entry_offset = start + rel;
+    if entry_offset + KEY_SIZE > PAGE_SIZE {
+        return None;
+    }
+    Some(entry_offset)
+}
+
+fn find_key_pos(page: &Page, key: &[u8]) -> Option<(bool, usize)> {
+    let header = page_header(page);
+    let mut lo = 0usize;
+    let mut hi = header.key_count as usize;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let mid_key = entry_key_at(page, mid)?;
+        match mid_key.cmp(key) {
+            std::cmp::Ordering::Equal => return Some((true, mid)),
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
         }
-        true
-    });
-    found
+    }
+    Some((false, lo))
+}
+
+fn rebuild_page_with_insert(
+    page: &Page,
+    header: PageHeader,
+    insert_pos: usize,
+    key: &[u8],
+    value: &[u8],
+) -> Result<Page> {
+    let value_size = entry_value_size(header.page_type);
+    let total = header.key_count as usize + 1;
+    let mut out = new_page(header.page_type, header.level);
+    let mut new_header = header;
+    new_header.key_count = total as u16;
+    write_header(&mut out, new_header);
+
+    let start = data_start(new_header.key_count);
+    let mut cursor = start;
+    for pos in 0..total {
+        let (k, v) = if pos == insert_pos {
+            (key, value)
+        } else {
+            let idx = if pos < insert_pos { pos } else { pos - 1 };
+            let k = entry_key_at(page, idx).ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
+            let v = entry_value_at(page, idx).ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
+            (k, v)
+        };
+
+        let offset_pos = HEADER_SIZE + pos * OFFSET_ENTRY_SIZE;
+        let rel = (cursor - start) as u16;
+        write_u16(&mut out, offset_pos, rel);
+        out[cursor..cursor + KEY_SIZE].copy_from_slice(k);
+        cursor += KEY_SIZE;
+        out[cursor..cursor + value_size].copy_from_slice(v);
+        cursor += value_size;
+    }
+    Ok(out)
+}
+
+fn rebuild_page_with_remove(
+    page: &Page,
+    header: PageHeader,
+    remove_pos: usize,
+) -> Result<Page> {
+    let value_size = entry_value_size(header.page_type);
+    let total = header.key_count as usize;
+    if remove_pos >= total {
+        return Ok(page.clone());
+    }
+    let new_total = total.saturating_sub(1);
+    let mut out = new_page(header.page_type, header.level);
+    let mut new_header = header;
+    new_header.key_count = new_total as u16;
+    write_header(&mut out, new_header);
+    let start = data_start(new_header.key_count);
+    let mut cursor = start;
+    let mut out_pos = 0usize;
+    for idx in 0..total {
+        if idx == remove_pos {
+            continue;
+        }
+        let k = entry_key_at(page, idx).ok_or_else(|| Error::InvalidPageSize(idx, PAGE_SIZE))?;
+        let v = entry_value_at(page, idx).ok_or_else(|| Error::InvalidPageSize(idx, PAGE_SIZE))?;
+        let offset_pos = HEADER_SIZE + out_pos * OFFSET_ENTRY_SIZE;
+        let rel = (cursor - start) as u16;
+        write_u16(&mut out, offset_pos, rel);
+        out[cursor..cursor + KEY_SIZE].copy_from_slice(k);
+        cursor += KEY_SIZE;
+        out[cursor..cursor + value_size].copy_from_slice(v);
+        cursor += value_size;
+        out_pos += 1;
+    }
+    Ok(out)
+}
+
+fn find_in_leaf(page: &Page, key: &[u8]) -> Option<SlotRef> {
+    let header = page_header(page);
+    let mut lo = 0usize;
+    let mut hi = header.key_count as usize;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let mid_key = entry_key_at(page, mid)?;
+        match mid_key.cmp(key) {
+            std::cmp::Ordering::Equal => {
+                let value = entry_value_at(page, mid)?;
+                return Some(decode_slot_ref(value));
+            }
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+        }
+    }
+    None
+}
+
+fn lower_bound_in_leaf(page: &Page, key: &[u8]) -> usize {
+    let header = page_header(page);
+    let mut lo = 0usize;
+    let mut hi = header.key_count as usize;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let mid_key = match entry_key_at(page, mid) {
+            Some(key) => key,
+            None => return lo,
+        };
+        if mid_key < key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 fn encode_entries(
@@ -466,20 +768,26 @@ fn encode_entries(
     entries: &[(Vec<u8>, Vec<u8>)],
     mut header: PageHeader,
 ) -> Result<()> {
-    let mut cursor = HEADER_SIZE;
-    for (k, v) in entries {
-        let key_len = k.len() as u16;
-        let val_len = v.len() as u16;
-        if cursor + 4 + k.len() + v.len() > PAGE_SIZE {
+    let value_size = entry_value_size(header.page_type);
+    let start = data_start(entries.len() as u16);
+    let mut cursor = start;
+    for (index, (k, v)) in entries.iter().enumerate() {
+        if k.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(k.len(), KEY_SIZE));
+        }
+        if v.len() != value_size {
+            return Err(Error::InvalidValueSize(v.len(), value_size));
+        }
+        if cursor + KEY_SIZE + value_size > PAGE_SIZE {
             return Err(Error::InvalidPageSize(cursor, PAGE_SIZE));
         }
-        page[cursor..cursor + 2].copy_from_slice(&key_len.to_le_bytes());
-        page[cursor + 2..cursor + 4].copy_from_slice(&val_len.to_le_bytes());
-        cursor += 4;
-        page[cursor..cursor + k.len()].copy_from_slice(k);
-        cursor += k.len();
-        page[cursor..cursor + v.len()].copy_from_slice(v);
-        cursor += v.len();
+        let offset_pos = HEADER_SIZE + index * OFFSET_ENTRY_SIZE;
+        let rel = (cursor - start) as u16;
+        write_u16(page, offset_pos, rel);
+        page[cursor..cursor + KEY_SIZE].copy_from_slice(k);
+        cursor += KEY_SIZE;
+        page[cursor..cursor + value_size].copy_from_slice(v);
+        cursor += value_size;
     }
     header.key_count = entries.len() as u16;
     write_header(page, header);
@@ -487,10 +795,13 @@ fn encode_entries(
 }
 
 fn fits_in_page(entries: &[(Vec<u8>, Vec<u8>)]) -> bool {
-    let mut size = HEADER_SIZE;
-    for (k, v) in entries {
-        size += 4 + k.len() + v.len();
+    if entries.is_empty() {
+        return HEADER_SIZE <= PAGE_SIZE;
     }
+    let value_size = entries[0].1.len();
+    let size = HEADER_SIZE
+        + entries.len() * OFFSET_ENTRY_SIZE
+        + entries.len() * (KEY_SIZE + value_size);
     size <= PAGE_SIZE
 }
 
@@ -548,13 +859,17 @@ fn decode_child_id(buf: &[u8]) -> PageId {
 #[cfg(test)]
 mod tests {
     use super::{InMemoryPageProvider, PageBPlusTree, PageProvider, SlotRef};
+    use crate::KEY_SIZE;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
     use std::sync::RwLock;
 
     fn key_for(i: u32) -> Vec<u8> {
         let mut key = format!("k{:03}", i).into_bytes();
-        key.extend_from_slice(&vec![b'x'; 100]);
+        while key.len() < KEY_SIZE {
+            key.push(b'x');
+        }
+        key.truncate(KEY_SIZE);
         key
     }
 

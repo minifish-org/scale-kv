@@ -1,4 +1,4 @@
-use scale_kv::{ComputeNode, StorageServer, PAGE_SIZE};
+use scale_kv::{ComputeNode, StorageServer, KEY_SIZE, VALUE_SIZE};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +18,15 @@ fn cleanup_dir(dir: &PathBuf) {
     let _ = fs::remove_dir_all(dir);
 }
 
+fn fixed_key(raw: &str) -> String {
+    let mut out = raw.to_string();
+    while out.len() < KEY_SIZE {
+        out.push('_');
+    }
+    out.truncate(KEY_SIZE);
+    out
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_network_operations() {
     let dir = temp_dir();
@@ -29,28 +38,23 @@ async fn test_network_operations() {
                 let server = StorageServer::start_with_dir(addr, dir.clone())
                     .await
                     .unwrap();
-                let value1 = vec![b'a'; PAGE_SIZE / 4];
-                let value2 = vec![b'b'; PAGE_SIZE / 4];
+                let value1 = vec![b'a'; VALUE_SIZE];
+                let value2 = vec![b'b'; VALUE_SIZE];
+                let key = fixed_key("network_key");
 
-            let compute = ComputeNode::with_storage(&server.addr().to_string(), &local)
-                .await
-                .unwrap();
+                let compute = ComputeNode::with_storage(&server.addr().to_string(), &local)
+                    .await
+                    .unwrap();
 
-            compute.put("network_key", &value1).await.unwrap();
-            assert_eq!(
-                compute.get("network_key").await.unwrap(),
-                Some(value1.clone())
-            );
-            assert!(compute.exists("network_key"));
+                compute.put(&key, &value1).await.unwrap();
+                assert_eq!(compute.get(&key).await.unwrap(), Some(value1.clone()));
+                assert!(compute.exists(&key));
 
-            compute.put("network_key", &value2).await.unwrap();
-            assert_eq!(
-                compute.get("network_key").await.unwrap(),
-                Some(value2.clone())
-            );
+                compute.put(&key, &value2).await.unwrap();
+                assert_eq!(compute.get(&key).await.unwrap(), Some(value2.clone()));
 
-            assert!(compute.delete("network_key").await.unwrap());
-            assert_eq!(compute.get("network_key").await.unwrap(), None);
+                assert!(compute.delete(&key).await.unwrap());
+                assert_eq!(compute.get(&key).await.unwrap(), None);
             })
             .await;
     }
@@ -68,30 +72,25 @@ async fn test_multiple_clients() {
                 let server = StorageServer::start_with_dir(addr, dir.clone())
                     .await
                     .unwrap();
-                let value1 = vec![b'1'; PAGE_SIZE / 4];
-                let value2 = vec![b'2'; PAGE_SIZE / 4];
+                let value1 = vec![b'1'; VALUE_SIZE];
+                let value2 = vec![b'2'; VALUE_SIZE];
+                let key = fixed_key("shared_key");
 
-            let compute1 = ComputeNode::with_storage(&server.addr().to_string(), &local)
-                .await
-                .unwrap();
-            let compute2 = ComputeNode::with_storage(&server.addr().to_string(), &local)
-                .await
-                .unwrap();
+                let compute1 = ComputeNode::with_storage(&server.addr().to_string(), &local)
+                    .await
+                    .unwrap();
+                let compute2 = ComputeNode::with_storage(&server.addr().to_string(), &local)
+                    .await
+                    .unwrap();
 
-            compute1.put("shared_key", &value1).await.unwrap();
-            assert_eq!(
-                compute1.get("shared_key").await.unwrap(),
-                Some(value1.clone())
-            );
+                compute1.put(&key, &value1).await.unwrap();
+                assert_eq!(compute1.get(&key).await.unwrap(), Some(value1.clone()));
 
-            assert_eq!(compute2.get("shared_key").await.unwrap(), None);
+                assert_eq!(compute2.get(&key).await.unwrap(), None);
 
-            compute2.put("shared_key", &value2).await.unwrap();
-            assert_eq!(
-                compute2.get("shared_key").await.unwrap(),
-                Some(value2.clone())
-            );
-            assert_eq!(compute1.get("shared_key").await.unwrap(), Some(value1.clone()));
+                compute2.put(&key, &value2).await.unwrap();
+                assert_eq!(compute2.get(&key).await.unwrap(), Some(value2.clone()));
+                assert_eq!(compute1.get(&key).await.unwrap(), Some(value1.clone()));
             })
             .await;
     }
@@ -109,17 +108,17 @@ async fn test_batch_put() {
                 let server = StorageServer::start_with_dir(addr, dir.clone())
                     .await
                     .unwrap();
-            let compute = ComputeNode::with_storage(&server.addr().to_string(), &local)
-                .await
-                .unwrap();
-                let v1 = vec![b'1'; PAGE_SIZE / 4];
-                let v2 = vec![b'2'; PAGE_SIZE / 4];
+                let compute = ComputeNode::with_storage(&server.addr().to_string(), &local)
+                    .await
+                    .unwrap();
+                let v1 = vec![b'1'; VALUE_SIZE];
+                let v2 = vec![b'2'; VALUE_SIZE];
 
-            let items = vec![("b1".to_string(), v1.clone()), ("b2".to_string(), v2.clone())];
-            compute.batch_put(&items).await.unwrap();
+                let items = vec![(fixed_key("b1"), v1.clone()), (fixed_key("b2"), v2.clone())];
+                compute.batch_put(&items).await.unwrap();
 
-            assert_eq!(compute.get("b1").await.unwrap(), Some(v1));
-            assert_eq!(compute.get("b2").await.unwrap(), Some(v2));
+                assert_eq!(compute.get(&fixed_key("b1")).await.unwrap(), Some(v1));
+                assert_eq!(compute.get(&fixed_key("b2")).await.unwrap(), Some(v2));
             })
             .await;
     }

@@ -68,6 +68,7 @@ Scale-KV is a distributed key-value store with compute-store separation architec
 - **一致性/事务**：不考虑数据丢失与事务；计算层写入产生 WAL，**攒满 256KB 才发送**。
 - **缓存策略**：不做计算层淘汰，**所有数据常驻内存 cache**。
 - **读写路径**：计算层内存完成读写，读走 B+Tree 索引并回表读 page。
+- **Schema（固定长度）**：Key/Value 均为**预先约定的定长**（当前 `KEY_SIZE=16`, `VALUE_SIZE=1024`），不支持变长类型；长度不匹配直接拒绝。
 
 ### Key Characteristics
 - **Compute-Store Separation**: Compute nodes handle indexing and caching, storage nodes handle persistence

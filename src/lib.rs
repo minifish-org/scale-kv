@@ -7,7 +7,15 @@ pub mod common;
 pub use common::*;
 
 pub mod page_bptree;
-pub use page_bptree::{InMemoryPageProvider, PageBPlusTree, PageProvider, SharedPageProvider, SlotRef as PageSlotRef};
+pub use page_bptree::{
+    InMemoryPageProvider,
+    PageBPlusTree,
+    PageCache,
+    PageProvider,
+    SharedPageProvider,
+    SlotRef as PageSlotRef,
+    DEFAULT_PAGE_CACHE_SHARDS,
+};
 
 pub mod page_store;
 pub use page_store::{BufferPoolConfig, BufferStats, CheckpointConfig, PageStore};
