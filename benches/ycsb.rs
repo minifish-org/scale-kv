@@ -3,9 +3,10 @@ use rand::RngCore;
 use scale_kv::{ComputeNode, StorageServer};
 use sled::Config;
 use std::collections::HashSet;
-use std::time::Duration;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use std::env;
 use tokio::runtime::Builder;
 use tokio::task::LocalSet;
@@ -392,16 +393,17 @@ fn bench_throughput_get(c: &mut Criterion) {
     let local = LocalSet::new();
     let workers = rpc_workers();
     let compute = setup(&rt, &local, workers);
+    let next_key = Arc::new(AtomicUsize::new(0));
     let mut group = c.benchmark_group(format!("ycsb_network_workers{}", workers));
     group.bench_function("throughput_get", |b| {
         let compute = compute.clone();
+        let next_key = next_key.clone();
         b.iter(|| {
             let compute = compute.clone();
+            let idx = next_key.fetch_add(1, Ordering::Relaxed) % NUM_RECORDS;
+            let key = key_for(idx as u64);
             local.block_on(&rt, async move {
-                for i in 0..OPERATIONS {
-                    let key = key_for(i as u64);
-                    black_box(compute.get(&key).await.unwrap());
-                }
+                black_box(compute.get(&key).await.unwrap());
             })
         })
     });
@@ -672,13 +674,14 @@ fn bench_sled_throughput_get(c: &mut Criterion) {
         return;
     }
     let db = setup_sled();
+    let next_key = Arc::new(AtomicUsize::new(0));
     let mut group = c.benchmark_group("sled_local");
     group.bench_function("throughput_get", |b| {
+        let next_key = next_key.clone();
         b.iter(|| {
-            for i in 0..OPERATIONS {
-                let key = format!("user{:06}", i);
-                let _ = black_box(db.get(key.as_bytes()));
-            }
+            let idx = next_key.fetch_add(1, Ordering::Relaxed) % NUM_RECORDS;
+            let key = key_for(idx as u64);
+            let _ = black_box(db.get(key.as_bytes()));
         })
     });
     group.finish();
