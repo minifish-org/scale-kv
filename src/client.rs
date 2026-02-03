@@ -12,6 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 use tokio::task::LocalSet;
 use tokio::time::{sleep, Duration};
 use crate::node::WalBatch;
@@ -28,13 +29,23 @@ pub struct StorageClientPool {
 }
 
 const WAL_BATCH_BYTES: usize = 256 * 1024;
+const SYNC_WAL_ON_FLUSH_ENV: &str = "SCALE_KV_SYNC_WAL_ON_FLUSH";
+
+fn sync_wal_on_flush() -> bool {
+    std::env::var(SYNC_WAL_ON_FLUSH_ENV)
+        .map(|value| value != "0")
+        .unwrap_or(false)
+}
 
 struct WalSender {
     client: Arc<StorageClient>,
     buffer: Mutex<Vec<crate::node::WalRecord>>,
     buffer_bytes: Mutex<usize>,
     pending: Mutex<VecDeque<crate::node::WalRecord>>,
+    queued_bytes: AtomicUsize,
     lsn: AtomicU64,
+    batches_sent: AtomicU64,
+    notify: Notify,
 }
 
 impl WalSender {
@@ -44,7 +55,10 @@ impl WalSender {
             buffer: Mutex::new(Vec::new()),
             buffer_bytes: Mutex::new(0),
             pending: Mutex::new(VecDeque::new()),
+            queued_bytes: AtomicUsize::new(0),
             lsn: AtomicU64::new(1),
+            batches_sent: AtomicU64::new(0),
+            notify: Notify::new(),
         }
     }
 
@@ -52,9 +66,40 @@ impl WalSender {
         self.lsn.fetch_add(1, Ordering::Relaxed)
     }
 
+    fn record_size(record: &crate::node::WalRecord) -> usize {
+        record.key.len() + record.value.len() + 32
+    }
+
     fn enqueue(&self, record: crate::node::WalRecord) {
+        let size = Self::record_size(&record);
+        self.queued_bytes.fetch_add(size, Ordering::Relaxed);
         let mut pending = self.pending.lock().unwrap();
         pending.push_back(record);
+    }
+
+    async fn enqueue_and_maybe_flush(&self, record: crate::node::WalRecord, sync_on_flush: bool) {
+        if !sync_on_flush {
+            self.enqueue(record);
+            return;
+        }
+
+        let size = Self::record_size(&record);
+        let new_total = self.queued_bytes.fetch_add(size, Ordering::Relaxed) + size;
+        let mut pending = self.pending.lock().unwrap();
+        pending.push_back(record);
+        drop(pending);
+
+        if new_total < WAL_BATCH_BYTES {
+            return;
+        }
+
+        let start = self.batches_sent.load(Ordering::Acquire);
+        loop {
+            self.notify.notified().await;
+            if self.batches_sent.load(Ordering::Acquire) > start {
+                break;
+            }
+        }
     }
 
     fn drain_pending(&self) -> Vec<crate::node::WalRecord> {
@@ -76,7 +121,8 @@ impl WalSender {
                 *buffer_bytes += record.key.len() + record.value.len() + 32;
                 buffer.push(record);
                 if *buffer_bytes >= WAL_BATCH_BYTES {
-                    let batch = self.take_batch(&mut buffer, &mut buffer_bytes);
+                    let (batch, batch_bytes) = self.take_batch(&mut buffer, &mut buffer_bytes);
+                    self.queued_bytes.fetch_sub(batch_bytes, Ordering::Relaxed);
                     drop(buffer);
                     drop(buffer_bytes);
                     self.send_with_retry(batch).await;
@@ -86,7 +132,8 @@ impl WalSender {
             }
 
             if *buffer_bytes >= WAL_BATCH_BYTES {
-                let batch = self.take_batch(&mut buffer, &mut buffer_bytes);
+                let (batch, batch_bytes) = self.take_batch(&mut buffer, &mut buffer_bytes);
+                self.queued_bytes.fetch_sub(batch_bytes, Ordering::Relaxed);
                 drop(buffer);
                 drop(buffer_bytes);
                 self.send_with_retry(batch).await;
@@ -106,22 +153,26 @@ impl WalSender {
             }
             sleep(Duration::from_millis(10)).await;
         }
+        self.batches_sent.fetch_add(1, Ordering::Release);
+        self.notify.notify_waiters();
     }
 
     fn take_batch(
         &self,
         buffer: &mut Vec<crate::node::WalRecord>,
         buffer_bytes: &mut usize,
-    ) -> crate::node::WalBatch {
+    ) -> (crate::node::WalBatch, usize) {
         let records = std::mem::take(buffer);
+        let bytes = *buffer_bytes;
         *buffer_bytes = 0;
         let start_lsn = records.first().map(|r| r.lsn).unwrap_or(0);
         let end_lsn = records.last().map(|r| r.lsn).unwrap_or(0);
-        crate::node::WalBatch {
+        let batch = crate::node::WalBatch {
             start_lsn,
             end_lsn,
             records,
-        }
+        };
+        (batch, bytes)
     }
 }
 
@@ -486,14 +537,19 @@ impl BatchedComputeNode {
 
         if let Some(wal_sender) = &self.wal_sender {
             let lsn = wal_sender.next_lsn();
-            wal_sender.enqueue(crate::node::WalRecord {
-                lsn,
-                op: 1,
-                page_id,
-                slot_id,
-                key: key.as_bytes().to_vec(),
-                value: value.to_vec(),
-            });
+            wal_sender
+                .enqueue_and_maybe_flush(
+                    crate::node::WalRecord {
+                        lsn,
+                        op: 1,
+                        page_id,
+                        slot_id,
+                        key: key.as_bytes().to_vec(),
+                        value: value.to_vec(),
+                    },
+                    sync_wal_on_flush(),
+                )
+                .await;
         }
 
         Ok(())
@@ -519,14 +575,19 @@ impl BatchedComputeNode {
             self.tree.write().unwrap().remove(key.as_bytes())?;
             if let Some(wal_sender) = &self.wal_sender {
                 let lsn = wal_sender.next_lsn();
-                wal_sender.enqueue(crate::node::WalRecord {
-                    lsn,
-                    op: 2,
-                    page_id: slot_ref.page_id,
-                    slot_id: slot_ref.slot_id,
-                    key: key.as_bytes().to_vec(),
-                    value: Vec::new(),
-                });
+                wal_sender
+                    .enqueue_and_maybe_flush(
+                        crate::node::WalRecord {
+                            lsn,
+                            op: 2,
+                            page_id: slot_ref.page_id,
+                            slot_id: slot_ref.slot_id,
+                            key: key.as_bytes().to_vec(),
+                            value: Vec::new(),
+                        },
+                        sync_wal_on_flush(),
+                    )
+                    .await;
             }
             return Ok(true);
         }
@@ -694,14 +755,19 @@ impl BatchedComputeNode {
 
             if let Some(wal_sender) = &self.wal_sender {
                 let lsn = wal_sender.next_lsn();
-                wal_sender.enqueue(crate::node::WalRecord {
-                    lsn,
-                    op: 1,
-                    page_id,
-                    slot_id,
-                    key: key.as_bytes().to_vec(),
-                    value: value.clone(),
-                });
+                wal_sender
+                    .enqueue_and_maybe_flush(
+                        crate::node::WalRecord {
+                            lsn,
+                            op: 1,
+                            page_id,
+                            slot_id,
+                            key: key.as_bytes().to_vec(),
+                            value: value.clone(),
+                        },
+                        sync_wal_on_flush(),
+                    )
+                    .await;
             }
         }
 
@@ -1125,14 +1191,19 @@ impl ComputeNode {
             self.tree.write().unwrap().remove(key.as_bytes())?;
             if let Some(wal_sender) = &self.wal_sender {
                 let lsn = wal_sender.next_lsn();
-                wal_sender.enqueue(crate::node::WalRecord {
-                    lsn,
-                    op: 2,
-                    page_id: slot_ref.page_id,
-                    slot_id: slot_ref.slot_id,
-                    key: key.as_bytes().to_vec(),
-                    value: Vec::new(),
-                });
+                wal_sender
+                    .enqueue_and_maybe_flush(
+                        crate::node::WalRecord {
+                            lsn,
+                            op: 2,
+                            page_id: slot_ref.page_id,
+                            slot_id: slot_ref.slot_id,
+                            key: key.as_bytes().to_vec(),
+                            value: Vec::new(),
+                        },
+                        sync_wal_on_flush(),
+                    )
+                    .await;
             }
             return Ok(true);
         }
@@ -1308,14 +1379,19 @@ impl ComputeNode {
 
             if let Some(wal_sender) = &self.wal_sender {
                 let lsn = wal_sender.next_lsn();
-                wal_sender.enqueue(crate::node::WalRecord {
-                    lsn,
-                    op: 1,
-                    page_id,
-                    slot_id,
-                    key: key.as_bytes().to_vec(),
-                    value: value.clone(),
-                });
+                wal_sender
+                    .enqueue_and_maybe_flush(
+                        crate::node::WalRecord {
+                            lsn,
+                            op: 1,
+                            page_id,
+                            slot_id,
+                            key: key.as_bytes().to_vec(),
+                            value: value.clone(),
+                        },
+                        sync_wal_on_flush(),
+                    )
+                    .await;
             }
         }
 
