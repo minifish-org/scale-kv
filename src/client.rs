@@ -4,7 +4,7 @@ use crate::{Error, Page, PageId, Result, Value, PAGE_SIZE};
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
 use capnp_rpc::RpcSystem;
-use futures::{future::try_join_all, FutureExt};
+use futures::FutureExt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -412,24 +412,20 @@ impl BatchedComputeNode {
             }
         };
 
-        if let Some(page) = self.page_cache.read().unwrap().get(&slot_ref.page_id) {
-            if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
-                self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(value));
+        let page = match self.page_cache.read().unwrap().get(&slot_ref.page_id) {
+            Some(page) => page.clone(),
+            None => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                return Err(Error::InMemoryPageMissing(slot_ref.page_id));
             }
+        };
+
+        if let Some(value) = read_value(&page, slot_ref.slot_id, key.as_bytes()) {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(value));
         }
 
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
-        let page = match &self.storage {
-            Some(storage) => storage.get(slot_ref.page_id).await?,
-            None => return Ok(None),
-        };
-        if let Some(page) = page {
-            let value = read_value(&page, slot_ref.slot_id, key.as_bytes());
-            self.page_cache.write().unwrap().insert(slot_ref.page_id, page);
-            return Ok(value);
-        }
-
         Ok(None)
     }
 
@@ -440,26 +436,23 @@ impl BatchedComputeNode {
         let required = payload_len + SLOT_ENTRY_SIZE;
         let old_slot = self.tree.lock().unwrap().get(key.as_bytes());
         if let Some(slot_ref) = old_slot {
-            let cached_page = {
-                self.page_cache
-                    .read()
-                    .unwrap()
-                    .get(&slot_ref.page_id)
-                    .cloned()
-            };
+            let cached_page = self
+                .page_cache
+                .read()
+                .unwrap()
+                .get(&slot_ref.page_id)
+                .cloned();
             let mut page = match cached_page {
-                Some(page) => Some(page),
-                None => self.fetch_page(slot_ref.page_id).await?,
+                Some(page) => page,
+                None => return Err(Error::InMemoryPageMissing(slot_ref.page_id)),
             };
-            if let Some(mut page) = page.take() {
-                clear_slot(&mut page, slot_ref.slot_id);
-                let free = page_free_space(&page);
-                self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
-                self.page_cache.write().unwrap().insert(slot_ref.page_id, page.clone());
-                let _page_id = slot_ref.page_id;
-            }
-                self.tree.lock().unwrap().remove(key.as_bytes())?;
-            }
+            clear_slot(&mut page, slot_ref.slot_id);
+            let free = page_free_space(&page);
+            self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
+            self.page_cache.write().unwrap().insert(slot_ref.page_id, page.clone());
+            let _page_id = slot_ref.page_id;
+            self.tree.lock().unwrap().remove(key.as_bytes())?;
+        }
 
         let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
         let cached_page = {
@@ -470,7 +463,7 @@ impl BatchedComputeNode {
         } else if is_new {
             new_page()
         } else {
-            self.fetch_page(page_id).await?.unwrap_or_else(new_page)
+            return Err(Error::InMemoryPageMissing(page_id));
         };
 
         let mut slot_id = insert_record(&mut page, key.as_bytes(), value)?;
@@ -514,19 +507,15 @@ impl BatchedComputeNode {
         let slot_ref = self.tree.lock().unwrap().get(key.as_bytes());
 
         if let Some(slot_ref) = slot_ref {
-            let cached_page = {
-                self.page_cache
-                    .read()
-                    .unwrap()
-                    .get(&slot_ref.page_id)
-                    .cloned()
-            };
-            let mut page = if let Some(page) = cached_page {
-                page
-            } else {
-                self.fetch_page(slot_ref.page_id)
-                    .await?
-                    .unwrap_or_else(new_page)
+            let cached_page = self
+                .page_cache
+                .read()
+                .unwrap()
+                .get(&slot_ref.page_id)
+                .cloned();
+            let mut page = match cached_page {
+                Some(page) => page,
+                None => return Err(Error::InMemoryPageMissing(slot_ref.page_id)),
             };
             clear_slot(&mut page, slot_ref.slot_id);
             let free = page_free_space(&page);
@@ -594,7 +583,6 @@ impl BatchedComputeNode {
         }
 
         let mut out = vec![None; keys.len()];
-        let mut missing_pages: HashSet<PageId> = HashSet::new();
         let mut pending: Vec<(usize, String, PageSlotRef)> = Vec::new();
 
         {
@@ -607,34 +595,19 @@ impl BatchedComputeNode {
                             continue;
                         }
                     }
-                    missing_pages.insert(slot_ref.page_id);
                     pending.push((idx, key, slot_ref));
-                }
-            }
-        }
-
-        if !missing_pages.is_empty() {
-            let fetches = missing_pages
-                .iter()
-                .map(|page_id| self.fetch_page(*page_id))
-                .collect::<Vec<_>>();
-            let pages = try_join_all(fetches).await?;
-            {
-                let mut cache = self.page_cache.write().unwrap();
-                for (page_id, page) in missing_pages.iter().copied().zip(pages.into_iter()) {
-                    if let Some(page) = page {
-                        cache.insert(page_id, page);
-                    }
                 }
             }
         }
 
         let cache = self.page_cache.read().unwrap();
         for (idx, key, slot_ref) in pending.into_iter() {
-            if let Some(page) = cache.get(&slot_ref.page_id) {
-                if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
-                    out[idx] = Some(value);
-                }
+            let page = match cache.get(&slot_ref.page_id) {
+                Some(page) => page,
+                None => return Err(Error::InMemoryPageMissing(slot_ref.page_id)),
+            };
+            if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
+                out[idx] = Some(value);
             }
         }
 
@@ -650,7 +623,6 @@ impl BatchedComputeNode {
             .fetch_add(items.len(), Ordering::Relaxed);
 
         let mut modified_pages: HashMap<PageId, Page> = HashMap::new();
-        let mut pages_to_fetch: HashSet<PageId> = HashSet::new();
         let mut slot_refs: Vec<Option<PageSlotRef>> = Vec::with_capacity(items.len());
 
         for (key, _) in items {
@@ -659,25 +631,12 @@ impl BatchedComputeNode {
                 if !modified_pages.contains_key(&slot_ref.page_id) {
                     let in_cache = self.page_cache.read().unwrap().contains_key(&slot_ref.page_id);
                     if !in_cache {
-                        pages_to_fetch.insert(slot_ref.page_id);
+                        return Err(Error::InMemoryPageMissing(slot_ref.page_id));
                     }
                 }
                 slot_refs.push(Some(slot_ref.clone()));
             } else {
                 slot_refs.push(None);
-            }
-        }
-
-        if !pages_to_fetch.is_empty() {
-            let fetches = pages_to_fetch
-                .iter()
-                .map(|page_id| self.fetch_page(*page_id))
-                .collect::<Vec<_>>();
-            let fetched_pages = try_join_all(fetches).await?;
-            for (page_id, page) in pages_to_fetch.iter().copied().zip(fetched_pages.into_iter()) {
-                if let Some(page) = page {
-                    modified_pages.insert(page_id, page);
-                }
             }
         }
 
@@ -718,7 +677,7 @@ impl BatchedComputeNode {
                 } else if is_new {
                     new_page()
                 } else {
-                    self.fetch_page(page_id).await?.unwrap_or_else(new_page)
+                    return Err(Error::InMemoryPageMissing(page_id));
                 }
             };
 
@@ -778,7 +737,6 @@ impl BatchedComputeNode {
         }
 
         let mut out = Vec::with_capacity(keys.len());
-        let mut missing_pages: HashSet<PageId> = HashSet::new();
         let mut key_slots: Vec<(Vec<u8>, PageSlotRef)> = Vec::with_capacity(keys.len());
 
         {
@@ -790,33 +748,18 @@ impl BatchedComputeNode {
                         continue;
                     }
                 }
-                missing_pages.insert(slot_ref.page_id);
                 key_slots.push((key, slot_ref));
-            }
-        }
-
-        if !missing_pages.is_empty() {
-            let fetches = missing_pages
-                .iter()
-                .map(|page_id| self.fetch_page(*page_id))
-                .collect::<Vec<_>>();
-            let pages = try_join_all(fetches).await?;
-            {
-                let mut cache = self.page_cache.write().unwrap();
-                for (page_id, page) in missing_pages.iter().copied().zip(pages.into_iter()) {
-                    if let Some(page) = page {
-                        cache.insert(page_id, page);
-                    }
-                }
             }
         }
 
         let cache = self.page_cache.read().unwrap();
         for (key, slot_ref) in key_slots.into_iter() {
-            if let Some(page) = cache.get(&slot_ref.page_id) {
-                if let Some(value) = read_value(page, slot_ref.slot_id, &key) {
-                    out.push((String::from_utf8_lossy(&key).to_string(), value));
-                }
+            let page = match cache.get(&slot_ref.page_id) {
+                Some(page) => page,
+                None => return Err(Error::InMemoryPageMissing(slot_ref.page_id)),
+            };
+            if let Some(value) = read_value(page, slot_ref.slot_id, &key) {
+                out.push((String::from_utf8_lossy(&key).to_string(), value));
             }
         }
 
@@ -846,13 +789,6 @@ impl BatchedComputeNode {
         self.storage.as_ref().map(|s| s.pending()).unwrap_or(0)
     }
 
-    async fn fetch_page(&self, page_id: PageId) -> Result<Option<Page>> {
-        let storage = match &self.storage {
-            Some(storage) => storage,
-            None => return Ok(None),
-        };
-        storage.get(page_id).await
-    }
 }
 
 impl Default for BatchedComputeNode {
@@ -1108,30 +1044,20 @@ impl ComputeNode {
             }
         };
 
-        if let Some(page) = self.page_cache.read().unwrap().get(&slot_ref.page_id) {
-            if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
-                self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(value));
+        let page = match self.page_cache.read().unwrap().get(&slot_ref.page_id) {
+            Some(page) => page.clone(),
+            None => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                return Err(Error::InMemoryPageMissing(slot_ref.page_id));
             }
+        };
+
+        if let Some(value) = read_value(&page, slot_ref.slot_id, key.as_bytes()) {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(value));
         }
 
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
-        let page = if let Some(batch_sender) = &self.batch_sender {
-            batch_sender.client.get(slot_ref.page_id).await?
-        } else if let Some(storage) = &self.storage {
-            storage.get(slot_ref.page_id).await?
-        } else {
-            return Ok(None);
-        };
-        if let Some(page) = page {
-            let value = read_value(&page, slot_ref.slot_id, key.as_bytes());
-            self.page_cache
-                .write()
-                .unwrap()
-                .insert(slot_ref.page_id, page);
-            return Ok(value);
-        }
-
         Ok(None)
     }
 
@@ -1143,29 +1069,26 @@ impl ComputeNode {
 
         let old_slot = self.tree.lock().unwrap().get(key.as_bytes());
         if let Some(slot_ref) = old_slot {
-            let cached_page = {
-                self.page_cache
-                    .read()
-                    .unwrap()
-                    .get(&slot_ref.page_id)
-                    .cloned()
-            };
+            let cached_page = self
+                .page_cache
+                .read()
+                .unwrap()
+                .get(&slot_ref.page_id)
+                .cloned();
             let mut page = match cached_page {
-                Some(page) => Some(page),
-                None => self.fetch_page(slot_ref.page_id).await?,
+                Some(page) => page,
+                None => return Err(Error::InMemoryPageMissing(slot_ref.page_id)),
             };
-            if let Some(mut page) = page.take() {
-                clear_slot(&mut page, slot_ref.slot_id);
-                let free = page_free_space(&page);
-                self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
-                self.page_cache
-                    .write()
-                    .unwrap()
-                    .insert(slot_ref.page_id, page.clone());
-                let _page_id = slot_ref.page_id;
-            }
-                self.tree.lock().unwrap().remove(key.as_bytes())?;
-            }
+            clear_slot(&mut page, slot_ref.slot_id);
+            let free = page_free_space(&page);
+            self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
+            self.page_cache
+                .write()
+                .unwrap()
+                .insert(slot_ref.page_id, page.clone());
+            let _page_id = slot_ref.page_id;
+            self.tree.lock().unwrap().remove(key.as_bytes())?;
+        }
 
         let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
         let cached_page = {
@@ -1176,7 +1099,7 @@ impl ComputeNode {
         } else if is_new {
             new_page()
         } else {
-            self.fetch_page(page_id).await?.unwrap_or_else(new_page)
+            return Err(Error::InMemoryPageMissing(page_id));
         };
 
         let mut slot_id = insert_record(&mut page, key.as_bytes(), value)?;
@@ -1208,19 +1131,15 @@ impl ComputeNode {
         let slot_ref = self.tree.lock().unwrap().get(key.as_bytes());
 
         if let Some(slot_ref) = slot_ref {
-            let cached_page = {
-                self.page_cache
-                    .read()
-                    .unwrap()
-                    .get(&slot_ref.page_id)
-                    .cloned()
-            };
-            let mut page = if let Some(page) = cached_page {
-                page
-            } else {
-                self.fetch_page(slot_ref.page_id)
-                    .await?
-                    .unwrap_or_else(new_page)
+            let cached_page = self
+                .page_cache
+                .read()
+                .unwrap()
+                .get(&slot_ref.page_id)
+                .cloned();
+            let mut page = match cached_page {
+                Some(page) => page,
+                None => return Err(Error::InMemoryPageMissing(slot_ref.page_id)),
             };
             clear_slot(&mut page, slot_ref.slot_id);
             let free = page_free_space(&page);
@@ -1230,6 +1149,17 @@ impl ComputeNode {
                 .unwrap()
                 .insert(slot_ref.page_id, page.clone());
             self.tree.lock().unwrap().remove(key.as_bytes())?;
+            if let Some(wal_sender) = &self.wal_sender {
+                let lsn = wal_sender.next_lsn();
+                wal_sender.enqueue(crate::node::WalRecord {
+                    lsn,
+                    op: 2,
+                    page_id: slot_ref.page_id,
+                    slot_id: slot_ref.slot_id,
+                    key: key.as_bytes().to_vec(),
+                    value: Vec::new(),
+                });
+            }
             return Ok(true);
         }
 
@@ -1286,7 +1216,6 @@ impl ComputeNode {
         }
 
         let mut out = vec![None; keys.len()];
-        let mut missing_pages: HashSet<PageId> = HashSet::new();
         let mut pending: Vec<(usize, String, PageSlotRef)> = Vec::new();
 
         {
@@ -1299,34 +1228,19 @@ impl ComputeNode {
                             continue;
                         }
                     }
-                    missing_pages.insert(slot_ref.page_id);
                     pending.push((idx, key, slot_ref));
-                }
-            }
-        }
-
-        if !missing_pages.is_empty() {
-            let fetches = missing_pages
-                .iter()
-                .map(|page_id| self.fetch_page(*page_id))
-                .collect::<Vec<_>>();
-            let pages = try_join_all(fetches).await?;
-            {
-                let mut cache = self.page_cache.write().unwrap();
-                for (page_id, page) in missing_pages.iter().copied().zip(pages.into_iter()) {
-                    if let Some(page) = page {
-                        cache.insert(page_id, page);
-                    }
                 }
             }
         }
 
         let cache = self.page_cache.read().unwrap();
         for (idx, key, slot_ref) in pending.into_iter() {
-            if let Some(page) = cache.get(&slot_ref.page_id) {
-                if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
-                    out[idx] = Some(value);
-                }
+            let page = match cache.get(&slot_ref.page_id) {
+                Some(page) => page,
+                None => return Err(Error::InMemoryPageMissing(slot_ref.page_id)),
+            };
+            if let Some(value) = read_value(page, slot_ref.slot_id, key.as_bytes()) {
+                out[idx] = Some(value);
             }
         }
 
@@ -1343,7 +1257,6 @@ impl ComputeNode {
 
         let mut modified_pages: HashMap<PageId, Page> = HashMap::new();
 
-        let mut pages_to_fetch: HashSet<PageId> = HashSet::new();
         let mut slot_refs: Vec<Option<PageSlotRef>> = Vec::with_capacity(items.len());
 
         for (key, _) in items {
@@ -1352,25 +1265,12 @@ impl ComputeNode {
                 if !modified_pages.contains_key(&slot_ref.page_id) {
                     let in_cache = self.page_cache.read().unwrap().contains_key(&slot_ref.page_id);
                     if !in_cache {
-                        pages_to_fetch.insert(slot_ref.page_id);
+                        return Err(Error::InMemoryPageMissing(slot_ref.page_id));
                     }
                 }
                 slot_refs.push(Some(slot_ref.clone()));
             } else {
                 slot_refs.push(None);
-            }
-        }
-
-        if !pages_to_fetch.is_empty() {
-            let fetches = pages_to_fetch
-                .iter()
-                .map(|page_id| self.fetch_page(*page_id))
-                .collect::<Vec<_>>();
-            let fetched_pages = try_join_all(fetches).await?;
-            for (page_id, page) in pages_to_fetch.iter().copied().zip(fetched_pages.into_iter()) {
-                if let Some(page) = page {
-                    modified_pages.insert(page_id, page);
-                }
             }
         }
 
@@ -1411,7 +1311,7 @@ impl ComputeNode {
                 } else if is_new {
                     new_page()
                 } else {
-                    self.fetch_page(page_id).await?.unwrap_or_else(new_page)
+                    return Err(Error::InMemoryPageMissing(page_id));
                 }
             };
 
@@ -1471,7 +1371,6 @@ impl ComputeNode {
         }
 
         let mut out = Vec::with_capacity(keys.len());
-        let mut missing_pages: HashSet<PageId> = HashSet::new();
         let mut key_slots: Vec<(Vec<u8>, PageSlotRef)> = Vec::with_capacity(keys.len());
 
         {
@@ -1483,33 +1382,18 @@ impl ComputeNode {
                         continue;
                     }
                 }
-                missing_pages.insert(slot_ref.page_id);
                 key_slots.push((key, slot_ref));
-            }
-        }
-
-        if !missing_pages.is_empty() {
-            let fetches = missing_pages
-                .iter()
-                .map(|page_id| self.fetch_page(*page_id))
-                .collect::<Vec<_>>();
-            let pages = try_join_all(fetches).await?;
-            {
-                let mut cache = self.page_cache.write().unwrap();
-                for (page_id, page) in missing_pages.iter().copied().zip(pages.into_iter()) {
-                    if let Some(page) = page {
-                        cache.insert(page_id, page);
-                    }
-                }
             }
         }
 
         let cache = self.page_cache.read().unwrap();
         for (key, slot_ref) in key_slots.into_iter() {
-            if let Some(page) = cache.get(&slot_ref.page_id) {
-                if let Some(value) = read_value(page, slot_ref.slot_id, &key) {
-                    out.push((String::from_utf8_lossy(&key).to_string(), value));
-                }
+            let page = match cache.get(&slot_ref.page_id) {
+                Some(page) => page,
+                None => return Err(Error::InMemoryPageMissing(slot_ref.page_id)),
+            };
+            if let Some(value) = read_value(page, slot_ref.slot_id, &key) {
+                out.push((String::from_utf8_lossy(&key).to_string(), value));
             }
         }
 
@@ -1529,14 +1413,6 @@ impl ComputeNode {
             operations,
             cache_hit_rate,
         }
-    }
-
-    async fn fetch_page(&self, page_id: PageId) -> Result<Option<Page>> {
-        let storage = match &self.storage {
-            Some(storage) => storage,
-            None => return Ok(None),
-        };
-        storage.get(page_id).await
     }
 
 }

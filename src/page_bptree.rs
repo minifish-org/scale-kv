@@ -193,13 +193,7 @@ impl<P: PageProvider> PageBPlusTree<P> {
     pub fn get(&self, key: &[u8]) -> Option<SlotRef> {
         let (leaf_id, _) = self.find_leaf(key);
         let page = self.provider.read_page(leaf_id)?;
-        let entries = decode_entries(&page);
-        for (k, v) in entries {
-            if k == key {
-                return Some(decode_slot_ref(&v));
-            }
-        }
-        None
+        find_in_leaf(&page, key)
     }
 
     pub fn insert(&mut self, key: Vec<u8>, slot_ref: SlotRef) -> Result<()> {
@@ -209,7 +203,7 @@ impl<P: PageProvider> PageBPlusTree<P> {
         match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key.as_slice())) {
             Ok(pos) => entries[pos].1 = encode_slot_ref(slot_ref),
             Err(pos) => {
-                entries.insert(pos, (key.clone(), encode_slot_ref(slot_ref)));
+                entries.insert(pos, (key, encode_slot_ref(slot_ref)));
                 self.len += 1;
             }
         }
@@ -248,8 +242,21 @@ impl<P: PageProvider> PageBPlusTree<P> {
     }
 
     pub fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, SlotRef)> {
-        let (leaf_id, _) = self.find_leaf(start);
         let mut out = Vec::new();
+        self.range_visit(start, end, |k, slot_ref| {
+            out.push((k.to_vec(), slot_ref));
+            true
+        });
+        out
+    }
+
+    pub fn range_visit(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        mut f: impl FnMut(&[u8], SlotRef) -> bool,
+    ) {
+        let (leaf_id, _) = self.find_leaf(start);
         let mut current = Some(leaf_id);
         while let Some(page_id) = current {
             let page = match self.provider.read_page(page_id) {
@@ -257,19 +264,26 @@ impl<P: PageProvider> PageBPlusTree<P> {
                 None => break,
             };
             let header = leaf_page_header(&page);
-            let entries = decode_entries(&page);
-            for (k, v) in entries {
-                if k.as_slice() < start {
-                    continue;
+            let mut stop = false;
+            for_each_entry(&page, |k, v| {
+                if k < start {
+                    return true;
                 }
-                if k.as_slice() > end {
-                    return out;
+                if k > end {
+                    stop = true;
+                    return false;
                 }
-                out.push((k, decode_slot_ref(&v)));
+                if !f(k, decode_slot_ref(v)) {
+                    stop = true;
+                    return false;
+                }
+                true
+            });
+            if stop {
+                return;
             }
             current = header.next_leaf;
         }
-        out
     }
 
     fn find_leaf(&self, key: &[u8]) -> (PageId, Vec<PageId>) {
@@ -282,14 +296,14 @@ impl<P: PageProvider> PageBPlusTree<P> {
                 return (current, stack);
             }
             stack.push(current);
-            let entries = decode_entries(&page);
             let mut child = header.left_child;
-            for (k, v) in entries {
-                if key < k.as_slice() {
-                    break;
+            for_each_entry(&page, |k, v| {
+                if key < k {
+                    return false;
                 }
-                child = decode_child_id(&v);
-            }
+                child = decode_child_id(v);
+                true
+            });
             current = child;
         }
     }
@@ -327,7 +341,7 @@ impl<P: PageProvider> PageBPlusTree<P> {
                     entries.len()
                 }
             });
-        entries.insert(pos, (separator.clone(), encode_child_id(right_id)));
+        entries.insert(pos, (separator, encode_child_id(right_id)));
 
         if fits_in_page(&entries) {
             let header = page_header(&parent);
@@ -413,6 +427,38 @@ fn decode_entries(page: &Page) -> Vec<(Vec<u8>, Vec<u8>)> {
         entries.push((key, val));
     }
     entries
+}
+
+fn for_each_entry<'a>(
+    page: &'a Page,
+    mut f: impl FnMut(&'a [u8], &'a [u8]) -> bool,
+) {
+    let header = page_header(page);
+    let mut cursor = HEADER_SIZE;
+    for _ in 0..header.key_count {
+        let key_len = u16::from_le_bytes([page[cursor], page[cursor + 1]]) as usize;
+        let val_len = u16::from_le_bytes([page[cursor + 2], page[cursor + 3]]) as usize;
+        cursor += 4;
+        let key = &page[cursor..cursor + key_len];
+        cursor += key_len;
+        let val = &page[cursor..cursor + val_len];
+        cursor += val_len;
+        if !f(key, val) {
+            break;
+        }
+    }
+}
+
+fn find_in_leaf(page: &Page, key: &[u8]) -> Option<SlotRef> {
+    let mut found = None;
+    for_each_entry(page, |k, v| {
+        if k == key {
+            found = Some(decode_slot_ref(v));
+            return false;
+        }
+        true
+    });
+    found
 }
 
 fn encode_entries(

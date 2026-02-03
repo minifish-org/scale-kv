@@ -62,6 +62,13 @@
 
 Scale-KV is a distributed key-value store with compute-store separation architecture, written in Rust. The system separates compute (indexing, caching) from storage (persistence, durability) to enable horizontal scaling.
 
+### Demo Scope & Target Model (Current Phase)
+- **目标架构**：Aurora-style KV（计算/存储两个进程），计算层只通过异步 WAL 同步到存储层。
+- **当前阶段**：单计算 + 单存储 demo，不考虑多写/多存储协调。
+- **一致性/事务**：不考虑数据丢失与事务；计算层写入产生 WAL，**攒满 256KB 才发送**。
+- **缓存策略**：不做计算层淘汰，**所有数据常驻内存 cache**。
+- **读写路径**：计算层内存完成读写，读走 B+Tree 索引并回表读 page。
+
 ### Key Characteristics
 - **Compute-Store Separation**: Compute nodes handle indexing and caching, storage nodes handle persistence
 - **Page-Oriented Storage**: Fixed 16KB pages with PostgreSQL-style segment-page storage
@@ -341,6 +348,36 @@ cargo test --test smoke
 ```bash
 cargo bench  # ✅ All benchmarks executable
 ```
+
+**Scale-KV vs Sled Comparison (Aligned Method)**:
+- Same dataset and value sizes: `NUM_RECORDS=10_000`, `VALUE_SIZE=1024`, `OPERATIONS=1_000`
+- Same YCSB mixes and key distribution (Zipfian)
+- Range scans are fully consumed on both sides to avoid lazy-iterator undercounting
+- Scale-KV runs through loopback RPC (compute + storage) with WAL; sled runs embedded (local DB)
+
+**Comparison Controls (Env Vars)**:
+```bash
+# Enable sled benchmarks alongside scale-kv
+SCALE_KV_RUN_SLED=1
+
+# Choose which side to run: scale_kv | sled | both
+SCALE_KV_BENCH_SET=both
+
+# Filter specific workloads (comma-separated)
+SCALE_KV_BENCH_FILTER=workload_a,workload_c
+
+# Benchmark tuning
+SCALE_KV_SAMPLE_SIZE=50
+SCALE_KV_WARMUP_SECS=2
+SCALE_KV_MEASUREMENT_SECS=5
+
+# Scale-KV RPC worker count
+SCALE_KV_RPC_WORKERS=1
+```
+
+**Expected Performance Differences (Interpretation)**:
+- **Sled** should generally show lower latency / higher throughput for single-node workloads due to in-process access and no RPC/WAL batching overhead.
+- **Scale-KV** numbers reflect networked, WAL-backed behavior even on localhost, so absolute throughput will be lower but more representative of distributed deployment characteristics.
 
 ---
 

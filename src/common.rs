@@ -16,6 +16,8 @@ pub enum Error {
     InvalidPageSize(usize, usize),
     #[error("invalid value size: {0} (max {1})")]
     InvalidValueSize(usize, usize),
+    #[error("in-memory page missing for page_id {0}")]
+    InMemoryPageMissing(u64),
 }
 
 impl From<capnp::Error> for Error {
