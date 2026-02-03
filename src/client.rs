@@ -135,6 +135,18 @@ impl StorageClientPool {
         })
     }
 
+    pub async fn connect_local(addr: &str, size: usize) -> Result<Self> {
+        let size = size.max(1);
+        let mut clients = Vec::with_capacity(size);
+        for _ in 0..size {
+            clients.push(StorageClient::connect_local(addr).await?);
+        }
+        Ok(Self {
+            clients,
+            next: AtomicUsize::new(0),
+        })
+    }
+
     fn pick(&self) -> &StorageClient {
         let index = self.next.fetch_add(1, Ordering::Relaxed);
         &self.clients[index % self.clients.len()]
@@ -266,6 +278,12 @@ impl BatchedStorageClientPool {
         Ok(Self { sender })
     }
 
+    pub async fn connect_local(addr: &str, window_size: usize) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect_local(addr).await?);
+        let sender = Arc::new(BatchSender::new(client, window_size));
+        Ok(Self { sender })
+    }
+
     pub async fn get(&self, page_id: PageId) -> Result<Option<Page>> {
         self.sender.client.get(page_id).await
     }
@@ -299,6 +317,7 @@ impl BatchedStorageClientPool {
 pub struct BatchedComputeNode {
     tree: Mutex<PageBPlusTree<SharedPageProvider>>,
     page_cache: Arc<RwLock<HashMap<PageId, Page>>>,
+    #[allow(dead_code)]
     next_page_id: Arc<AtomicU64>,
     fsm: Mutex<FreeSpaceMap>,
     cache_hits: AtomicUsize,
@@ -327,9 +346,39 @@ impl BatchedComputeNode {
         }
     }
 
+    /// Create a BatchedComputeNode with storage connection.
+    /// 
+    /// # Note
+    /// Requires a `LocalSet` because Cap'n Proto RPC system is not `Send`.
+    /// This is a limitation of the underlying RPC library.
     pub async fn with_storage(addr: &str, window_size: usize, local: &LocalSet) -> Result<Self> {
         let client = Arc::new(StorageClient::connect(addr, local).await?);
         let storage = Some(Arc::new(BatchedStorageClientPool::connect(addr, window_size, local).await?));
+        let wal_sender = Arc::new(WalSender::new(client));
+        let wal_sender_clone = wal_sender.clone();
+        tokio::task::spawn_local(async move {
+            wal_sender_clone.run().await;
+        });
+        let page_cache = Arc::new(RwLock::new(HashMap::new()));
+        let next_page_id = Arc::new(AtomicU64::new(1));
+        let provider = SharedPageProvider::new(page_cache.clone(), next_page_id.clone());
+        let tree = PageBPlusTree::new_with_provider(provider);
+        Ok(Self {
+            tree: Mutex::new(tree),
+            page_cache,
+            next_page_id: next_page_id.clone(),
+            fsm: Mutex::new(FreeSpaceMap::new(next_page_id)),
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            storage,
+            wal_sender: Some(wal_sender),
+        })
+    }
+
+    pub async fn with_storage_local(addr: &str, window_size: usize) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect_local(addr).await?);
+        let storage = Some(Arc::new(BatchedStorageClientPool::connect_local(addr, window_size).await?));
         let wal_sender = Arc::new(WalSender::new(client));
         let wal_sender_clone = wal_sender.clone();
         tokio::task::spawn_local(async move {
@@ -601,28 +650,52 @@ impl BatchedComputeNode {
             .fetch_add(items.len(), Ordering::Relaxed);
 
         let mut modified_pages: HashMap<PageId, Page> = HashMap::new();
+        let mut pages_to_fetch: HashSet<PageId> = HashSet::new();
+        let mut slot_refs: Vec<Option<PageSlotRef>> = Vec::with_capacity(items.len());
 
-        for (key, value) in items {
+        for (key, _) in items {
+            let old_slot = self.tree.lock().unwrap().get(key.as_bytes());
+            if let Some(slot_ref) = old_slot {
+                if !modified_pages.contains_key(&slot_ref.page_id) {
+                    let in_cache = self.page_cache.read().unwrap().contains_key(&slot_ref.page_id);
+                    if !in_cache {
+                        pages_to_fetch.insert(slot_ref.page_id);
+                    }
+                }
+                slot_refs.push(Some(slot_ref.clone()));
+            } else {
+                slot_refs.push(None);
+            }
+        }
+
+        if !pages_to_fetch.is_empty() {
+            let fetches = pages_to_fetch
+                .iter()
+                .map(|page_id| self.fetch_page(*page_id))
+                .collect::<Vec<_>>();
+            let fetched_pages = try_join_all(fetches).await?;
+            for (page_id, page) in pages_to_fetch.iter().copied().zip(fetched_pages.into_iter()) {
+                if let Some(page) = page {
+                    modified_pages.insert(page_id, page);
+                }
+            }
+        }
+
+        for (idx, (key, value)) in items.iter().enumerate() {
             let key = key.clone();
             let payload_len = payload_len(key.as_bytes(), value)?;
             let required = payload_len + SLOT_ENTRY_SIZE;
 
-            let old_slot = self.tree.lock().unwrap().get(key.as_bytes());
-            if let Some(slot_ref) = old_slot {
+            if let Some(slot_ref) = slot_refs[idx].as_ref() {
                 let page = if let Some(page) = modified_pages.get(&slot_ref.page_id) {
                     page.clone()
                 } else {
-                    let cached_page = {
-                        self.page_cache
-                            .read()
-                            .unwrap()
-                            .get(&slot_ref.page_id)
-                            .cloned()
-                    };
-                    match cached_page {
-                        Some(page) => page,
-                        None => self.fetch_page(slot_ref.page_id).await?.unwrap_or_else(new_page),
-                    }
+                    self.page_cache
+                        .read()
+                        .unwrap()
+                        .get(&slot_ref.page_id)
+                        .cloned()
+                        .unwrap_or_else(new_page)
                 };
 
                 let mut page = page;
@@ -841,6 +914,7 @@ impl FreeSpaceMap {
 pub struct ComputeNode {
     tree: Mutex<PageBPlusTree<SharedPageProvider>>,
     page_cache: Arc<RwLock<HashMap<PageId, Page>>>,
+    #[allow(dead_code)]
     next_page_id: Arc<AtomicU64>,
     fsm: Mutex<FreeSpaceMap>,
     cache_hits: AtomicUsize,
@@ -899,9 +973,55 @@ impl ComputeNode {
         })
     }
 
+    pub async fn with_storage_local(addr: &str) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect_local(addr).await?);
+        let storage = StorageClientPool::connect_local(addr, 1).await?;
+        let wal_sender = Arc::new(WalSender::new(client));
+        let wal_sender_clone = wal_sender.clone();
+        tokio::task::spawn_local(async move {
+            wal_sender_clone.run().await;
+        });
+        let (tree, page_cache, next_page_id) = create_shared_tree();
+        Ok(Self {
+            tree,
+            page_cache,
+            next_page_id: next_page_id.clone(),
+            fsm: Mutex::new(FreeSpaceMap::new(next_page_id)),
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            storage: Some(storage),
+            batch_sender: None,
+            wal_sender: Some(wal_sender),
+        })
+    }
+
     pub async fn with_storage_workers(addr: &str, workers: usize, local: &LocalSet) -> Result<Self> {
         let client = Arc::new(StorageClient::connect(addr, local).await?);
         let storage = StorageClientPool::connect(addr, workers, local).await?;
+        let wal_sender = Arc::new(WalSender::new(client));
+        let wal_sender_clone = wal_sender.clone();
+        tokio::task::spawn_local(async move {
+            wal_sender_clone.run().await;
+        });
+        let (tree, page_cache, next_page_id) = create_shared_tree();
+        Ok(Self {
+            tree,
+            page_cache,
+            next_page_id: next_page_id.clone(),
+            fsm: Mutex::new(FreeSpaceMap::new(next_page_id)),
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            storage: Some(storage),
+            batch_sender: None,
+            wal_sender: Some(wal_sender),
+        })
+    }
+
+    pub async fn with_storage_workers_local(addr: &str, workers: usize) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect_local(addr).await?);
+        let storage = StorageClientPool::connect_local(addr, workers).await?;
         let wal_sender = Arc::new(WalSender::new(client));
         let wal_sender_clone = wal_sender.clone();
         tokio::task::spawn_local(async move {
@@ -926,8 +1046,35 @@ impl ComputeNode {
         Self::with_storage_workers(addr, size, local).await
     }
 
+    pub async fn with_storage_pool_local(addr: &str, size: usize) -> Result<Self> {
+        Self::with_storage_workers_local(addr, size).await
+    }
+
     pub async fn with_storage_batched(addr: &str, window_size: usize, local: &LocalSet) -> Result<Self> {
         let client = Arc::new(StorageClient::connect(addr, local).await?);
+        let batch_sender = Arc::new(BatchSender::new(client.clone(), window_size));
+        let wal_sender = Arc::new(WalSender::new(client));
+        let wal_sender_clone = wal_sender.clone();
+        tokio::task::spawn_local(async move {
+            wal_sender_clone.run().await;
+        });
+        let (tree, page_cache, next_page_id) = create_shared_tree();
+        Ok(Self {
+            tree,
+            page_cache,
+            next_page_id: next_page_id.clone(),
+            fsm: Mutex::new(FreeSpaceMap::new(next_page_id)),
+            cache_hits: AtomicUsize::new(0),
+            cache_misses: AtomicUsize::new(0),
+            operations: AtomicUsize::new(0),
+            storage: None,
+            batch_sender: Some(batch_sender),
+            wal_sender: Some(wal_sender),
+        })
+    }
+
+    pub async fn with_storage_batched_local(addr: &str, window_size: usize) -> Result<Self> {
+        let client = Arc::new(StorageClient::connect_local(addr).await?);
         let batch_sender = Arc::new(BatchSender::new(client.clone(), window_size));
         let wal_sender = Arc::new(WalSender::new(client));
         let wal_sender_clone = wal_sender.clone();
@@ -1196,27 +1343,52 @@ impl ComputeNode {
 
         let mut modified_pages: HashMap<PageId, Page> = HashMap::new();
 
-        for (key, value) in items {
+        let mut pages_to_fetch: HashSet<PageId> = HashSet::new();
+        let mut slot_refs: Vec<Option<PageSlotRef>> = Vec::with_capacity(items.len());
+
+        for (key, _) in items {
+            let old_slot = self.tree.lock().unwrap().get(key.as_bytes());
+            if let Some(slot_ref) = old_slot {
+                if !modified_pages.contains_key(&slot_ref.page_id) {
+                    let in_cache = self.page_cache.read().unwrap().contains_key(&slot_ref.page_id);
+                    if !in_cache {
+                        pages_to_fetch.insert(slot_ref.page_id);
+                    }
+                }
+                slot_refs.push(Some(slot_ref.clone()));
+            } else {
+                slot_refs.push(None);
+            }
+        }
+
+        if !pages_to_fetch.is_empty() {
+            let fetches = pages_to_fetch
+                .iter()
+                .map(|page_id| self.fetch_page(*page_id))
+                .collect::<Vec<_>>();
+            let fetched_pages = try_join_all(fetches).await?;
+            for (page_id, page) in pages_to_fetch.iter().copied().zip(fetched_pages.into_iter()) {
+                if let Some(page) = page {
+                    modified_pages.insert(page_id, page);
+                }
+            }
+        }
+
+        for (idx, (key, value)) in items.iter().enumerate() {
             let key = key.clone();
             let payload_len = payload_len(key.as_bytes(), value)?;
             let required = payload_len + SLOT_ENTRY_SIZE;
 
-        let old_slot = self.tree.lock().unwrap().get(key.as_bytes());
-        if let Some(slot_ref) = old_slot {
+            if let Some(slot_ref) = slot_refs[idx].as_ref() {
                 let page = if let Some(page) = modified_pages.get(&slot_ref.page_id) {
                     page.clone()
                 } else {
-                    let cached_page = {
-                        self.page_cache
-                            .read()
-                            .unwrap()
-                            .get(&slot_ref.page_id)
-                            .cloned()
-                    };
-                    match cached_page {
-                        Some(page) => page,
-                        None => self.fetch_page(slot_ref.page_id).await?.unwrap_or_else(new_page),
-                    }
+                    self.page_cache
+                        .read()
+                        .unwrap()
+                        .get(&slot_ref.page_id)
+                        .cloned()
+                        .unwrap_or_else(new_page)
                 };
 
                 let mut page = page;
@@ -1224,8 +1396,8 @@ impl ComputeNode {
                 let free = page_free_space(&page);
                 self.fsm.lock().unwrap().update_page(slot_ref.page_id, free);
                 modified_pages.insert(slot_ref.page_id, page);
-            self.tree.lock().unwrap().remove(key.as_bytes())?;
-        }
+                self.tree.lock().unwrap().remove(key.as_bytes())?;
+            }
 
             let (mut page_id, is_new) = self.fsm.lock().unwrap().allocate(required);
             let mut page = if let Some(page) = modified_pages.get(&page_id) {
@@ -1258,22 +1430,10 @@ impl ComputeNode {
             let free = page_free_space(&page);
             self.fsm.lock().unwrap().update_page(page_id, free);
             modified_pages.insert(page_id, page);
-        self.tree
-            .lock()
-            .unwrap()
-            .insert(key.as_bytes().to_vec(), PageSlotRef { page_id, slot_id })?;
-
-        if let Some(wal_sender) = &self.wal_sender {
-            let lsn = wal_sender.next_lsn();
-            wal_sender.enqueue(crate::node::WalRecord {
-                lsn,
-                op: 1,
-                page_id,
-                slot_id,
-                key: key.as_bytes().to_vec(),
-                value: value.to_vec(),
-            });
-        }
+            self.tree
+                .lock()
+                .unwrap()
+                .insert(key.as_bytes().to_vec(), PageSlotRef { page_id, slot_id })?;
 
             if let Some(wal_sender) = &self.wal_sender {
                 let lsn = wal_sender.next_lsn();
@@ -1403,6 +1563,23 @@ impl StorageClient {
         let mut rpc_system = RpcSystem::new(Box::new(network), None);
         let client: storage::Client = rpc_system.bootstrap(Side::Server);
         let task = local.spawn_local(rpc_system.map(|_| ()));
+
+        Ok(Self {
+            client,
+            _task: task,
+        })
+    }
+
+    pub async fn connect_local(addr: &str) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
+        let (reader, writer) = stream.into_split();
+        let reader = reader.compat();
+        let writer = writer.compat_write();
+
+        let network = VatNetwork::new(reader, writer, Side::Client, Default::default());
+        let mut rpc_system = RpcSystem::new(Box::new(network), None);
+        let client: storage::Client = rpc_system.bootstrap(Side::Server);
+        let task = tokio::task::spawn_local(rpc_system.map(|_| ()));
 
         Ok(Self {
             client,

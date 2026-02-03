@@ -1,6 +1,6 @@
 use crate::page_store::PageStore;
 use crate::{Page, PageId, Result, Value, PAGE_SIZE};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,6 +22,7 @@ const WAL_STATE_TMP_FILE: &str = "wal_state.tmp";
 pub struct StorageNode {
     dir: PathBuf,
     page_store: Arc<PageStore>,
+    page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
     wal_sender: Mutex<Option<Sender<WalBatch>>>,
     wal_replay_rx: Mutex<Option<Receiver<WalBatch>>>,
 }
@@ -35,19 +36,27 @@ struct PageStoreReplay {
     page_store: Arc<PageStore>,
     dir: PathBuf,
     last_applied_lsn: std::sync::Mutex<u64>,
+    page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
 }
 
 impl PageStoreReplay {
-    fn new(page_store: Arc<PageStore>, dir: PathBuf, last_applied_lsn: u64) -> Self {
+    fn new(
+        page_store: Arc<PageStore>,
+        dir: PathBuf,
+        last_applied_lsn: u64,
+        page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
+    ) -> Self {
         Self {
             page_store,
             dir,
             last_applied_lsn: std::sync::Mutex::new(last_applied_lsn),
+            page_index,
         }
     }
 
     fn write_page(&self, page_id: PageId, page: &[u8], lsn: u64) -> Result<()> {
         self.page_store.put(page_id, page, lsn)?;
+        self.page_index.lock().unwrap().insert(page_id);
         Ok(())
     }
 
@@ -442,13 +451,14 @@ async fn replay_wal_segments_to_store(
     dir: &Path,
     page_store: Arc<PageStore>,
     last_applied_lsn: u64,
+    page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
 ) -> Result<()> {
     let mut segments = list_wal_segments(dir).await?;
     segments.sort_unstable();
     if segments.is_empty() {
         return Ok(());
     }
-    let replay = PageStoreReplay::new(page_store, dir.to_path_buf(), last_applied_lsn);
+    let replay = PageStoreReplay::new(page_store, dir.to_path_buf(), last_applied_lsn, page_index);
     for file_id in segments {
         let path = wal_segment_path(dir, file_id);
         let mut file = File::open(&path).await?;
@@ -631,17 +641,27 @@ impl StorageNode {
         });
         let last_applied_lsn = wal_state.last_applied_lsn.max(checkpoint_lsn);
 
-        let (wal_sender, wal_replay_rx) = start_wal_writer(dir.clone()).await?;
-
         let page_store = Arc::new(page_store);
+        let page_index = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        replay_wal_segments_to_store(
+            &dir,
+            Arc::clone(&page_store),
+            last_applied_lsn,
+            Arc::clone(&page_index),
+        )
+        .await?;
+        let rebuilt_index = build_page_index(&page_store).await;
+        *page_index.lock().unwrap() = rebuilt_index;
+
+        let (wal_sender, wal_replay_rx) = start_wal_writer(dir.clone()).await?;
         let node = Self {
             dir: dir.clone(),
             page_store: Arc::clone(&page_store),
+            page_index: Arc::clone(&page_index),
             wal_sender: Mutex::new(Some(wal_sender)),
             wal_replay_rx: Mutex::new(Some(wal_replay_rx)),
         };
 
-        replay_wal_segments_to_store(&dir, Arc::clone(&page_store), last_applied_lsn).await?;
         node.start_wal_replay(last_applied_lsn).await;
         Ok(node)
     }
@@ -669,6 +689,7 @@ impl StorageNode {
             Arc::clone(&self.page_store),
             self.dir.clone(),
             last_applied_lsn,
+            Arc::clone(&self.page_index),
         );
         tokio::spawn(async move {
             wal_replay_loop(replay, rx).await;
@@ -680,31 +701,40 @@ impl StorageNode {
     }
 
     pub fn len(&self) -> usize {
-        self.page_store.len()
+        self.page_index.lock().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.page_store.is_empty()
+        self.page_index.lock().unwrap().is_empty()
     }
 
     pub fn put(&self, key: PageId, value: &[u8]) {
         let _ = self.page_store.put_direct(key, value);
+        self.page_index.lock().unwrap().insert(key);
     }
 
     pub async fn get(&self, key: PageId) -> Option<Value> {
+        if !self.page_index.lock().unwrap().contains(&key) {
+            return None;
+        }
         self.page_store.get(key).await
     }
 
     pub fn delete(&self, key: PageId) {
-        self.page_store.delete(key);
+        let zero_page = vec![0u8; PAGE_SIZE];
+        let _ = self.page_store.put_direct(key, &zero_page);
+        self.page_index.lock().unwrap().remove(&key);
     }
 
     pub async fn contains(&self, key: PageId) -> bool {
+        if !self.page_index.lock().unwrap().contains(&key) {
+            return false;
+        }
         self.page_store.contains(key).await
     }
 
     pub fn keys(&self) -> Vec<PageId> {
-        self.page_store.keys()
+        self.page_index.lock().unwrap().iter().copied().collect()
     }
 
     pub async fn compact(&self) -> Result<()> {
@@ -763,6 +793,17 @@ impl StorageNode {
     pub fn page_store(&self) -> &Arc<PageStore> {
         &self.page_store
     }
+}
+
+async fn build_page_index(page_store: &Arc<PageStore>) -> HashSet<PageId> {
+    let mut index = HashSet::new();
+    let max_page_id = page_store.max_page_id();
+    for page_id in 0..=max_page_id {
+        if page_store.get(page_id).await.is_some() {
+            index.insert(page_id);
+        }
+    }
+    index
 }
 
 async fn read_wal_state(dir: &Path) -> Result<WalState> {
@@ -1012,7 +1053,12 @@ mod tests {
         write_header(&mut page, 0, PAGE_HEADER_SIZE as u16, PAGE_SIZE as u16);
         page_store.put_direct(10, &page).unwrap();
 
-        let replay = PageStoreReplay::new(Arc::clone(&page_store), dir.clone(), 0);
+        let replay = PageStoreReplay::new(
+            Arc::clone(&page_store),
+            dir.clone(),
+            0,
+            Arc::new(std::sync::Mutex::new(HashSet::new())),
+        );
         let records = vec![
             WalRecord {
                 lsn: 1,

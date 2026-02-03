@@ -14,9 +14,9 @@
 - **Crash Recovery**: WAL replay with checkpointing
 - **Testing**: Unit, integration, and benchmark tests
 
-### 🔄 **PARTIALLY IMPLEMENTED / NEEDS OPTIMIZATION**
-- **Sliding Window Batching**: Basic implementation exists
-- **Runtime Compatibility**: `spawn_local` usage in multi-thread runtime
+### ✅ **RECENTLY COMPLETED OPTIMIZATIONS**
+- **Sliding Window Batching**: ✅ Enhanced with adaptive window sizing and congestion control
+- **Runtime Compatibility**: ✅ Fixed `spawn_local` usage in multi-thread runtime
 
 ### 🔴 **NOT IMPLEMENTED / FUTURE WORK**
 - **Distributed Transactions**: Multi-key atomic operations
@@ -355,13 +355,20 @@ cargo bench  # ✅ All benchmarks executable
 | **B+Tree missing leaf linked list** | ✅ Fixed | `04980c5` | Added sibling pointers |
 | **Async I/O within lock** | ✅ Fixed | `287933b` | Release lock before async ops |
 
-### 7.2 Open Issues (TODO)
+### 7.2 Recently Fixed Issues
 
 | Issue | Location | Severity | Status | Notes |
 |-------|----------|----------|--------|-------|
-| **spawn_local compatibility** | `server.rs:196` | 🟡 Medium | 🔴 **Not Fixed** | Mixed runtime usage (`spawn_local` in multi-thread runtime) |
-| **Batch operations not concurrent** | `client.rs:387` | 🟡 Medium | 🔴 **Not Fixed** | Could use `join_all` for better parallelism |
+| **spawn_local compatibility** | `server.rs:196` | 🟡 Medium | ✅ **Fixed** | Replaced `spawn_local` with `spawn` for multi-thread runtime compatibility |
+| **Sliding Window Optimization** | `src/client.rs` | 🟡 Medium | ✅ **Enhanced** | Added adaptive window sizing with congestion control |
 | **Synchronous Cap'n RPC use** | `client.rs:287` | 🟡 Medium | 🟡 **Partially Fixed** | Has sliding window but still synchronous in some paths |
+
+### 7.3 Remaining Open Issues
+
+| Issue | Location | Severity | Status | Notes |
+|-------|----------|----------|--------|-------|
+| **Batch operations not concurrent** | `client.rs:387` | 🟡 Medium | 🔴 **Not Fixed** | Could use `join_all` for better parallelism |
+| **ComputeNode constructors require LocalSet** | `client.rs` | 🟢 Low | 🔴 **Not Fixed** | Backward compatibility concern, not critical |
 
 ---
 
@@ -417,12 +424,16 @@ cargo bench  # ✅ All benchmarks executable
    - **Benefit**: Fast client response times
    - **Implementation**: `src/node.rs` WAL system
 
-#### 🔄 **Partially Implemented / In Progress**
+#### ✅ **Recently Completed Optimizations**
 
-5. **Sliding Window Batching** 🔄 **PARTIALLY IMPLEMENTED**
-   - **Status**: Basic implementation exists, needs optimization
-   - **Current**: Window size fixed, could be dynamic
-   - **TODO**: Better congestion control, adaptive window sizing
+5. **Sliding Window Batching** ✅ **ENHANCED & OPTIMIZED**
+   - **Status**: Enhanced with adaptive window sizing and congestion control
+   - **Features**: 
+     - Dynamic window adjustment based on latency and success rate
+     - Exponential moving average for latency tracking
+     - Congestion control with backoff on failures
+     - Minimum window size protection
+   - **Implementation**: `src/client.rs` - `BatchSender` with `WindowStats`
 
 #### 🔴 **Not Yet Implemented / Future Work**
 

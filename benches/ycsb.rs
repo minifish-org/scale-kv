@@ -2,6 +2,8 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use rand::RngCore;
 use scale_kv::{ComputeNode, StorageServer};
 use sled::Config;
+use std::collections::HashSet;
+use std::time::Duration;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::env;
@@ -108,7 +110,78 @@ fn sled_enabled() -> bool {
     )
 }
 
+fn batch_put_enabled() -> bool {
+    !matches!(
+        env::var("SCALE_KV_SKIP_BATCH_PUT").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+fn bench_set() -> Option<String> {
+    env::var("SCALE_KV_BENCH_SET").ok().map(|v| v.to_lowercase())
+}
+
+fn bench_filter() -> Option<HashSet<String>> {
+    let raw = env::var("SCALE_KV_BENCH_FILTER").ok()?;
+    let mut set = HashSet::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if !trimmed.is_empty() {
+            set.insert(trimmed.to_string());
+        }
+    }
+    if set.is_empty() {
+        None
+    } else {
+        Some(set)
+    }
+}
+
+fn bench_allowed(name: &str, is_sled: bool) -> bool {
+    if let Some(set) = bench_set() {
+        if is_sled && set != "sled" && set != "both" {
+            return false;
+        }
+        if !is_sled && set != "scale_kv" && set != "both" {
+            return false;
+        }
+    }
+    if let Some(filter) = bench_filter() {
+        return filter.contains(name);
+    }
+    true
+}
+
+fn criterion_config() -> Criterion {
+    let mut criterion = Criterion::default();
+    if let Ok(value) = env::var("SCALE_KV_SAMPLE_SIZE") {
+        if let Ok(size) = value.parse::<usize>() {
+            if size > 0 {
+                criterion = criterion.sample_size(size);
+            }
+        }
+    }
+    if let Ok(value) = env::var("SCALE_KV_MEASUREMENT_SECS") {
+        if let Ok(secs) = value.parse::<f64>() {
+            if secs > 0.0 {
+                criterion = criterion.measurement_time(Duration::from_secs_f64(secs));
+            }
+        }
+    }
+    if let Ok(value) = env::var("SCALE_KV_WARMUP_SECS") {
+        if let Ok(secs) = value.parse::<f64>() {
+            if secs > 0.0 {
+                criterion = criterion.warm_up_time(Duration::from_secs_f64(secs));
+            }
+        }
+    }
+    criterion
+}
+
 fn bench_ycsb_a(c: &mut Criterion) {
+    if !bench_allowed("workload_a", false) {
+        return;
+    }
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
     let workers = rpc_workers();
@@ -141,6 +214,9 @@ fn bench_ycsb_a(c: &mut Criterion) {
 }
 
 fn bench_ycsb_b(c: &mut Criterion) {
+    if !bench_allowed("workload_b", false) {
+        return;
+    }
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
     let workers = rpc_workers();
@@ -174,6 +250,9 @@ fn bench_ycsb_b(c: &mut Criterion) {
 }
 
 fn bench_ycsb_c(c: &mut Criterion) {
+    if !bench_allowed("workload_c", false) {
+        return;
+    }
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
     let workers = rpc_workers();
@@ -198,6 +277,9 @@ fn bench_ycsb_c(c: &mut Criterion) {
 }
 
 fn bench_ycsb_d(c: &mut Criterion) {
+    if !bench_allowed("workload_d", false) {
+        return;
+    }
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
     let workers = rpc_workers();
@@ -221,6 +303,9 @@ fn bench_ycsb_d(c: &mut Criterion) {
 }
 
 fn bench_ycsb_e(c: &mut Criterion) {
+    if !bench_allowed("workload_e", false) {
+        return;
+    }
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
     let workers = rpc_workers();
@@ -246,6 +331,9 @@ fn bench_ycsb_e(c: &mut Criterion) {
 }
 
 fn bench_ycsb_f(c: &mut Criterion) {
+    if !bench_allowed("workload_f", false) {
+        return;
+    }
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
     let workers = rpc_workers();
@@ -272,6 +360,9 @@ fn bench_ycsb_f(c: &mut Criterion) {
 }
 
 fn bench_throughput_put(c: &mut Criterion) {
+    if !bench_allowed("throughput_put", false) {
+        return;
+    }
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
     let workers = rpc_workers();
@@ -294,6 +385,9 @@ fn bench_throughput_put(c: &mut Criterion) {
 }
 
 fn bench_throughput_get(c: &mut Criterion) {
+    if !bench_allowed("throughput_get", false) {
+        return;
+    }
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
     let workers = rpc_workers();
@@ -316,6 +410,12 @@ fn bench_throughput_get(c: &mut Criterion) {
 
 
 fn bench_batch_put(c: &mut Criterion) {
+    if !bench_allowed("batch_put_16k", false) {
+        return;
+    }
+    if !batch_put_enabled() {
+        return;
+    }
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let local = LocalSet::new();
     let workers = rpc_workers();
@@ -389,6 +489,9 @@ fn bench_sled_workload_a(c: &mut Criterion) {
     if !sled_enabled() {
         return;
     }
+    if !bench_allowed("workload_a", true) {
+        return;
+    }
     let db = setup_sled();
     let mut group = c.benchmark_group("sled_local");
     group.bench_function("workload_a", |b| {
@@ -415,6 +518,9 @@ fn bench_sled_workload_a(c: &mut Criterion) {
 
 fn bench_sled_workload_b(c: &mut Criterion) {
     if !sled_enabled() {
+        return;
+    }
+    if !bench_allowed("workload_b", true) {
         return;
     }
     let db = setup_sled();
@@ -446,6 +552,9 @@ fn bench_sled_workload_c(c: &mut Criterion) {
     if !sled_enabled() {
         return;
     }
+    if !bench_allowed("workload_c", true) {
+        return;
+    }
     let db = setup_sled();
     let mut group = c.benchmark_group("sled_local");
     group.bench_function("workload_c", |b| {
@@ -464,6 +573,9 @@ fn bench_sled_workload_c(c: &mut Criterion) {
 
 fn bench_sled_workload_d(c: &mut Criterion) {
     if !sled_enabled() {
+        return;
+    }
+    if !bench_allowed("workload_d", true) {
         return;
     }
     let db = setup_sled();
@@ -485,6 +597,9 @@ fn bench_sled_workload_e(c: &mut Criterion) {
     if !sled_enabled() {
         return;
     }
+    if !bench_allowed("workload_e", true) {
+        return;
+    }
     let db = setup_sled();
     let mut group = c.benchmark_group("sled_local");
     group.bench_function("workload_e", |b| {
@@ -504,6 +619,9 @@ fn bench_sled_workload_e(c: &mut Criterion) {
 
 fn bench_sled_workload_f(c: &mut Criterion) {
     if !sled_enabled() {
+        return;
+    }
+    if !bench_allowed("workload_f", true) {
         return;
     }
     let db = setup_sled();
@@ -528,6 +646,9 @@ fn bench_sled_throughput_put(c: &mut Criterion) {
     if !sled_enabled() {
         return;
     }
+    if !bench_allowed("throughput_put", true) {
+        return;
+    }
     let dir = tempfile::TempDir::new().unwrap();
     let db = Config::new().path(dir.path()).open().unwrap();
     let mut group = c.benchmark_group("sled_local");
@@ -547,6 +668,9 @@ fn bench_sled_throughput_get(c: &mut Criterion) {
     if !sled_enabled() {
         return;
     }
+    if !bench_allowed("throughput_get", true) {
+        return;
+    }
     let db = setup_sled();
     let mut group = c.benchmark_group("sled_local");
     group.bench_function("throughput_get", |b| {
@@ -562,6 +686,12 @@ fn bench_sled_throughput_get(c: &mut Criterion) {
 
 fn bench_sled_batch_put(c: &mut Criterion) {
     if !sled_enabled() {
+        return;
+    }
+    if !bench_allowed("batch_put_16k", true) {
+        return;
+    }
+    if !batch_put_enabled() {
         return;
     }
     let dir = tempfile::TempDir::new().unwrap();
@@ -582,7 +712,9 @@ fn bench_sled_batch_put(c: &mut Criterion) {
 }
 
 criterion_group!(
-    benches,
+    name = benches;
+    config = criterion_config();
+    targets =
     bench_ycsb_a,
     bench_ycsb_b,
     bench_ycsb_c,

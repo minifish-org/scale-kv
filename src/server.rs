@@ -193,7 +193,7 @@ impl StorageServer {
         let data = Arc::new(StorageNode::new().await);
 
         let data_clone = data.clone();
-        tokio::task::spawn_local(async move {
+        tokio::task::spawn(async move {
             loop {
                 let accept = listener.accept().await;
                 let (stream, _) = match accept {
@@ -201,8 +201,12 @@ impl StorageServer {
                     Err(_) => break,
                 };
                 let data = data_clone.clone();
-                tokio::task::spawn_local(async move {
-                    let _ = handle_connection(stream, data).await;
+                // Use spawn_blocking because RPC system is not Send
+                tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        let _ = handle_connection(stream, data).await;
+                    });
                 });
             }
         });
@@ -216,7 +220,7 @@ impl StorageServer {
         let data = Arc::new(StorageNode::open(dir).await?);
 
         let data_clone = data.clone();
-        tokio::task::spawn_local(async move {
+        tokio::task::spawn(async move {
             loop {
                 let accept = listener.accept().await;
                 let (stream, _) = match accept {
@@ -224,8 +228,12 @@ impl StorageServer {
                     Err(_) => break,
                 };
                 let data = data_clone.clone();
-                tokio::task::spawn_local(async move {
-                    let _ = handle_connection(stream, data).await;
+                // Use spawn_blocking because RPC system is not Send
+                tokio::task::spawn_blocking(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        let _ = handle_connection(stream, data).await;
+                    });
                 });
             }
         });
