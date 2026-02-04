@@ -110,3 +110,68 @@ fn test_recovery_from_wal() {
     assert_eq!(tx.get(&key(6)).unwrap(), Some(value(6)));
     assert_eq!(tx.get(&key(7)).unwrap(), Some(value(7)));
 }
+
+#[test]
+fn test_scan_basic_ordering() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let manager = TxnManager::open(&path).unwrap();
+
+    let mut tx = manager.begin_rw();
+    tx.put(&key(3), &value(3)).unwrap();
+    tx.put(&key(1), &value(1)).unwrap();
+    tx.put(&key(2), &value(2)).unwrap();
+    tx.commit().unwrap();
+
+    let tx_ro = manager.begin_ro();
+    let rows = tx_ro.scan(&key(1), &key(4), 10).unwrap();
+    let keys: Vec<u8> = rows.iter().map(|(k, _)| k[0]).collect();
+    assert_eq!(keys, vec![1, 2, 3]);
+}
+
+#[test]
+fn test_scan_respects_snapshot() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let manager = TxnManager::open(&path).unwrap();
+
+    let mut tx = manager.begin_rw();
+    tx.put(&key(1), &value(1)).unwrap();
+    tx.commit().unwrap();
+
+    let tx_ro = manager.begin_ro();
+
+    let mut tx2 = manager.begin_rw();
+    tx2.put(&key(1), &value(2)).unwrap();
+    tx2.put(&key(2), &value(2)).unwrap();
+    tx2.commit().unwrap();
+
+    let rows = tx_ro.scan(&key(1), &key(3), 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0[0], 1);
+    assert_eq!(rows[0].1, value(1));
+}
+
+#[test]
+fn test_scan_overlays_writes_and_deletes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let manager = TxnManager::open(&path).unwrap();
+
+    let mut tx = manager.begin_rw();
+    tx.put(&key(1), &value(1)).unwrap();
+    tx.put(&key(2), &value(2)).unwrap();
+    tx.put(&key(3), &value(3)).unwrap();
+    tx.commit().unwrap();
+
+    let mut tx = manager.begin_rw();
+    tx.delete(&key(1)).unwrap();
+    tx.put(&key(2), &value(9)).unwrap();
+
+    let rows = tx.scan(&key(1), &key(4), 2).unwrap();
+    let keys: Vec<u8> = rows.iter().map(|(k, _)| k[0]).collect();
+    let values: Vec<u8> = rows.iter().map(|(_, v)| v[0]).collect();
+
+    assert_eq!(keys, vec![2, 3]);
+    assert_eq!(values, vec![9, 3]);
+}

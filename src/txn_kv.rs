@@ -127,6 +127,55 @@ impl Txn {
         Ok(())
     }
 
+    pub fn scan(
+        &self,
+        start_inclusive: &[u8],
+        end_exclusive: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let start = parse_key(start_inclusive)?;
+        let end = parse_key(end_exclusive)?;
+        if start == end {
+            return Ok(Vec::new());
+        }
+
+        let mut merged: BTreeMap<Key, Value> = BTreeMap::new();
+        {
+            let store = self.inner.store.read().unwrap();
+            for (key, versions) in store.range(start..end) {
+                if let Some(value) = versions
+                    .iter()
+                    .rfind(|version| version.commit_ts <= self.read_ts)
+                    .and_then(|version| version.value.clone())
+                {
+                    merged.insert(*key, value);
+                }
+            }
+        }
+
+        for (key, value) in &self.write_set {
+            if *key >= start && *key < end {
+                match value {
+                    Some(value) => {
+                        merged.insert(*key, value.clone());
+                    }
+                    None => {
+                        merged.remove(key);
+                    }
+                }
+            }
+        }
+
+        Ok(merged
+            .into_iter()
+            .take(limit)
+            .map(|(key, value)| (key.to_vec(), value))
+            .collect())
+    }
+
     pub fn commit(self) -> Result<u64> {
         if self.read_only || self.write_set.is_empty() {
             return Ok(self.read_ts);
