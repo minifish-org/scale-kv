@@ -3,7 +3,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use crate::{KEY_SIZE, VALUE_SIZE, Value};
 
@@ -118,10 +120,40 @@ struct QuorumReplica {
     storage: Mutex<Option<LocalFileStorage>>,
 }
 
+#[derive(Clone, Debug)]
+enum QuorumOp {
+    Append { record: Arc<Vec<u8>> },
+    Snapshot {
+        commit_ts: u64,
+        store: Arc<BTreeMap<Key, Vec<Version>>>,
+    },
+    Truncate,
+}
+
+impl QuorumOp {
+    fn apply(&self, storage: &LocalFileStorage) -> Result<()> {
+        match self {
+            QuorumOp::Append { record } => storage.append_wal_record(record.as_slice()),
+            QuorumOp::Snapshot { commit_ts, store } => {
+                storage.write_snapshot(*commit_ts, store)
+            }
+            QuorumOp::Truncate => storage.truncate_wal(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RepairTask {
+    replica_index: usize,
+    op: QuorumOp,
+    attempt: u32,
+}
+
 #[derive(Debug)]
 pub struct QuorumStorage {
-    replicas: Vec<QuorumReplica>,
+    replicas: Arc<Vec<QuorumReplica>>,
     quorum: usize,
+    repair_tx: mpsc::Sender<RepairTask>,
 }
 
 impl QuorumStorage {
@@ -138,43 +170,97 @@ impl QuorumStorage {
                 wal_path: path.join("wal.log"),
                 storage: Mutex::new(None),
             })
-            .collect();
-        Ok(Self { replicas, quorum })
+            .collect::<Vec<_>>();
+        let replicas = Arc::new(replicas);
+        let (repair_tx, repair_rx) = mpsc::channel();
+        let worker_replicas = Arc::clone(&replicas);
+        std::thread::spawn(move || repair_worker(worker_replicas, repair_rx));
+        Ok(Self {
+            replicas,
+            quorum,
+            repair_tx,
+        })
     }
 
-    fn with_replica<F, T>(&self, replica: &QuorumReplica, f: F) -> Result<T>
+    fn with_replica<F, T>(&self, index: usize, f: F) -> Result<T>
     where
         F: FnOnce(&LocalFileStorage) -> Result<T>,
     {
-        let mut guard = replica.storage.lock().unwrap();
-        if guard.is_none() {
-            if let Some(parent) = replica.wal_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            *guard = Some(LocalFileStorage::open(&replica.wal_path)?);
-        }
-        f(guard.as_ref().unwrap())
+        with_replica(&self.replicas, index, f)
     }
 
-    fn quorum_write<F>(&self, f: F) -> Result<()>
-    where
-        F: Fn(&LocalFileStorage) -> Result<()>,
-    {
+    fn quorum_write(&self, op: QuorumOp) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        let replicas = Arc::clone(&self.replicas);
+        for index in 0..replicas.len() {
+            let tx = tx.clone();
+            let replicas = Arc::clone(&replicas);
+            let op = op.clone();
+            let repair_tx = self.repair_tx.clone();
+            std::thread::spawn(move || {
+                let result = with_replica(&replicas, index, |storage| op.apply(storage));
+                if result.is_err() {
+                    let _ = repair_tx.send(RepairTask {
+                        replica_index: index,
+                        op: op.clone(),
+                        attempt: 1,
+                    });
+                }
+                let _ = tx.send(result);
+            });
+        }
+        drop(tx);
         let mut successes = 0usize;
         let mut last_err: Option<TxnError> = None;
-        for replica in &self.replicas {
-            match self.with_replica(replica, |storage| f(storage)) {
-                Ok(()) => successes += 1,
+        for result in rx {
+            match result {
+                Ok(()) => {
+                    successes += 1;
+                    if successes >= self.quorum {
+                        return Ok(());
+                    }
+                }
                 Err(err) => last_err = Some(err),
             }
         }
-        if successes >= self.quorum {
-            Ok(())
-        } else {
-            Err(last_err.unwrap_or(TxnError::QuorumNotMet {
-                required: self.quorum,
-                succeeded: successes,
-            }))
+        Err(last_err.unwrap_or(TxnError::QuorumNotMet {
+            required: self.quorum,
+            succeeded: successes,
+        }))
+    }
+}
+
+fn with_replica<F, T>(replicas: &Arc<Vec<QuorumReplica>>, index: usize, f: F) -> Result<T>
+where
+    F: FnOnce(&LocalFileStorage) -> Result<T>,
+{
+    let replica = &replicas[index];
+    let mut guard = replica.storage.lock().unwrap();
+    if guard.is_none() {
+        if let Some(parent) = replica.wal_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        *guard = Some(LocalFileStorage::open(&replica.wal_path)?);
+    }
+    f(guard.as_ref().unwrap())
+}
+
+fn repair_worker(replicas: Arc<Vec<QuorumReplica>>, repair_rx: mpsc::Receiver<RepairTask>) {
+    const REPAIR_MAX_ATTEMPTS: u32 = 5;
+    const REPAIR_BASE_DELAY_MS: u64 = 50;
+    while let Ok(mut task) = repair_rx.recv() {
+        loop {
+            if with_replica(&replicas, task.replica_index, |storage| task.op.apply(storage))
+                .is_ok()
+            {
+                break;
+            }
+            if task.attempt >= REPAIR_MAX_ATTEMPTS {
+                break;
+            }
+            let backoff = REPAIR_BASE_DELAY_MS.saturating_mul(1u64 << (task.attempt - 1));
+            std::thread::sleep(Duration::from_millis(backoff));
+            task.attempt += 1;
         }
     }
 }
@@ -184,8 +270,8 @@ impl TxnStorage for QuorumStorage {
         let mut best: Option<(BTreeMap<Key, Vec<Version>>, u64)> = None;
         let mut saw_ok = false;
         let mut last_err: Option<TxnError> = None;
-        for replica in &self.replicas {
-            match self.with_replica(replica, |storage| storage.load_snapshot()) {
+        for index in 0..self.replicas.len() {
+            match self.with_replica(index, |storage| storage.load_snapshot()) {
                 Ok(snapshot) => {
                     saw_ok = true;
                     if let Some((store, ts)) = snapshot {
@@ -219,7 +305,11 @@ impl TxnStorage for QuorumStorage {
         commit_ts: u64,
         store: &BTreeMap<Key, Vec<Version>>,
     ) -> Result<()> {
-        self.quorum_write(|storage| storage.write_snapshot(commit_ts, store))
+        let op = QuorumOp::Snapshot {
+            commit_ts,
+            store: Arc::new(store.clone()),
+        };
+        self.quorum_write(op)
     }
 
     fn replay_wal(
@@ -231,8 +321,8 @@ impl TxnStorage for QuorumStorage {
         // then pick the replica that yields the highest max_ts.
         let mut best: Option<(BTreeMap<Key, Vec<Version>>, u64)> = None;
         let mut last_err: Option<TxnError> = None;
-        for replica in &self.replicas {
-            let result = self.with_replica(replica, |storage| {
+        for index in 0..self.replicas.len() {
+            let result = self.with_replica(index, |storage| {
                 let snapshot = storage.load_snapshot()?;
                 let (base_store, base_ts) = snapshot.unwrap_or_default();
                 storage.replay_wal(base_store, base_ts)
@@ -259,11 +349,14 @@ impl TxnStorage for QuorumStorage {
     }
 
     fn append_wal_record(&self, record: &[u8]) -> Result<()> {
-        self.quorum_write(|storage| storage.append_wal_record(record))
+        let op = QuorumOp::Append {
+            record: Arc::new(record.to_vec()),
+        };
+        self.quorum_write(op)
     }
 
     fn truncate_wal(&self) -> Result<()> {
-        self.quorum_write(|storage| storage.truncate_wal())
+        self.quorum_write(QuorumOp::Truncate)
     }
 }
 

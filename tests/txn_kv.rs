@@ -268,3 +268,36 @@ fn test_quorum_commit_fails_if_not_enough_replicas() {
     perms.set_mode(0o700);
     std::fs::set_permissions(bad_dir, perms).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn test_quorum_commit_succeeds_with_one_replica_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let mut replica_dirs: Vec<PathBuf> = Vec::new();
+    for i in 0..3 {
+        let path = dir.path().join(format!("replica_{i}"));
+        std::fs::create_dir_all(&path).unwrap();
+        replica_dirs.push(path);
+    }
+
+    let bad_dir = &replica_dirs[0];
+    let mut perms = std::fs::metadata(bad_dir).unwrap().permissions();
+    perms.set_mode(0o500);
+    std::fs::set_permissions(bad_dir, perms).unwrap();
+
+    let manager = TxnManager::open_quorum(replica_dirs.clone(), 2).unwrap();
+    let mut tx = manager.begin_rw();
+    tx.put(&key(7), &value(7)).unwrap();
+    tx.commit().unwrap();
+    drop(manager);
+
+    let manager = TxnManager::open_quorum(replica_dirs.clone(), 2).unwrap();
+    let tx = manager.begin_ro();
+    assert_eq!(tx.get(&key(7)).unwrap(), Some(value(7)));
+
+    let mut perms = std::fs::metadata(bad_dir).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(bad_dir, perms).unwrap();
+}
