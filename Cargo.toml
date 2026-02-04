@@ -8,6 +8,7 @@ build = "build.rs"
 [dependencies]
 capnp = "0.18"
 capnp-rpc = "0.18"
+crc32fast = "1"
 dashmap = "6"
 futures = "0.3"
 thiserror = "2"

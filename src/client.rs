@@ -1778,24 +1778,34 @@ mod tests {
     #[test]
     fn test_defragment_page_reclaims_space() {
         let mut page = new_page();
-        let key1 = vec![b'k'; KEY_SIZE];
-        let key2 = vec![b'z'; KEY_SIZE];
         let value = vec![b'x'; VALUE_SIZE];
+        let large_value = vec![b'y'; VALUE_SIZE];
 
-        let slot1 = insert_record(&mut page, &key1, &value).unwrap().unwrap();
-        let _slot2 = insert_record(&mut page, &key2, &value).unwrap().unwrap();
-        clear_slot(&mut page, slot1);
+        let mut slots = Vec::new();
+        let mut counter = 0u8;
+        loop {
+            let mut key = vec![0u8; KEY_SIZE];
+            key[0] = counter;
+            counter = counter.wrapping_add(1);
+            match insert_record(&mut page, &key, &value).unwrap() {
+                Some(slot_id) => slots.push((key, slot_id)),
+                None => break,
+            }
+        }
+        assert!(slots.len() >= 2);
+        let mid = slots.len() / 2;
+        let (deleted_key, deleted_slot) = slots[mid].clone();
+        clear_slot(&mut page, deleted_slot);
 
         let (_slots_before, free_start_before, free_end_before) = read_header(&page);
         let free_bytes_before = free_end_before.saturating_sub(free_start_before) as usize;
 
-        let large_value = vec![b'y'; VALUE_SIZE];
-        let needed = payload_len(&key1, &large_value).unwrap();
+        let needed = payload_len(&deleted_key, &large_value).unwrap();
         assert!(free_bytes_before < needed);
 
-        let slot3 = insert_record(&mut page, &key1, &large_value)
+        let slot3 = insert_record(&mut page, &deleted_key, &large_value)
             .unwrap()
             .unwrap();
-        assert!(read_value(&page, slot3, &key1).is_some());
+        assert!(read_value(&page, slot3, &deleted_key).is_some());
     }
 }

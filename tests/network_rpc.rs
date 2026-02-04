@@ -7,6 +7,10 @@ use scale_kv::{StorageClient, StorageServer, PAGE_SIZE};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+fn tcp_bind_allowed() -> bool {
+    std::net::TcpListener::bind("127.0.0.1:0").is_ok()
+}
+
 fn temp_dir() -> PathBuf {
     let mut dir = std::env::temp_dir();
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -21,6 +25,9 @@ fn cleanup_dir(dir: &PathBuf) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_rpc_put_get_delete_roundtrip() {
+    if !tcp_bind_allowed() {
+        return;
+    }
     let dir = temp_dir();
     let local = tokio::task::LocalSet::new();
     local

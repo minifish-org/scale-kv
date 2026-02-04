@@ -30,3 +30,6 @@ pub mod server;
 pub use server::StorageServer;
 
 pub mod storage_capnp;
+
+pub mod txn_kv;
+pub use txn_kv::{Txn, TxnError, TxnManager};
