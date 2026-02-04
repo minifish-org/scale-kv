@@ -122,26 +122,26 @@ Scale-KV is a distributed key-value store with compute-store separation architec
 
 ### 3.1 B+Tree Index
 
-**Location**: `src/bptree.rs`
+**Location**: `src/page_bptree.rs`
 
 ```rust
 // Current implementation features:
-// - In-memory B+tree with leaf node linked lists
-// - MAX_KEYS = 256 (dynamically adjusted based on page size)
-// - Concurrent reads with RwLock
+// - Page-based B+Tree stored in PageCache via PageProvider
+// - Root/leaf/internal nodes are pages in memory (not persisted to storage)
+// - Concurrent reads with RwLock around the tree
 // - Serial writes for consistency
 ```
 
 **Key Structures**:
 ```rust
-pub struct BPTree<K, V> {
-    root: Arc<RwLock<Node<K>>>,
-    // ... other fields
+pub struct PageBPlusTree<P: PageProvider> {
+    provider: P, // SharedPageProvider -> PageCache
+    len: usize,
 }
 
-enum Node<K> {
-    Internal { keys: Vec<K>, children: Vec<Arc<RwLock<Node<K>>>> },
-    Leaf { keys: Vec<K>, next: Option<*mut Node<K>> },  // Linked list for range scans
+pub struct SharedPageProvider {
+    pages: Arc<PageCache>,
+    // root page id is tracked here
 }
 ```
 
@@ -173,6 +173,164 @@ Each page (16KB) can hold multiple key-value pairs using slotted page format:
 **Page Cache**: `HashMap<PageId, Page>` with RwLock synchronization
 **Free Space Management**: Bucketed free lists for page allocation
 **Defragmentation**: Automatic when in-page fragmentation exceeds threshold
+
+### 3.4 Read & Write Flow (Current)
+
+**Read (detailed, ASCII)**:
+```
+READ (detailed: data page + cache + locks)
+
+[Client get(key)]
+        |
+        v
++----------------------+
+| ComputeNode.get()    |
++----------------------+
+        |
+        v
++----------------------+
+| validate_key_len     |
++----------------------+
+        |
+        v
++------------------------------+
+| tree.read() (RwLock)         |
++------------------------------+
+        |
+        v
++------------------------------+
+| PageBPlusTree.get(key)       |
++------------------------------+
+        |
+        v
++------------------------------+
+| provider.root_page_id()      |
++------------------------------+
+        |
+        v
++-----------------------------------------+
+| provider.read_page(root_id)             |
+| -> PageCache.get(root_id)               |
+|    -> shard = page_id % shards          |
+|    -> shard.read() (RwLock)             |
++-----------------------------------------+
+        |
+        v
++-----------------------------------------+
+| B+Tree page: binary search on keys      |
+| -> pick child_id / leaf slot            |
++-----------------------------------------+
+        |
+        v
++-----------------------------------------+
+| provider.read_page(child_id) ... repeat |
++-----------------------------------------+
+        |
+        v
++------------------------+        +----------------------+
+| (page_id, slot_id)     |------->| PageCache.get(page)  |
++------------------------+        | -> shard.read() lock |
+                                  +----------------------+
+                                           |
+                                           v
+                              +---------------------------+
+                              | read_value(page, slot)    |
+                              | - slot directory lookup   |
+                              | - fixed-length decode     |
+                              |   (KEY_SIZE/VALUE_SIZE)   |
+                              +---------------------------+
+                                           |
+                                           v
+                                      [Return value]
+```
+
+**Write (detailed, ASCII)**:
+```
+WRITE (detailed: data page + cache + locks + WAL)
+
+[Client put(key, value)]
+        |
+        v
++----------------------+
+| ComputeNode.put()    |
++----------------------+
+        |
+        v
++----------------------+
+| validate_key_len     |
+| payload_len check    |
++----------------------+
+        |
+        v
++------------------------------+
+| tree.read() (RwLock)         |
+| lookup old slot (if exists)  |
++------------------------------+
+        |
+        v
++------------------------------+
+| PageCache.get(old_page)      |
+| -> shard.read() lock         |
++------------------------------+
+        |
+        v
++------------------------------+
+| clear_slot + update FSM      |
++------------------------------+
+        |
+        v
++------------------------------+
+| FSM.allocate(required)       |
++------------------------------+
+        |
+        v
++------------------------------+
+| PageCache.get(page_id)       |
+| -> shard.read() lock         |
++------------------------------+
+        |
+        v
++------------------------------+
+| insert_record(page)          |
+| - fixed-length record write  |
+| - slot directory update      |
++------------------------------+
+        |
+        v
++------------------------------+
+| PageCache.insert(page_id)    |
+| -> shard.write() lock        |
++------------------------------+
+        |
+        v
++------------------------------+
+| tree.write() (RwLock)        |
+| update B+Tree pages in cache |
++------------------------------+
+        |
+        v
+     [Return OK]
+        |
+        | (async WAL)
+        v
++------------------------------+
+| WalSender.enqueue(record)    |
+| pending queue (Mutex)        |
++------------------------------+
+        |
+        v
++------------------------------+
+| background batching to 256KB |
++------------------------------+
+        |
+        v
++------------------------------+
+| append_wal(batch) RPC        |
++------------------------------+
+        |
+        v
+  [ack -> notify waiters]
+```
 
 ---
 
