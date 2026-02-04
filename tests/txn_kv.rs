@@ -112,6 +112,45 @@ fn test_recovery_from_wal() {
 }
 
 #[test]
+fn test_checkpoint_and_recovery() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    {
+        let manager = TxnManager::open(&path).unwrap();
+        let mut tx = manager.begin_rw();
+        tx.put(&key(10), &value(10)).unwrap();
+        tx.put(&key(11), &value(11)).unwrap();
+        tx.commit().unwrap();
+        manager.checkpoint().unwrap();
+    }
+
+    let manager = TxnManager::open(&path).unwrap();
+    let tx = manager.begin_ro();
+    assert_eq!(tx.get(&key(10)).unwrap(), Some(value(10)));
+    assert_eq!(tx.get(&key(11)).unwrap(), Some(value(11)));
+}
+
+#[test]
+fn test_wal_truncation_reduces_size() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal.log");
+    let manager = TxnManager::open(&path).unwrap();
+
+    let mut tx = manager.begin_rw();
+    tx.put(&key(20), &value(20)).unwrap();
+    tx.put(&key(21), &value(21)).unwrap();
+    tx.commit().unwrap();
+
+    let before = std::fs::metadata(&path).unwrap().len();
+    assert!(before > 0);
+
+    manager.checkpoint().unwrap();
+
+    let after = std::fs::metadata(&path).unwrap().len();
+    assert!(after < before);
+}
+
+#[test]
 fn test_scan_basic_ordering() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");

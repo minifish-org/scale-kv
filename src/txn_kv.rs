@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -9,6 +9,8 @@ use crate::{KEY_SIZE, VALUE_SIZE, Value};
 
 const WAL_MAGIC: u32 = 0x534B5657; // "SKVW"
 const WAL_HEADER_LEN: usize = 12; // magic + len + crc32
+const SNAPSHOT_MAGIC: u32 = 0x53534E50; // "SSNP"
+const SNAPSHOT_VERSION: u32 = 1;
 
 pub type Key = [u8; KEY_SIZE];
 
@@ -40,6 +42,7 @@ struct TxnManagerInner {
     commit_ts: AtomicU64,
     commit_lock: Mutex<()>,
     wal: Mutex<File>,
+    wal_path: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -57,13 +60,15 @@ pub struct Txn {
 
 impl TxnManager {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        let path = path.as_ref().to_path_buf();
+        let snapshot = load_snapshot(&snapshot_path(&path))?;
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(path)?;
-        let (store, max_ts, valid_len) = replay_wal(&mut file)?;
+            .open(&path)?;
+        let (base_store, base_ts) = snapshot.unwrap_or_default();
+        let (store, max_ts, valid_len) = replay_wal_with_base(&mut file, base_store, base_ts)?;
         let file_len = file.metadata()?.len();
         if valid_len < file_len {
             file.set_len(valid_len)?;
@@ -75,8 +80,22 @@ impl TxnManager {
                 commit_ts: AtomicU64::new(max_ts),
                 commit_lock: Mutex::new(()),
                 wal: Mutex::new(file),
+                wal_path: path,
             }),
         })
+    }
+
+    pub fn checkpoint(&self) -> Result<()> {
+        let _guard = self.inner.commit_lock.lock().unwrap();
+        let commit_ts = self.inner.commit_ts.load(Ordering::SeqCst);
+        let store = self.inner.store.read().unwrap();
+        write_snapshot(&snapshot_path(&self.inner.wal_path), commit_ts, &store)?;
+
+        let mut wal = self.inner.wal.lock().unwrap();
+        wal.set_len(0)?;
+        wal.seek(SeekFrom::Start(0))?;
+        wal.sync_all()?;
+        Ok(())
     }
 
     pub fn begin_ro(&self) -> Txn {
@@ -270,13 +289,16 @@ fn encode_payload(commit_ts: u64, writes: &HashMap<Key, Option<Value>>) -> Resul
     Ok(buf)
 }
 
-fn replay_wal(file: &mut File) -> Result<(BTreeMap<Key, Vec<Version>>, u64, u64)> {
+fn replay_wal_with_base(
+    file: &mut File,
+    mut store: BTreeMap<Key, Vec<Version>>,
+    base_ts: u64,
+) -> Result<(BTreeMap<Key, Vec<Version>>, u64, u64)> {
     let mut data = Vec::new();
     file.seek(SeekFrom::Start(0))?;
     file.read_to_end(&mut data)?;
 
-    let mut store: BTreeMap<Key, Vec<Version>> = BTreeMap::new();
-    let mut max_ts = 0u64;
+    let mut max_ts = base_ts;
     let mut offset = 0usize;
     let mut last_good = 0usize;
 
@@ -301,20 +323,146 @@ fn replay_wal(file: &mut File) -> Result<(BTreeMap<Key, Vec<Version>>, u64, u64)
             Ok(value) => value,
             Err(_) => break,
         };
-        for (key, value) in ops {
-            store
-                .entry(key)
-                .or_default()
-                .push(Version { commit_ts, value });
-        }
-        if commit_ts > max_ts {
-            max_ts = commit_ts;
+        if commit_ts > base_ts {
+            for (key, value) in ops {
+                store
+                    .entry(key)
+                    .or_default()
+                    .push(Version { commit_ts, value });
+            }
+            if commit_ts > max_ts {
+                max_ts = commit_ts;
+            }
         }
         offset = payload_end;
         last_good = offset;
     }
 
     Ok((store, max_ts, last_good as u64))
+}
+
+fn snapshot_path(wal_path: &Path) -> PathBuf {
+    let mut os = wal_path.as_os_str().to_os_string();
+    os.push(".snapshot");
+    PathBuf::from(os)
+}
+
+fn load_snapshot(path: &Path) -> Result<Option<(BTreeMap<Key, Vec<Version>>, u64)>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut file = File::open(path)?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+    if data.len() < 4 + 4 + 8 + 4 {
+        return Err(TxnError::CorruptWal("snapshot too short".to_string()));
+    }
+    let mut cursor = 0usize;
+    let magic = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+    cursor += 4;
+    if magic != SNAPSHOT_MAGIC {
+        return Err(TxnError::CorruptWal("invalid snapshot magic".to_string()));
+    }
+    let version = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+    cursor += 4;
+    if version != SNAPSHOT_VERSION {
+        return Err(TxnError::CorruptWal(
+            "unsupported snapshot version".to_string(),
+        ));
+    }
+    let commit_ts = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+    cursor += 8;
+    let num_entries = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+    cursor += 4;
+
+    let mut store: BTreeMap<Key, Vec<Version>> = BTreeMap::new();
+    for _ in 0..num_entries {
+        if cursor + KEY_SIZE + 4 > data.len() {
+            return Err(TxnError::CorruptWal("snapshot truncated".to_string()));
+        }
+        let mut key = [0u8; KEY_SIZE];
+        key.copy_from_slice(&data[cursor..cursor + KEY_SIZE]);
+        cursor += KEY_SIZE;
+        let len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4;
+        if len > VALUE_SIZE {
+            return Err(TxnError::InvalidValueSize(len, VALUE_SIZE));
+        }
+        if cursor + len > data.len() {
+            return Err(TxnError::CorruptWal("snapshot truncated".to_string()));
+        }
+        let value = data[cursor..cursor + len].to_vec();
+        cursor += len;
+        store
+            .entry(key)
+            .or_default()
+            .push(Version {
+                commit_ts,
+                value: Some(value),
+            });
+    }
+
+    if cursor != data.len() {
+        return Err(TxnError::CorruptWal(
+            "snapshot length mismatch".to_string(),
+        ));
+    }
+
+    Ok(Some((store, commit_ts)))
+}
+
+fn write_snapshot(
+    path: &Path,
+    commit_ts: u64,
+    store: &BTreeMap<Key, Vec<Version>>,
+) -> Result<()> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&SNAPSHOT_MAGIC.to_le_bytes());
+    buf.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+    buf.extend_from_slice(&commit_ts.to_le_bytes());
+
+    let mut entries = Vec::new();
+    for (key, versions) in store {
+        if let Some(version) = versions.last() {
+            if let Some(value) = &version.value {
+                entries.push((*key, value.as_slice()));
+            }
+        }
+    }
+
+    if entries.len() > u32::MAX as usize {
+        return Err(TxnError::CorruptWal("too many snapshot entries".to_string()));
+    }
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+
+    // Snapshot stores only the latest committed value per key. This is safe because
+    // after recovery all new transactions begin after the snapshot commit_ts.
+    for (key, value) in entries {
+        if value.len() > VALUE_SIZE {
+            return Err(TxnError::InvalidValueSize(value.len(), VALUE_SIZE));
+        }
+        buf.extend_from_slice(&key);
+        buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(value);
+    }
+
+    let tmp_path = path.with_extension("snapshot.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)?;
+        file.write_all(&buf)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 fn decode_payload(payload: &[u8]) -> Result<(u64, Vec<(Key, Option<Value>)>)> {
