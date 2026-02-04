@@ -30,8 +30,86 @@ pub enum TxnError {
 
 pub type Result<T> = std::result::Result<T, TxnError>;
 
+pub trait TxnStorage: Send + Sync + std::fmt::Debug {
+    fn load_snapshot(&self) -> Result<Option<(BTreeMap<Key, Vec<Version>>, u64)>>;
+    fn write_snapshot(&self, commit_ts: u64, store: &BTreeMap<Key, Vec<Version>>)
+        -> Result<()>;
+    fn replay_wal(
+        &self,
+        base_store: BTreeMap<Key, Vec<Version>>,
+        base_ts: u64,
+    ) -> Result<(BTreeMap<Key, Vec<Version>>, u64)>;
+    fn append_wal_record(&self, record: &[u8]) -> Result<()>;
+    fn truncate_wal(&self) -> Result<()>;
+}
+
+#[derive(Debug)]
+struct LocalFileStorage {
+    wal: Mutex<File>,
+    wal_path: PathBuf,
+}
+
+impl LocalFileStorage {
+    fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        Ok(Self {
+            wal: Mutex::new(file),
+            wal_path: path,
+        })
+    }
+}
+
+impl TxnStorage for LocalFileStorage {
+    fn load_snapshot(&self) -> Result<Option<(BTreeMap<Key, Vec<Version>>, u64)>> {
+        load_snapshot_file(&snapshot_path(&self.wal_path))
+    }
+
+    fn write_snapshot(
+        &self,
+        commit_ts: u64,
+        store: &BTreeMap<Key, Vec<Version>>,
+    ) -> Result<()> {
+        write_snapshot_file(&snapshot_path(&self.wal_path), commit_ts, store)
+    }
+
+    fn replay_wal(
+        &self,
+        base_store: BTreeMap<Key, Vec<Version>>,
+        base_ts: u64,
+    ) -> Result<(BTreeMap<Key, Vec<Version>>, u64)> {
+        let mut wal = self.wal.lock().unwrap();
+        let (store, max_ts, valid_len) = replay_wal_with_base(&mut wal, base_store, base_ts)?;
+        let file_len = wal.metadata()?.len();
+        if valid_len < file_len {
+            wal.set_len(valid_len)?;
+        }
+        wal.seek(SeekFrom::End(0))?;
+        Ok((store, max_ts))
+    }
+
+    fn append_wal_record(&self, record: &[u8]) -> Result<()> {
+        let mut wal = self.wal.lock().unwrap();
+        wal.write_all(record)?;
+        wal.sync_all()?;
+        Ok(())
+    }
+
+    fn truncate_wal(&self) -> Result<()> {
+        let mut wal = self.wal.lock().unwrap();
+        wal.set_len(0)?;
+        wal.seek(SeekFrom::Start(0))?;
+        wal.sync_all()?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
-struct Version {
+pub struct Version {
     commit_ts: u64,
     value: Option<Value>,
 }
@@ -41,8 +119,7 @@ struct TxnManagerInner {
     store: RwLock<BTreeMap<Key, Vec<Version>>>,
     commit_ts: AtomicU64,
     commit_lock: Mutex<()>,
-    wal: Mutex<File>,
-    wal_path: PathBuf,
+    storage: Arc<dyn TxnStorage>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,27 +137,20 @@ pub struct Txn {
 
 impl TxnManager {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let snapshot = load_snapshot(&snapshot_path(&path))?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
+        let storage = LocalFileStorage::open(path)?;
+        Self::open_with_storage(storage)
+    }
+
+    pub fn open_with_storage(storage: impl TxnStorage + Send + Sync + 'static) -> Result<Self> {
+        let snapshot = storage.load_snapshot()?;
         let (base_store, base_ts) = snapshot.unwrap_or_default();
-        let (store, max_ts, valid_len) = replay_wal_with_base(&mut file, base_store, base_ts)?;
-        let file_len = file.metadata()?.len();
-        if valid_len < file_len {
-            file.set_len(valid_len)?;
-        }
-        file.seek(SeekFrom::End(0))?;
+        let (store, max_ts) = storage.replay_wal(base_store, base_ts)?;
         Ok(Self {
             inner: Arc::new(TxnManagerInner {
                 store: RwLock::new(store),
                 commit_ts: AtomicU64::new(max_ts),
                 commit_lock: Mutex::new(()),
-                wal: Mutex::new(file),
-                wal_path: path,
+                storage: Arc::new(storage),
             }),
         })
     }
@@ -89,12 +159,8 @@ impl TxnManager {
         let _guard = self.inner.commit_lock.lock().unwrap();
         let commit_ts = self.inner.commit_ts.load(Ordering::SeqCst);
         let store = self.inner.store.read().unwrap();
-        write_snapshot(&snapshot_path(&self.inner.wal_path), commit_ts, &store)?;
-
-        let mut wal = self.inner.wal.lock().unwrap();
-        wal.set_len(0)?;
-        wal.seek(SeekFrom::Start(0))?;
-        wal.sync_all()?;
+        self.inner.storage.write_snapshot(commit_ts, &store)?;
+        self.inner.storage.truncate_wal()?;
         Ok(())
     }
 
@@ -222,11 +288,7 @@ impl Txn {
         record.extend_from_slice(&crc.to_le_bytes());
         record.extend_from_slice(&payload);
 
-        {
-            let mut wal = self.inner.wal.lock().unwrap();
-            wal.write_all(&record)?;
-            wal.sync_all()?;
-        }
+        self.inner.storage.append_wal_record(&record)?;
 
         {
             let mut store = self.inner.store.write().unwrap();
@@ -347,7 +409,7 @@ fn snapshot_path(wal_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-fn load_snapshot(path: &Path) -> Result<Option<(BTreeMap<Key, Vec<Version>>, u64)>> {
+fn load_snapshot_file(path: &Path) -> Result<Option<(BTreeMap<Key, Vec<Version>>, u64)>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -411,7 +473,7 @@ fn load_snapshot(path: &Path) -> Result<Option<(BTreeMap<Key, Vec<Version>>, u64
     Ok(Some((store, commit_ts)))
 }
 
-fn write_snapshot(
+fn write_snapshot_file(
     path: &Path,
     commit_ts: u64,
     store: &BTreeMap<Key, Vec<Version>>,
