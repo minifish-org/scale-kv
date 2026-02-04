@@ -26,6 +26,10 @@ pub enum TxnError {
     WriteWriteConflict,
     #[error("corrupt wal: {0}")]
     CorruptWal(String),
+    #[error("quorum not met: required {required}, succeeded {succeeded}")]
+    QuorumNotMet { required: usize, succeeded: usize },
+    #[error("invalid quorum {quorum} for {replicas} replicas")]
+    InvalidQuorum { quorum: usize, replicas: usize },
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;
@@ -108,6 +112,161 @@ impl TxnStorage for LocalFileStorage {
     }
 }
 
+#[derive(Debug)]
+struct QuorumReplica {
+    wal_path: PathBuf,
+    storage: Mutex<Option<LocalFileStorage>>,
+}
+
+#[derive(Debug)]
+pub struct QuorumStorage {
+    replicas: Vec<QuorumReplica>,
+    quorum: usize,
+}
+
+impl QuorumStorage {
+    pub fn open(paths: Vec<PathBuf>, quorum: usize) -> Result<Self> {
+        if quorum < 1 || quorum > paths.len() {
+            return Err(TxnError::InvalidQuorum {
+                quorum,
+                replicas: paths.len(),
+            });
+        }
+        let replicas = paths
+            .into_iter()
+            .map(|path| QuorumReplica {
+                wal_path: path.join("wal.log"),
+                storage: Mutex::new(None),
+            })
+            .collect();
+        Ok(Self { replicas, quorum })
+    }
+
+    fn with_replica<F, T>(&self, replica: &QuorumReplica, f: F) -> Result<T>
+    where
+        F: FnOnce(&LocalFileStorage) -> Result<T>,
+    {
+        let mut guard = replica.storage.lock().unwrap();
+        if guard.is_none() {
+            if let Some(parent) = replica.wal_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            *guard = Some(LocalFileStorage::open(&replica.wal_path)?);
+        }
+        f(guard.as_ref().unwrap())
+    }
+
+    fn quorum_write<F>(&self, f: F) -> Result<()>
+    where
+        F: Fn(&LocalFileStorage) -> Result<()>,
+    {
+        let mut successes = 0usize;
+        let mut last_err: Option<TxnError> = None;
+        for replica in &self.replicas {
+            match self.with_replica(replica, |storage| f(storage)) {
+                Ok(()) => successes += 1,
+                Err(err) => last_err = Some(err),
+            }
+        }
+        if successes >= self.quorum {
+            Ok(())
+        } else {
+            Err(last_err.unwrap_or(TxnError::QuorumNotMet {
+                required: self.quorum,
+                succeeded: successes,
+            }))
+        }
+    }
+}
+
+impl TxnStorage for QuorumStorage {
+    fn load_snapshot(&self) -> Result<Option<(BTreeMap<Key, Vec<Version>>, u64)>> {
+        let mut best: Option<(BTreeMap<Key, Vec<Version>>, u64)> = None;
+        let mut saw_ok = false;
+        let mut last_err: Option<TxnError> = None;
+        for replica in &self.replicas {
+            match self.with_replica(replica, |storage| storage.load_snapshot()) {
+                Ok(snapshot) => {
+                    saw_ok = true;
+                    if let Some((store, ts)) = snapshot {
+                        let replace = match &best {
+                            Some((_, best_ts)) => ts > *best_ts,
+                            None => true,
+                        };
+                        if replace {
+                            best = Some((store, ts));
+                        }
+                    }
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+        if best.is_some() {
+            return Ok(best);
+        }
+        if saw_ok {
+            Ok(None)
+        } else {
+            Err(last_err.unwrap_or(TxnError::QuorumNotMet {
+                required: self.quorum,
+                succeeded: 0,
+            }))
+        }
+    }
+
+    fn write_snapshot(
+        &self,
+        commit_ts: u64,
+        store: &BTreeMap<Key, Vec<Version>>,
+    ) -> Result<()> {
+        self.quorum_write(|storage| storage.write_snapshot(commit_ts, store))
+    }
+
+    fn replay_wal(
+        &self,
+        _base_store: BTreeMap<Key, Vec<Version>>,
+        _base_ts: u64,
+    ) -> Result<(BTreeMap<Key, Vec<Version>>, u64)> {
+        // Best-effort recovery: for each replica, replay WAL after its own snapshot,
+        // then pick the replica that yields the highest max_ts.
+        let mut best: Option<(BTreeMap<Key, Vec<Version>>, u64)> = None;
+        let mut last_err: Option<TxnError> = None;
+        for replica in &self.replicas {
+            let result = self.with_replica(replica, |storage| {
+                let snapshot = storage.load_snapshot()?;
+                let (base_store, base_ts) = snapshot.unwrap_or_default();
+                storage.replay_wal(base_store, base_ts)
+            });
+            match result {
+                Ok((store, max_ts)) => {
+                    let replace = match &best {
+                        Some((_, best_ts)) => max_ts > *best_ts,
+                        None => true,
+                    };
+                    if replace {
+                        best = Some((store, max_ts));
+                    }
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+        best.ok_or_else(|| {
+            last_err.unwrap_or(TxnError::QuorumNotMet {
+                required: self.quorum,
+                succeeded: 0,
+            })
+        })
+    }
+
+    fn append_wal_record(&self, record: &[u8]) -> Result<()> {
+        self.quorum_write(|storage| storage.append_wal_record(record))
+    }
+
+    fn truncate_wal(&self) -> Result<()> {
+        self.quorum_write(|storage| storage.truncate_wal())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Version {
     commit_ts: u64,
@@ -138,6 +297,11 @@ pub struct Txn {
 impl TxnManager {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let storage = LocalFileStorage::open(path)?;
+        Self::open_with_storage(storage)
+    }
+
+    pub fn open_quorum(replica_paths: Vec<PathBuf>, quorum: usize) -> Result<Self> {
+        let storage = QuorumStorage::open(replica_paths, quorum)?;
         Self::open_with_storage(storage)
     }
 

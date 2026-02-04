@@ -1,5 +1,8 @@
 use tempfile::tempdir;
 
+#[cfg(unix)]
+use std::path::PathBuf;
+
 use scale_kv::txn_kv::{TxnError, TxnManager};
 use scale_kv::{KEY_SIZE, VALUE_SIZE};
 
@@ -213,4 +216,55 @@ fn test_scan_overlays_writes_and_deletes() {
 
     assert_eq!(keys, vec![2, 3]);
     assert_eq!(values, vec![9, 3]);
+}
+
+#[test]
+fn test_quorum_commit_survives_one_replica_down() {
+    let dir = tempdir().unwrap();
+    let mut replica_dirs = Vec::new();
+    for i in 0..3 {
+        let path = dir.path().join(format!("replica_{i}"));
+        std::fs::create_dir_all(&path).unwrap();
+        replica_dirs.push(path);
+    }
+
+    let manager = TxnManager::open_quorum(replica_dirs.clone(), 2).unwrap();
+    let mut tx = manager.begin_rw();
+    tx.put(&key(42), &value(42)).unwrap();
+    tx.commit().unwrap();
+    drop(manager);
+
+    std::fs::remove_dir_all(&replica_dirs[0]).unwrap();
+
+    let manager = TxnManager::open_quorum(replica_dirs, 2).unwrap();
+    let tx = manager.begin_ro();
+    assert_eq!(tx.get(&key(42)).unwrap(), Some(value(42)));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_quorum_commit_fails_if_not_enough_replicas() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let mut replica_dirs: Vec<PathBuf> = Vec::new();
+    for i in 0..3 {
+        let path = dir.path().join(format!("replica_{i}"));
+        std::fs::create_dir_all(&path).unwrap();
+        replica_dirs.push(path);
+    }
+
+    let bad_dir = &replica_dirs[0];
+    let mut perms = std::fs::metadata(bad_dir).unwrap().permissions();
+    perms.set_mode(0o500);
+    std::fs::set_permissions(bad_dir, perms).unwrap();
+
+    let manager = TxnManager::open_quorum(replica_dirs.clone(), 3).unwrap();
+    let mut tx = manager.begin_rw();
+    tx.put(&key(9), &value(9)).unwrap();
+    assert!(tx.commit().is_err());
+
+    let mut perms = std::fs::metadata(bad_dir).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(bad_dir, perms).unwrap();
 }
