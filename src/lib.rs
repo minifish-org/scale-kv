@@ -31,5 +31,8 @@ pub use server::StorageServer;
 
 pub mod storage_capnp;
 
+pub mod quorum_client;
+pub use quorum_client::StorageQuorumClient;
+
 pub mod txn_kv;
 pub use txn_kv::{Txn, TxnError, TxnManager};

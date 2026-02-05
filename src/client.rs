@@ -1474,6 +1474,8 @@ pub struct StorageClient {
     _task: tokio::task::JoinHandle<()>,
 }
 
+// (moved to quorum_client.rs)
+
 impl StorageClient {
     pub async fn connect(addr: &str, local: &LocalSet) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
