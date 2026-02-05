@@ -166,8 +166,10 @@ impl WalSender {
         let bytes = *buffer_bytes;
         *buffer_bytes = 0;
         let start_lsn = records.first().map(|r| r.lsn).unwrap_or(0);
-        let end_lsn = records.last().map(|r| r.lsn).unwrap_or(0);
+        // legacy: best-effort; treat end_lsn as right boundary
+        let end_lsn = records.last().map(|r| r.lsn + 1).unwrap_or(0);
         let batch = crate::node::WalBatch {
+            request_id: 0,
             start_lsn,
             end_lsn,
             records,
@@ -1553,6 +1555,7 @@ impl StorageClient {
         let mut request = self.client.append_wal_request();
         let params = request.get();
         let mut wal_batch = params.init_batch();
+        wal_batch.set_request_id(batch.request_id);
         wal_batch.set_start_lsn(batch.start_lsn);
         wal_batch.set_end_lsn(batch.end_lsn);
         let mut records = wal_batch.init_records(batch.records.len() as u32);

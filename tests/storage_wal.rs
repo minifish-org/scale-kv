@@ -75,8 +75,9 @@ async fn test_append_wal_applies_to_storage() {
                 value: b"v1".to_vec(),
             };
             let batch = WalBatch {
+                request_id: 0,
                 start_lsn: 1,
-                end_lsn: 1,
+                end_lsn: 2,
                 records: vec![record],
             };
             client.append_wal(&batch).await.unwrap();

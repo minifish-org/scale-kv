@@ -1,5 +1,5 @@
 use crate::storage_capnp::storage;
-use crate::node::{WalBatch, WalRecord};
+use crate::node::{WalBatch, WalRecord, WAL_OP_TXN_COMMIT, WAL_OP_TXN_DEL, WAL_OP_TXN_PUT};
 use crate::{Result, StorageNode};
 use capnp::capability::Promise;
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -36,12 +36,13 @@ impl storage::Server for StorageService {
         let data = self.data.clone();
         Promise::from_future(async move {
             let value = data.get(key).await;
+            let mut res = results.get();
+            res.set_durable_lsn(data.durable_lsn());
             if let Some(value) = value {
-                let mut res = results.get();
                 res.set_found(true);
                 res.set_value(&value);
             } else {
-                results.get().set_found(false);
+                res.set_found(false);
             }
             Ok(())
         })
@@ -50,7 +51,7 @@ impl storage::Server for StorageService {
     fn put(
         &mut self,
         params: storage::PutParams,
-        _results: storage::PutResults,
+        mut results: storage::PutResults,
     ) -> Promise<(), capnp::Error> {
         let params = match params.get() {
             Ok(params) => params,
@@ -64,9 +65,11 @@ impl storage::Server for StorageService {
 
         let data = self.data.clone();
         Promise::from_future(async move {
-            task::spawn_blocking(move || data.put(key, &value))
+            let data2 = data.clone();
+            task::spawn_blocking(move || data2.put(key, &value))
                 .await
                 .map_err(map_join_error)?;
+            results.get().set_durable_lsn(data.durable_lsn());
             Ok(())
         })
     }
@@ -84,7 +87,9 @@ impl storage::Server for StorageService {
         Promise::from_future(async move {
             let existed = data.contains(key).await;
             data.delete(key);
-            results.get().set_found(existed);
+            let mut res = results.get();
+            res.set_found(existed);
+            res.set_durable_lsn(data.durable_lsn());
             Ok(())
         })
     }
@@ -92,7 +97,7 @@ impl storage::Server for StorageService {
     fn batch_put(
         &mut self,
         params: storage::BatchPutParams,
-        _results: storage::BatchPutResults,
+        mut results: storage::BatchPutResults,
     ) -> Promise<(), capnp::Error> {
         let params = match params.get() {
             Ok(params) => params,
@@ -114,13 +119,15 @@ impl storage::Server for StorageService {
         }
         let data = self.data.clone();
         Promise::from_future(async move {
+            let data2 = data.clone();
             task::spawn_blocking(move || {
                 for (key, value) in batch {
-                    data.put(key, &value);
+                    data2.put(key, &value);
                 }
             })
             .await
             .map_err(map_join_error)?;
+            results.get().set_durable_lsn(data.durable_lsn());
             Ok(())
         })
     }
@@ -128,7 +135,7 @@ impl storage::Server for StorageService {
     fn append_wal(
         &mut self,
         params: storage::AppendWalParams,
-        _results: storage::AppendWalResults,
+        mut results: storage::AppendWalResults,
     ) -> Promise<(), capnp::Error> {
         let params = match params.get() {
             Ok(params) => params,
@@ -138,6 +145,7 @@ impl storage::Server for StorageService {
             Ok(batch) => batch,
             Err(err) => return Promise::err(err),
         };
+        let request_id = batch.get_request_id();
         let start_lsn = batch.get_start_lsn();
         let end_lsn = batch.get_end_lsn();
         let records = match batch.get_records() {
@@ -166,6 +174,7 @@ impl storage::Server for StorageService {
         }
 
         let batch = WalBatch {
+            request_id,
             start_lsn,
             end_lsn,
             records: wal_records,
@@ -176,6 +185,98 @@ impl storage::Server for StorageService {
             data.append_wal_batch(batch)
                 .await
                 .map_err(|err| capnp::Error::failed(err.to_string()))?;
+            results.get().set_durable_lsn(data.durable_lsn());
+            Ok(())
+        })
+    }
+
+    fn get_durable_lsn(
+        &mut self,
+        _params: storage::GetDurableLsnParams,
+        mut results: storage::GetDurableLsnResults,
+    ) -> Promise<(), capnp::Error> {
+        let data = self.data.clone();
+        Promise::from_future(async move {
+            results.get().set_durable_lsn(data.durable_lsn());
+            Ok(())
+        })
+    }
+
+    fn txn_get(
+        &mut self,
+        params: storage::TxnGetParams,
+        mut results: storage::TxnGetResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(err) => return Promise::err(err),
+        };
+        let key = match params.get_key() {
+            Ok(k) => k.to_vec(),
+            Err(err) => return Promise::err(err),
+        };
+        let read_lsn = params.get_read_lsn();
+
+        let data = self.data.clone();
+        Promise::from_future(async move {
+            let found = data.txn_get(&key, read_lsn);
+            let mut res = results.get();
+            res.set_durable_lsn(data.durable_lsn());
+            match found {
+                Some(Some(v)) => {
+                    res.set_found(true);
+                    res.set_value(&v);
+                }
+                _ => {
+                    res.set_found(false);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn append_txn_batch(
+        &mut self,
+        params: storage::AppendTxnBatchParams,
+        mut results: storage::AppendTxnBatchResults,
+    ) -> Promise<(), capnp::Error> {
+        let params = match params.get() {
+            Ok(p) => p,
+            Err(err) => return Promise::err(err),
+        };
+        let request_id = params.get_request_id();
+        let records = match params.get_records() {
+            Ok(r) => r,
+            Err(err) => return Promise::err(err),
+        };
+
+        let mut ops: Vec<(u8, Vec<u8>, Vec<u8>)> = Vec::with_capacity(records.len() as usize);
+        for rec in records.iter() {
+            let op = rec.get_op();
+            let key = rec.get_key().map(|k| k.to_vec()).unwrap_or_default();
+            let value = rec.get_value().map(|v| v.to_vec()).unwrap_or_default();
+            let mapped_op = match op {
+                1 => WAL_OP_TXN_PUT,
+                2 => WAL_OP_TXN_DEL,
+                3 => WAL_OP_TXN_COMMIT,
+                _ => {
+                    return Promise::err(capnp::Error::failed(format!(
+                        "invalid txn op: {op}"
+                    )))
+                }
+            };
+            ops.push((mapped_op, key, value));
+        }
+
+        let data = self.data.clone();
+        Promise::from_future(async move {
+            let commit_lsn = data
+                .append_txn_batch_sync(request_id, ops)
+                .await
+                .map_err(|err| capnp::Error::failed(err.to_string()))?;
+            let mut res = results.get();
+            res.set_commit_lsn(commit_lsn);
+            res.set_durable_lsn(data.durable_lsn());
             Ok(())
         })
     }
