@@ -182,10 +182,11 @@ impl storage::Server for StorageService {
 
         let data = self.data.clone();
         Promise::from_future(async move {
-            data.append_wal_batch(batch)
+            let durable = data
+                .append_wal_batch_sync(batch)
                 .await
                 .map_err(|err| capnp::Error::failed(err.to_string()))?;
-            results.get().set_durable_lsn(data.durable_lsn());
+            results.get().set_durable_lsn(durable);
             Ok(())
         })
     }

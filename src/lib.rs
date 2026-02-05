@@ -34,5 +34,8 @@ pub mod storage_capnp;
 pub mod quorum_client;
 pub use quorum_client::StorageQuorumClient;
 
+pub mod compute_sequencer;
+pub use compute_sequencer::ComputeSequencer;
+
 pub mod txn_kv;
 pub use txn_kv::{Txn, TxnError, TxnManager};
