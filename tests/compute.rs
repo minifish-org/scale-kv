@@ -4,6 +4,10 @@ use scale_kv::{ComputeNode, StorageServer, KEY_SIZE, VALUE_SIZE};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+fn tcp_bind_allowed() -> bool {
+    std::net::TcpListener::bind("127.0.0.1:0").is_ok()
+}
+
 fn temp_dir() -> std::path::PathBuf {
     let mut dir = std::env::temp_dir();
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -81,6 +85,9 @@ async fn test_compute_multi_and_range() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_compute_wal_queue_async() {
+    if !tcp_bind_allowed() {
+        return;
+    }
     let dir = temp_dir();
     let local = tokio::task::LocalSet::new();
     local

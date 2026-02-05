@@ -1,13 +1,13 @@
 use crate::page_store::PageStore;
 use crate::{Page, PageId, Result, Value, KEY_SIZE, PAGE_SIZE, VALUE_SIZE};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 const PAGE_HEADER_SIZE: usize = 6;
 const SLOT_ENTRY_SIZE: usize = 4;
@@ -23,8 +23,26 @@ pub struct StorageNode {
     dir: PathBuf,
     page_store: Arc<PageStore>,
     page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
-    wal_sender: Mutex<Option<Sender<WalBatch>>>,
+    wal_sender: Mutex<Option<Sender<WalWriteRequest>>>,
     wal_replay_rx: Mutex<Option<Receiver<WalBatch>>>,
+    durable_lsn: Arc<std::sync::atomic::AtomicU64>,
+    next_lsn: Arc<std::sync::atomic::AtomicU64>,
+
+    // MVCC store for txnGet/appendTxnBatch. Key is raw bytes.
+    mvcc: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
+    // requestId -> commitLsn (end_lsn) for idempotent retry
+    request_index: Arc<std::sync::Mutex<HashMap<u64, u64>>>,
+}
+
+#[derive(Clone, Debug)]
+struct MvccVersion {
+    commit_lsn: u64,
+    value: Option<Vec<u8>>,
+}
+
+struct WalWriteRequest {
+    batch: WalBatch,
+    ack: Option<oneshot::Sender<Result<u64>>>,
 }
 
 struct ReplayBuffer {
@@ -260,15 +278,27 @@ pub struct WalRecord {
     pub value: Vec<u8>,
 }
 
+// WAL ops for page/slot records (legacy)
+pub const WAL_OP_PAGE_PUT: u8 = 1;
+pub const WAL_OP_PAGE_DEL: u8 = 2;
+
+// WAL ops for txn MVCC records
+pub const WAL_OP_TXN_PUT: u8 = 11;
+pub const WAL_OP_TXN_DEL: u8 = 12;
+pub const WAL_OP_TXN_COMMIT: u8 = 13;
+
 #[derive(Clone, Debug)]
 pub struct WalBatch {
+    pub request_id: u64,
     pub start_lsn: u64,
+    /// Right boundary (exclusive). Commit point uses end_lsn.
     pub end_lsn: u64,
     pub records: Vec<WalRecord>,
 }
 
 fn encode_wal_batch(batch: &WalBatch, out: &mut Vec<u8>) -> Result<()> {
     let mut buf = Vec::new();
+    buf.extend_from_slice(&batch.request_id.to_le_bytes());
     buf.extend_from_slice(&batch.start_lsn.to_le_bytes());
     buf.extend_from_slice(&batch.end_lsn.to_le_bytes());
     let count = batch.records.len() as u32;
@@ -291,21 +321,36 @@ fn encode_wal_batch(batch: &WalBatch, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-async fn start_wal_writer(dir: PathBuf) -> Result<(Sender<WalBatch>, Receiver<WalBatch>)> {
-    let (tx, rx) = mpsc::channel::<WalBatch>(1024);
+async fn start_wal_writer(
+    dir: PathBuf,
+    durable_lsn: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<(Sender<WalWriteRequest>, Receiver<WalBatch>)> {
+    let (tx, rx) = mpsc::channel::<WalWriteRequest>(1024);
     let (replay_tx, replay_rx) = mpsc::channel::<WalBatch>(1024);
-    tokio::spawn(wal_writer_loop(dir, rx, replay_tx));
+    tokio::spawn(wal_writer_loop(dir, durable_lsn, rx, replay_tx));
     Ok((tx, replay_rx))
 }
 
-async fn wal_writer_loop(dir: PathBuf, mut rx: Receiver<WalBatch>, replay_tx: Sender<WalBatch>) {
+async fn wal_writer_loop(
+    dir: PathBuf,
+    durable_lsn: Arc<std::sync::atomic::AtomicU64>,
+    mut rx: Receiver<WalWriteRequest>,
+    replay_tx: Sender<WalBatch>,
+) {
     let mut writer = match WalWriter::open(dir).await {
         Ok(writer) => writer,
         Err(_) => return,
     };
-    while let Some(batch) = rx.recv().await {
-        if writer.append_batch(&batch).await.is_ok() {
+    while let Some(req) = rx.recv().await {
+        let WalWriteRequest { batch, ack } = req;
+        let appended = writer.append_batch(&batch).await.map(|_| batch.end_lsn);
+        if let Ok(end_lsn) = appended {
+            durable_lsn.store(end_lsn, std::sync::atomic::Ordering::Release);
             let _ = replay_tx.send(batch).await;
+        }
+        if let Some(ack) = ack {
+            // If WAL append failed, return the error to the caller.
+            let _ = ack.send(appended.map_err(|e| e));
         }
     }
 }
@@ -322,6 +367,7 @@ async fn read_wal_batch(file: &mut File) -> Result<Option<WalBatch>> {
     file.read_exact(&mut buf).await?;
     let mut cursor = 0usize;
 
+    let request_id = read_u64_from(&buf, &mut cursor)?;
     let start_lsn = read_u64_from(&buf, &mut cursor)?;
     let end_lsn = read_u64_from(&buf, &mut cursor)?;
     let count = read_u32_from(&buf, &mut cursor)? as usize;
@@ -350,10 +396,64 @@ async fn read_wal_batch(file: &mut File) -> Result<Option<WalBatch>> {
         });
     }
     Ok(Some(WalBatch {
+        request_id,
         start_lsn,
         end_lsn,
         records,
     }))
+}
+
+fn apply_txn_batch_to_mvcc(
+    mvcc: &Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
+    batch: &WalBatch,
+) {
+    if batch.records.is_empty() {
+        return;
+    }
+    let last = batch.records.last().unwrap();
+    if last.op != WAL_OP_TXN_COMMIT {
+        return;
+    }
+    let commit_lsn = batch.end_lsn;
+
+    let mut store = mvcc.lock().unwrap();
+    for record in &batch.records {
+        match record.op {
+            WAL_OP_TXN_PUT => {
+                store
+                    .entry(record.key.clone())
+                    .or_default()
+                    .push(MvccVersion {
+                        commit_lsn,
+                        value: Some(record.value.clone()),
+                    });
+            }
+            WAL_OP_TXN_DEL => {
+                store
+                    .entry(record.key.clone())
+                    .or_default()
+                    .push(MvccVersion {
+                        commit_lsn,
+                        value: None,
+                    });
+            }
+            WAL_OP_TXN_COMMIT => {}
+            _ => {}
+        }
+    }
+}
+
+fn mvcc_get_at(
+    mvcc: &Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
+    key: &[u8],
+    read_lsn: u64,
+) -> Option<Option<Vec<u8>>> {
+    let store = mvcc.lock().unwrap();
+    let versions = store.get(key)?;
+    versions
+        .iter()
+        .rfind(|v| v.commit_lsn <= read_lsn)
+        .map(|v| v.value.clone())
 }
 
 fn read_u64_from(buf: &[u8], cursor: &mut usize) -> Result<u64> {
@@ -395,9 +495,25 @@ fn read_u8_from(buf: &[u8], cursor: &mut usize) -> Result<u8> {
     Ok(value)
 }
 
-async fn wal_replay_loop(replay: PageStoreReplay, mut rx: Receiver<WalBatch>) {
+async fn wal_replay_loop(
+    replay: PageStoreReplay,
+    mut rx: Receiver<WalBatch>,
+    mvcc: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
+    request_index: Arc<std::sync::Mutex<HashMap<u64, u64>>>,
+) {
     let mut buffers: HashMap<PageId, ReplayBuffer> = HashMap::new();
     while let Some(batch) = rx.recv().await {
+        // Build requestId -> commitLsn mapping for idempotent retry.
+        if batch.request_id != 0 {
+            request_index
+                .lock()
+                .unwrap()
+                .insert(batch.request_id, batch.end_lsn);
+        }
+
+        // Apply txn MVCC records if this batch ends with a commit marker.
+        apply_txn_batch_to_mvcc(&mvcc, &batch);
+
         let mut last_seen = replay.last_applied();
         for record in batch.records.into_iter() {
             if record.lsn <= last_seen {
@@ -407,6 +523,15 @@ async fn wal_replay_loop(replay: PageStoreReplay, mut rx: Receiver<WalBatch>) {
                 break;
             }
             last_seen = record.lsn;
+
+            // Skip txn records for page replay.
+            if record.op == WAL_OP_TXN_PUT
+                || record.op == WAL_OP_TXN_DEL
+                || record.op == WAL_OP_TXN_COMMIT
+            {
+                continue;
+            }
+
             let page_id = record.page_id;
             let buffer = buffers.entry(page_id).or_insert_with(ReplayBuffer::new);
             buffer.push(record);
@@ -452,6 +577,8 @@ async fn replay_wal_segments_to_store(
     page_store: Arc<PageStore>,
     last_applied_lsn: u64,
     page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
+    mvcc: &Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
+    request_index: &Arc<std::sync::Mutex<HashMap<u64, u64>>>,
 ) -> Result<()> {
     let mut segments = list_wal_segments(dir).await?;
     segments.sort_unstable();
@@ -467,8 +594,24 @@ async fn replay_wal_segments_to_store(
                 Some(batch) => batch,
                 None => break,
             };
+
+            if batch.request_id != 0 {
+                request_index
+                    .lock()
+                    .unwrap()
+                    .insert(batch.request_id, batch.end_lsn);
+            }
+            apply_txn_batch_to_mvcc(mvcc, &batch);
+
             for record in batch.records {
                 if record.lsn <= replay.last_applied() {
+                    continue;
+                }
+                // Skip txn records.
+                if record.op == WAL_OP_TXN_PUT
+                    || record.op == WAL_OP_TXN_DEL
+                    || record.op == WAL_OP_TXN_COMMIT
+                {
                     continue;
                 }
                 replay.apply_record(record).await?;
@@ -480,11 +623,15 @@ async fn replay_wal_segments_to_store(
 
 fn apply_wal_record(page: &mut [u8], record: &WalRecord) -> Result<()> {
     match record.op {
-        1 => insert_record_at_slot_checked(page, record.slot_id, &record.key, &record.value),
-        2 => {
+        WAL_OP_PAGE_PUT => {
+            insert_record_at_slot_checked(page, record.slot_id, &record.key, &record.value)
+        }
+        WAL_OP_PAGE_DEL => {
             clear_slot(page, record.slot_id);
             Ok(())
         }
+        // txn records are not applied to the page store
+        WAL_OP_TXN_PUT | WAL_OP_TXN_DEL | WAL_OP_TXN_COMMIT => Ok(()),
         _ => Ok(()),
     }
 }
@@ -644,23 +791,40 @@ impl StorageNode {
 
         let page_store = Arc::new(page_store);
         let page_index = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let mvcc = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let request_index = Arc::new(std::sync::Mutex::new(HashMap::new()));
         replay_wal_segments_to_store(
             &dir,
             Arc::clone(&page_store),
             last_applied_lsn,
             Arc::clone(&page_index),
+            &mvcc,
+            &request_index,
         )
         .await?;
         let rebuilt_index = build_page_index(&page_store).await;
         *page_index.lock().unwrap() = rebuilt_index;
 
-        let (wal_sender, wal_replay_rx) = start_wal_writer(dir.clone()).await?;
+        // Initialize durable_lsn and next_lsn from the last applied point.
+        // We treat `durable_lsn` as the right boundary (exclusive): all records with lsn < durable_lsn are durable.
+        // NOTE: in the quorum design, durable_lsn should reflect quorum-durable; for now it's local.
+        let durable_init = last_applied_lsn.saturating_add(1);
+        let durable_lsn = Arc::new(std::sync::atomic::AtomicU64::new(durable_init));
+        let next_lsn = Arc::new(std::sync::atomic::AtomicU64::new(durable_init));
+
+        let (wal_sender, wal_replay_rx) =
+            start_wal_writer(dir.clone(), durable_lsn.clone()).await?;
+
         let node = Self {
             dir: dir.clone(),
             page_store: Arc::clone(&page_store),
             page_index: Arc::clone(&page_index),
             wal_sender: Mutex::new(Some(wal_sender)),
             wal_replay_rx: Mutex::new(Some(wal_replay_rx)),
+            durable_lsn,
+            next_lsn,
+            mvcc,
+            request_index,
         };
 
         node.start_wal_replay(last_applied_lsn).await;
@@ -668,16 +832,156 @@ impl StorageNode {
     }
 
     pub async fn append_wal_batch(&self, batch: WalBatch) -> Result<()> {
+        self.validate_incoming_wal_batch(&batch)?;
         let sender = self.wal_sender.lock().await;
         match sender.as_ref() {
-            Some(sender) => Ok(sender.send(batch).await.map_err(|_| {
-                crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal queue closed"))
-            })?),
+            Some(sender) => Ok(sender
+                .send(WalWriteRequest { batch, ack: None })
+                .await
+                .map_err(|_| crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal queue closed")))?),
             None => Err(crate::Error::Io(Error::new(
                 ErrorKind::BrokenPipe,
                 "wal queue not initialized",
             ))),
         }
+    }
+
+    pub fn durable_lsn(&self) -> u64 {
+        self.durable_lsn.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn validate_incoming_wal_batch(&self, batch: &WalBatch) -> Result<()> {
+        // Strict, single-writer style: batches must arrive in LSN order with no gaps.
+        // `durable_lsn` is the exclusive right boundary, so the next expected start is durable_lsn.
+        let expected_start = self.durable_lsn();
+        if batch.start_lsn != expected_start {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "wal batch out of order: start_lsn={} expected_start={}",
+                    batch.start_lsn, expected_start
+                ),
+            )));
+        }
+        if batch.end_lsn < batch.start_lsn {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "wal batch invalid range",
+            )));
+        }
+        let expected_len = batch.end_lsn.saturating_sub(batch.start_lsn) as usize;
+        if expected_len != batch.records.len() {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "wal batch length mismatch: records={} range_len={}",
+                    batch.records.len(), expected_len
+                ),
+            )));
+        }
+        for (i, rec) in batch.records.iter().enumerate() {
+            let want = batch.start_lsn + i as u64;
+            if rec.lsn != want {
+                return Err(crate::Error::Io(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("wal record lsn mismatch: got={} want={}", rec.lsn, want),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn alloc_lsn_range(&self, n: u64) -> (u64, u64) {
+        if n == 0 {
+            let cur = self.next_lsn.load(std::sync::atomic::Ordering::Relaxed);
+            return (cur, cur);
+        }
+        let start = self
+            .next_lsn
+            .fetch_add(n, std::sync::atomic::Ordering::AcqRel);
+        let end = start + n;
+        (start, end)
+    }
+
+    pub fn txn_get(&self, key: &[u8], read_lsn: u64) -> Option<Option<Vec<u8>>> {
+        mvcc_get_at(&self.mvcc, key, read_lsn)
+    }
+
+    pub async fn append_txn_batch_sync(
+        &self,
+        request_id: u64,
+        records: Vec<(u8, Vec<u8>, Vec<u8>)>,
+    ) -> Result<u64> {
+        // Idempotent retry: if we've already committed this request_id, return the same commit_lsn.
+        if request_id != 0 {
+            if let Some(lsn) = self.request_index.lock().unwrap().get(&request_id).copied() {
+                return Ok(lsn);
+            }
+        }
+
+        // Enforce: last record must be COMMIT.
+        if records.is_empty() {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "txn batch must be non-empty",
+            )));
+        }
+        if records.last().map(|(op, _, _)| *op) != Some(WAL_OP_TXN_COMMIT) {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "txn batch must end with COMMIT",
+            )));
+        }
+
+        let count = records.len() as u64;
+        let (start_lsn, end_lsn) = self.alloc_lsn_range(count);
+
+        let mut wal_records = Vec::with_capacity(records.len());
+        for (idx, (op, key, value)) in records.into_iter().enumerate() {
+            let lsn = start_lsn + idx as u64;
+            wal_records.push(WalRecord {
+                lsn,
+                op,
+                page_id: 0,
+                slot_id: 0,
+                key,
+                value,
+            });
+        }
+
+        let batch = WalBatch {
+            request_id,
+            start_lsn,
+            end_lsn,
+            records: wal_records,
+        };
+
+        let commit_lsn = self.append_wal_batch_sync(batch).await?;
+        if request_id != 0 {
+            self.request_index
+                .lock()
+                .unwrap()
+                .insert(request_id, commit_lsn);
+        }
+        Ok(commit_lsn)
+    }
+
+    pub async fn append_wal_batch_sync(&self, batch: WalBatch) -> Result<u64> {
+        self.validate_incoming_wal_batch(&batch)?;
+        let sender = self.wal_sender.lock().await;
+        let sender = sender.as_ref().ok_or_else(|| {
+            crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal queue not initialized"))
+        })?;
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(WalWriteRequest {
+                batch,
+                ack: Some(tx),
+            })
+            .await
+            .map_err(|_| crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal queue closed")))?;
+        rx.await
+            .map_err(|_| crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal ack dropped")))?
     }
 
     pub async fn start_wal_replay(&self, last_applied_lsn: u64) {
@@ -692,8 +996,10 @@ impl StorageNode {
             last_applied_lsn,
             Arc::clone(&self.page_index),
         );
+        let mvcc = self.mvcc.clone();
+        let req_index = self.request_index.clone();
         tokio::spawn(async move {
-            wal_replay_loop(replay, rx).await;
+            wal_replay_loop(replay, rx, mvcc, req_index).await;
         });
     }
 
@@ -1017,6 +1323,7 @@ mod tests {
         let dir = temp_dir().await;
         let path = dir.join("wal-test.log");
         let batch = WalBatch {
+            request_id: 0,
             start_lsn: 1,
             end_lsn: 2,
             records: vec![
@@ -1146,16 +1453,19 @@ mod tests {
 
         {
             let batch1 = WalBatch {
+                request_id: 0,
                 start_lsn: 1,
                 end_lsn: 10,
                 records: vec![],
             };
             let batch2 = WalBatch {
+                request_id: 0,
                 start_lsn: 11,
                 end_lsn: 20,
                 records: vec![],
             };
             let batch3 = WalBatch {
+                request_id: 0,
                 start_lsn: 21,
                 end_lsn: 30,
                 records: vec![],
@@ -1235,11 +1545,13 @@ mod tests {
         create_wal_segment(&dir, 2).await.unwrap();
         {
             let batch1 = WalBatch {
+                request_id: 0,
                 start_lsn: 1,
                 end_lsn: 5,
                 records: vec![],
             };
             let batch2 = WalBatch {
+                request_id: 0,
                 start_lsn: 6,
                 end_lsn: 10,
                 records: vec![],

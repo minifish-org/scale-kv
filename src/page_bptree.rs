@@ -876,7 +876,7 @@ mod tests {
     #[test]
     fn test_insert_get_remove_len() {
         let mut tree = PageBPlusTree::new();
-        let key = b"alpha".to_vec();
+        let key = key_for(1);
         let slot = SlotRef {
             page_id: 1,
             slot_id: 2,
@@ -925,7 +925,7 @@ mod tests {
         let provider = InMemoryPageProvider::new();
         let mut tree = PageBPlusTree::new_with_provider(provider);
 
-        let key = b"test_key".to_vec();
+        let key = key_for(2);
         let slot = SlotRef {
             page_id: 100,
             slot_id: 5,
@@ -966,7 +966,7 @@ mod tests {
         let provider = SharedPageProvider::new(pages.clone(), next_page_id.clone());
         let mut tree = PageBPlusTree::new_with_provider(provider);
 
-        let key = b"shared_key".to_vec();
+        let key = key_for(3);
         let slot = SlotRef {
             page_id: 42,
             slot_id: 7,

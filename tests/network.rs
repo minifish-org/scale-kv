@@ -6,6 +6,10 @@ use std::{fs, process};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+fn tcp_bind_allowed() -> bool {
+    std::net::TcpListener::bind("127.0.0.1:0").is_ok()
+}
+
 fn temp_dir() -> PathBuf {
     let mut dir = std::env::temp_dir();
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -29,6 +33,9 @@ fn fixed_key(raw: &str) -> String {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_network_operations() {
+    if !tcp_bind_allowed() {
+        return;
+    }
     let dir = temp_dir();
     {
         let local = tokio::task::LocalSet::new();
@@ -63,6 +70,9 @@ async fn test_network_operations() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_multiple_clients() {
+    if !tcp_bind_allowed() {
+        return;
+    }
     let dir = temp_dir();
     {
         let local = tokio::task::LocalSet::new();
@@ -99,6 +109,9 @@ async fn test_multiple_clients() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_batch_put() {
+    if !tcp_bind_allowed() {
+        return;
+    }
     let dir = temp_dir();
     {
         let local = tokio::task::LocalSet::new();

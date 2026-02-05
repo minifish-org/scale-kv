@@ -166,8 +166,10 @@ impl WalSender {
         let bytes = *buffer_bytes;
         *buffer_bytes = 0;
         let start_lsn = records.first().map(|r| r.lsn).unwrap_or(0);
-        let end_lsn = records.last().map(|r| r.lsn).unwrap_or(0);
+        // legacy: best-effort; treat end_lsn as right boundary
+        let end_lsn = records.last().map(|r| r.lsn + 1).unwrap_or(0);
         let batch = crate::node::WalBatch {
+            request_id: 0,
             start_lsn,
             end_lsn,
             records,
@@ -1472,6 +1474,8 @@ pub struct StorageClient {
     _task: tokio::task::JoinHandle<()>,
 }
 
+// (moved to quorum_client.rs)
+
 impl StorageClient {
     pub async fn connect(addr: &str, local: &LocalSet) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
@@ -1512,6 +1516,7 @@ impl StorageClient {
         request.get().set_key(page_id);
         let response = request.send().promise.await?;
         let response = response.get()?;
+        // durable_lsn is available but ignored by legacy page client.
         if response.get_found() {
             Ok(Some(response.get_value()?.to_vec()))
         } else {
@@ -1549,10 +1554,11 @@ impl StorageClient {
         Ok(())
     }
 
-    pub async fn append_wal(&self, batch: &WalBatch) -> Result<()> {
+    pub async fn append_wal(&self, batch: &WalBatch) -> Result<u64> {
         let mut request = self.client.append_wal_request();
         let params = request.get();
         let mut wal_batch = params.init_batch();
+        wal_batch.set_request_id(batch.request_id);
         wal_batch.set_start_lsn(batch.start_lsn);
         wal_batch.set_end_lsn(batch.end_lsn);
         let mut records = wal_batch.init_records(batch.records.len() as u32);
@@ -1565,8 +1571,53 @@ impl StorageClient {
             slot.set_key(&record.key);
             slot.set_value(&record.value);
         }
-        request.send().promise.await?;
-        Ok(())
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_durable_lsn())
+    }
+
+    pub async fn get_durable_lsn(&self) -> Result<u64> {
+        let request = self.client.get_durable_lsn_request();
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_durable_lsn())
+    }
+
+    pub async fn txn_get(&self, key: &[u8], read_lsn: u64) -> Result<(Option<Vec<u8>>, u64)> {
+        let mut request = self.client.txn_get_request();
+        {
+            let mut p = request.get();
+            p.set_key(key);
+            p.set_read_lsn(read_lsn);
+        }
+        let response = request.send().promise.await?;
+        let r = response.get()?;
+        let durable = r.get_durable_lsn();
+        if r.get_found() {
+            Ok((Some(r.get_value()?.to_vec()), durable))
+        } else {
+            Ok((None, durable))
+        }
+    }
+
+    pub async fn append_txn_batch(
+        &self,
+        request_id: u64,
+        records: &[(u8, Vec<u8>, Vec<u8>)],
+    ) -> Result<(u64, u64)> {
+        let mut request = self.client.append_txn_batch_request();
+        {
+            let mut p = request.get();
+            p.set_request_id(request_id);
+            let mut list = p.init_records(records.len() as u32);
+            for (i, (op, key, value)) in records.iter().enumerate() {
+                let mut rec = list.reborrow().get(i as u32);
+                rec.set_op(*op);
+                rec.set_key(key);
+                rec.set_value(value);
+            }
+        }
+        let response = request.send().promise.await?;
+        let r = response.get()?;
+        Ok((r.get_commit_lsn(), r.get_durable_lsn()))
     }
 }
 
@@ -1778,24 +1829,34 @@ mod tests {
     #[test]
     fn test_defragment_page_reclaims_space() {
         let mut page = new_page();
-        let key1 = vec![b'k'; KEY_SIZE];
-        let key2 = vec![b'z'; KEY_SIZE];
         let value = vec![b'x'; VALUE_SIZE];
+        let large_value = vec![b'y'; VALUE_SIZE];
 
-        let slot1 = insert_record(&mut page, &key1, &value).unwrap().unwrap();
-        let _slot2 = insert_record(&mut page, &key2, &value).unwrap().unwrap();
-        clear_slot(&mut page, slot1);
+        let mut slots = Vec::new();
+        let mut counter = 0u8;
+        loop {
+            let mut key = vec![0u8; KEY_SIZE];
+            key[0] = counter;
+            counter = counter.wrapping_add(1);
+            match insert_record(&mut page, &key, &value).unwrap() {
+                Some(slot_id) => slots.push((key, slot_id)),
+                None => break,
+            }
+        }
+        assert!(slots.len() >= 2);
+        let mid = slots.len() / 2;
+        let (deleted_key, deleted_slot) = slots[mid].clone();
+        clear_slot(&mut page, deleted_slot);
 
         let (_slots_before, free_start_before, free_end_before) = read_header(&page);
         let free_bytes_before = free_end_before.saturating_sub(free_start_before) as usize;
 
-        let large_value = vec![b'y'; VALUE_SIZE];
-        let needed = payload_len(&key1, &large_value).unwrap();
+        let needed = payload_len(&deleted_key, &large_value).unwrap();
         assert!(free_bytes_before < needed);
 
-        let slot3 = insert_record(&mut page, &key1, &large_value)
+        let slot3 = insert_record(&mut page, &deleted_key, &large_value)
             .unwrap()
             .unwrap();
-        assert!(read_value(&page, slot3, &key1).is_some());
+        assert!(read_value(&page, slot3, &deleted_key).is_some());
     }
 }
