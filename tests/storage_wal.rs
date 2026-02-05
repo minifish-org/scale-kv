@@ -80,7 +80,7 @@ async fn test_append_wal_applies_to_storage() {
                 end_lsn: 2,
                 records: vec![record],
             };
-            client.append_wal(&batch).await.unwrap();
+            let _durable = client.append_wal(&batch).await.unwrap();
 
             assert!(client.get(1).await.unwrap().is_none());
         })

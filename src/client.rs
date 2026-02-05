@@ -1514,6 +1514,7 @@ impl StorageClient {
         request.get().set_key(page_id);
         let response = request.send().promise.await?;
         let response = response.get()?;
+        // durable_lsn is available but ignored by legacy page client.
         if response.get_found() {
             Ok(Some(response.get_value()?.to_vec()))
         } else {
@@ -1551,7 +1552,7 @@ impl StorageClient {
         Ok(())
     }
 
-    pub async fn append_wal(&self, batch: &WalBatch) -> Result<()> {
+    pub async fn append_wal(&self, batch: &WalBatch) -> Result<u64> {
         let mut request = self.client.append_wal_request();
         let params = request.get();
         let mut wal_batch = params.init_batch();
@@ -1568,8 +1569,53 @@ impl StorageClient {
             slot.set_key(&record.key);
             slot.set_value(&record.value);
         }
-        request.send().promise.await?;
-        Ok(())
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_durable_lsn())
+    }
+
+    pub async fn get_durable_lsn(&self) -> Result<u64> {
+        let request = self.client.get_durable_lsn_request();
+        let response = request.send().promise.await?;
+        Ok(response.get()?.get_durable_lsn())
+    }
+
+    pub async fn txn_get(&self, key: &[u8], read_lsn: u64) -> Result<(Option<Vec<u8>>, u64)> {
+        let mut request = self.client.txn_get_request();
+        {
+            let mut p = request.get();
+            p.set_key(key);
+            p.set_read_lsn(read_lsn);
+        }
+        let response = request.send().promise.await?;
+        let r = response.get()?;
+        let durable = r.get_durable_lsn();
+        if r.get_found() {
+            Ok((Some(r.get_value()?.to_vec()), durable))
+        } else {
+            Ok((None, durable))
+        }
+    }
+
+    pub async fn append_txn_batch(
+        &self,
+        request_id: u64,
+        records: &[(u8, Vec<u8>, Vec<u8>)],
+    ) -> Result<(u64, u64)> {
+        let mut request = self.client.append_txn_batch_request();
+        {
+            let mut p = request.get();
+            p.set_request_id(request_id);
+            let mut list = p.init_records(records.len() as u32);
+            for (i, (op, key, value)) in records.iter().enumerate() {
+                let mut rec = list.reborrow().get(i as u32);
+                rec.set_op(*op);
+                rec.set_key(key);
+                rec.set_value(value);
+            }
+        }
+        let response = request.send().promise.await?;
+        let r = response.get()?;
+        Ok((r.get_commit_lsn(), r.get_durable_lsn()))
     }
 }
 
