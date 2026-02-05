@@ -806,9 +806,11 @@ impl StorageNode {
         *page_index.lock().unwrap() = rebuilt_index;
 
         // Initialize durable_lsn and next_lsn from the last applied point.
+        // We treat `durable_lsn` as the right boundary (exclusive): all records with lsn < durable_lsn are durable.
         // NOTE: in the quorum design, durable_lsn should reflect quorum-durable; for now it's local.
-        let durable_lsn = Arc::new(std::sync::atomic::AtomicU64::new(last_applied_lsn));
-        let next_lsn = Arc::new(std::sync::atomic::AtomicU64::new(last_applied_lsn.saturating_add(1)));
+        let durable_init = last_applied_lsn.saturating_add(1);
+        let durable_lsn = Arc::new(std::sync::atomic::AtomicU64::new(durable_init));
+        let next_lsn = Arc::new(std::sync::atomic::AtomicU64::new(durable_init));
 
         let (wal_sender, wal_replay_rx) =
             start_wal_writer(dir.clone(), durable_lsn.clone()).await?;
@@ -830,6 +832,7 @@ impl StorageNode {
     }
 
     pub async fn append_wal_batch(&self, batch: WalBatch) -> Result<()> {
+        self.validate_incoming_wal_batch(&batch)?;
         let sender = self.wal_sender.lock().await;
         match sender.as_ref() {
             Some(sender) => Ok(sender
@@ -845,6 +848,47 @@ impl StorageNode {
 
     pub fn durable_lsn(&self) -> u64 {
         self.durable_lsn.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn validate_incoming_wal_batch(&self, batch: &WalBatch) -> Result<()> {
+        // Strict, single-writer style: batches must arrive in LSN order with no gaps.
+        // `durable_lsn` is the exclusive right boundary, so the next expected start is durable_lsn.
+        let expected_start = self.durable_lsn();
+        if batch.start_lsn != expected_start {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "wal batch out of order: start_lsn={} expected_start={}",
+                    batch.start_lsn, expected_start
+                ),
+            )));
+        }
+        if batch.end_lsn < batch.start_lsn {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "wal batch invalid range",
+            )));
+        }
+        let expected_len = batch.end_lsn.saturating_sub(batch.start_lsn) as usize;
+        if expected_len != batch.records.len() {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "wal batch length mismatch: records={} range_len={}",
+                    batch.records.len(), expected_len
+                ),
+            )));
+        }
+        for (i, rec) in batch.records.iter().enumerate() {
+            let want = batch.start_lsn + i as u64;
+            if rec.lsn != want {
+                return Err(crate::Error::Io(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("wal record lsn mismatch: got={} want={}", rec.lsn, want),
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn alloc_lsn_range(&self, n: u64) -> (u64, u64) {
@@ -923,6 +967,7 @@ impl StorageNode {
     }
 
     pub async fn append_wal_batch_sync(&self, batch: WalBatch) -> Result<u64> {
+        self.validate_incoming_wal_batch(&batch)?;
         let sender = self.wal_sender.lock().await;
         let sender = sender.as_ref().ok_or_else(|| {
             crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal queue not initialized"))
