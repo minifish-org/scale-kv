@@ -1,4 +1,5 @@
 use crate::{Error, Result, StorageClient, StorageQuorumClient};
+use rand;
 use futures::future::join_all;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::task::LocalSet;
@@ -30,11 +31,18 @@ impl ComputeSequencer {
             clients.push(StorageClient::connect(addr, local).await?);
         }
 
+        let seed = {
+            // Avoid request_id collisions across compute restarts.
+            // (Storage keeps an in-memory request_index for idempotency.)
+            let r = rand::random::<u64>();
+            if r == 0 { 1 } else { r }
+        };
+
         Ok(Self {
             clients,
             quorum,
             next_lsn: AtomicU64::new(durable),
-            request_id: AtomicU64::new(1),
+            request_id: AtomicU64::new(seed),
             durable_lsn: AtomicU64::new(durable),
         })
     }
