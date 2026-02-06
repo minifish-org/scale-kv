@@ -236,6 +236,9 @@ impl PageStore {
     }
 
     /// Scan pages starting from `start_page_id` and return up to `limit` pages.
+    ///
+    /// This is "sparse"-friendly: it will skip missing page ids and continue searching
+    /// until it collects `limit` pages or reaches the current max page id.
     pub async fn scan_pages_with_lsn(
         &self,
         start_page_id: PageId,
@@ -246,10 +249,12 @@ impl PageStore {
             return out;
         }
         let max_id = self.max_page_id.load(Ordering::Acquire);
-        let end = (start_page_id.saturating_add(limit as u64)).min(max_id.saturating_add(1));
-        for page_id in start_page_id..end {
+        for page_id in start_page_id..=max_id {
             if let Some((page, lsn)) = self.get_with_lsn(page_id).await {
                 out.push((page_id, lsn, page));
+                if out.len() >= limit {
+                    break;
+                }
             }
         }
         out

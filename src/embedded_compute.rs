@@ -1,5 +1,6 @@
 use crate::compute_sequencer::ComputeSequencer;
-use crate::{Error, Result, StorageClient};
+use crate::page_bptree::{DEFAULT_PAGE_CACHE_SHARDS, PageCache};
+use crate::{Error, PageId, Result, StorageClient};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use tokio::task::LocalSet;
@@ -15,8 +16,10 @@ use tokio::task::LocalSet;
 #[derive(Clone)]
 pub struct EmbeddedCompute {
     sequencer: Arc<ComputeSequencer>,
-    #[allow(dead_code)]
     readers: Arc<Vec<StorageClient>>,
+
+    // Warmed pages. (Eventually this should back the compute-side page cache / B+Tree.)
+    page_cache: Arc<PageCache>,
 
     // key -> versions sorted by commit_lsn (append-only)
     mvcc: Arc<Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
@@ -40,6 +43,7 @@ impl EmbeddedCompute {
         Ok(Self {
             sequencer,
             readers: Arc::new(readers),
+            page_cache: Arc::new(PageCache::new(DEFAULT_PAGE_CACHE_SHARDS)),
             mvcc: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
@@ -51,6 +55,45 @@ impl EmbeddedCompute {
 
     pub fn durable_lsn(&self) -> u64 {
         self.sequencer.durable_lsn()
+    }
+
+    pub fn warmed_pages(&self) -> usize {
+        self.page_cache.len()
+    }
+
+    /// Warm up compute by scanning pages from storage and caching them locally.
+    ///
+    /// This uses `scanPages` and fetches the latest pages only.
+    ///
+    /// Returns the number of pages cached.
+    pub async fn warmup_scan_all(&self, limit_per_batch: u32) -> Result<usize> {
+        let limit_per_batch = limit_per_batch.max(1);
+
+        // Pick the first reader for warmup.
+        let reader = self.readers.get(0).ok_or_else(|| {
+            Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "no storage"))
+        })?;
+
+        let mut start: PageId = 0;
+        loop {
+            let (pages, _durable) = reader.scan_pages(start, limit_per_batch).await?;
+            if pages.is_empty() {
+                break;
+            }
+
+            for (page_id, _page_lsn, page) in &pages {
+                self.page_cache.insert(*page_id, page.clone());
+            }
+
+            // Continue from the largest page id we saw + 1.
+            if let Some((last_id, _, _)) = pages.last() {
+                start = last_id.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+
+        Ok(self.page_cache.len())
     }
 
     /// Begin a read-write transaction context (buffer ops until commit).

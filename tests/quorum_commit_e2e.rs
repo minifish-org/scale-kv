@@ -77,10 +77,7 @@ async fn test_quorum_commit_with_one_ahead_node() {
 
             let key = b"kq".to_vec();
             let value = b"vq".to_vec();
-            let records = vec![
-                (1u8, key, value),
-                (3u8, Vec::new(), Vec::new()),
-            ];
+            let records = vec![(1u8, key, value), (3u8, Vec::new(), Vec::new())];
 
             let commit_lsn = seq.commit_txn_batch(records).await.unwrap();
             assert!(commit_lsn > read_lsn);
