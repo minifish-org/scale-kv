@@ -1,6 +1,6 @@
 use crate::{Error, Result, StorageClient, StorageQuorumClient};
-use rand;
 use futures::future::join_all;
+use rand;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::task::LocalSet;
 

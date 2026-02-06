@@ -55,39 +55,69 @@ async fn main() -> anyhow::Result<()> {
             let addrs = vec![addr.to_string()];
             let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
 
-            // Load records.
+            // Load records (256 puts per txn).
             let start = Instant::now();
-            for i in 0..records as u64 {
-                let k = key_for(i);
-                let v = val_for(i);
-                compute.put(&k, &v).await.unwrap();
+            let mut i = 0u64;
+            while (i as usize) < records {
+                let mut tx = compute.begin();
+                let mut n = 0usize;
+                while n < 256 && (i as usize) < records {
+                    let k = key_for(i);
+                    let v = val_for(i);
+                    tx.put(&k, &v).unwrap();
+                    n += 1;
+                    i += 1;
+                }
+                tx.commit().await.unwrap();
             }
             let dur = start.elapsed();
             eprintln!(
-                "load: records={records} time={:.3}s ops/s={:.0}",
+                "load: records={records} batch=256 time={:.3}s ops/s={:.0}",
                 dur.as_secs_f64(),
                 (records as f64) / dur.as_secs_f64()
             );
 
-            // Mixed ops: 90% get, 10% put overwrite.
             use rand::RngCore;
             let mut rng = rand::rngs::StdRng::seed_from_u64(0x5ca1e);
+
+            // Run 1: pure get
             let start = Instant::now();
             let mut get_ok = 0usize;
-            for i in 0..ops as u64 {
-                let r: u32 = rng.next_u32();
-                let id = (r as u64) % (records as u64);
+            for _ in 0..ops {
+                let id = (rng.next_u32() as u64) % (records as u64);
                 let k = key_for(id);
-                if (r % 10) == 0 {
-                    let v = val_for(i);
-                    compute.put(&k, &v).await.unwrap();
-                } else if compute.get(&k).unwrap().is_some() {
+                if compute.get(&k).unwrap().is_some() {
                     get_ok += 1;
                 }
             }
             let dur = start.elapsed();
             eprintln!(
-                "run: ops={ops} get_ok={get_ok} time={:.3}s ops/s={:.0}",
+                "get: ops={ops} ok={get_ok} time={:.3}s ops/s={:.0}",
+                dur.as_secs_f64(),
+                (ops as f64) / dur.as_secs_f64()
+            );
+
+            // Run 2: pure put overwrite (10 puts per txn)
+            let start = Instant::now();
+            let mut done = 0usize;
+            let mut seq = 0u64;
+            while done < ops {
+                let mut tx = compute.begin();
+                let mut n = 0usize;
+                while n < 10 && done < ops {
+                    let id = (rng.next_u32() as u64) % (records as u64);
+                    let k = key_for(id);
+                    let v = val_for(seq);
+                    tx.put(&k, &v).unwrap();
+                    n += 1;
+                    done += 1;
+                    seq += 1;
+                }
+                tx.commit().await.unwrap();
+            }
+            let dur = start.elapsed();
+            eprintln!(
+                "put: ops={ops} batch=10 time={:.3}s ops/s={:.0}",
                 dur.as_secs_f64(),
                 (ops as f64) / dur.as_secs_f64()
             );
