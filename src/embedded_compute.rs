@@ -610,6 +610,27 @@ impl EmbeddedTxn {
             tree.insert(key.to_vec(), slot_ref)?;
         }
 
+        // Debug self-check: btree mapping must point to a slot whose key matches.
+        // (Catches corruption/misaligned page writes early.)
+        if let Some(page) = self.get_page_for_read(slot_ref.page_id) {
+            if let Some(slot_key) = slotted_page::read_key(&page, slot_ref.slot_id) {
+                if slot_key.as_slice() != key {
+                    eprintln!(
+                        "[selfcheck] slot key mismatch: page_id={} slot_id={} key_hex={} slot_key_hex={}",
+                        slot_ref.page_id,
+                        slot_ref.slot_id,
+                        hex::encode(key),
+                        hex::encode(&slot_key)
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[selfcheck] slot missing after put: key={:?} page_id={} slot_id={}",
+                    key, slot_ref.page_id, slot_ref.slot_id
+                );
+            }
+        }
+
         Ok(())
     }
 

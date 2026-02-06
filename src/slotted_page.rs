@@ -75,6 +75,21 @@ pub fn clear_slot(page: &mut [u8], slot_id: u16) {
     write_slot(page, slot_id, 0, 0);
 }
 
+pub fn read_key(page: &[u8], slot_id: u16) -> Option<Vec<u8>> {
+    if page.len() != PAGE_SIZE {
+        return None;
+    }
+    let (pos, len) = read_slot(page, slot_id);
+    if len as usize != payload_len() {
+        return None;
+    }
+    let pos = pos as usize;
+    if pos + KEY_SIZE > PAGE_SIZE {
+        return None;
+    }
+    Some(page[pos..pos + KEY_SIZE].to_vec())
+}
+
 /// Read the value at a slot, verifying the key matches.
 pub fn read_value(page: &[u8], slot_id: u16, key: &[u8]) -> Option<Vec<u8>> {
     if page.len() != PAGE_SIZE || key.len() != KEY_SIZE {
