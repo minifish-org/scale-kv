@@ -610,11 +610,6 @@ impl EmbeddedTxn {
             tree.insert(key.to_vec(), slot_ref)?;
         }
 
-        // Pull dirty bptree pages from provider and stage into txn.
-        for (pid, page) in self.compute.provider.take_dirty() {
-            self.write_page(pid, page);
-        }
-
         Ok(())
     }
 
@@ -705,9 +700,6 @@ impl EmbeddedTxn {
             tree.remove(key)?;
         }
 
-        for (pid, page) in self.compute.provider.take_dirty() {
-            self.write_page(pid, page);
-        }
         Ok(())
     }
 
@@ -737,6 +729,11 @@ impl EmbeddedTxn {
         };
         drop(tree);
         self.write_page(META_PAGE_ID, meta.encode());
+
+        // Pull dirty bptree pages from provider and stage into txn.
+        for (pid, page) in self.compute.provider.take_dirty() {
+            self.write_page(pid, page);
+        }
 
         // Reserve LSN range first so we can stamp commit_lsn into modified records.
         let pages_vec: Vec<(PageId, Page)> = self.dirty.into_iter().collect();

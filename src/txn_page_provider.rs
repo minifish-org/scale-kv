@@ -57,6 +57,10 @@ impl TxnPageProvider {
 
 impl PageProvider for TxnPageProvider {
     fn read_page(&self, page_id: PageId) -> Option<Page> {
+        // Prefer in-txn dirty version.
+        if let Some(p) = self.dirty.lock().unwrap().get(&page_id).cloned() {
+            return Some(p);
+        }
         if let Some(p) = self.pages.get(page_id) {
             return Some(p);
         }
