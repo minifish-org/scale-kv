@@ -1,4 +1,4 @@
-use crate::node::{WAL_OP_TXN_COMMIT, WAL_OP_TXN_DEL, WAL_OP_TXN_PUT};
+// (no legacy WAL/TXN op constants needed for page-level redo)
 use crate::storage_capnp::storage;
 use crate::{Result, StorageNode};
 use capnp::capability::Promise;
@@ -50,29 +50,25 @@ impl storage::Server for StorageService {
         let request_id = batch.get_request_id();
         let start_lsn = batch.get_start_lsn();
         let end_lsn = batch.get_end_lsn();
-        let records = match batch.get_records() {
-            Ok(r) => r,
+        let writes = match batch.get_writes() {
+            Ok(w) => w,
             Err(err) => return Promise::err(err),
         };
 
-        let mut ops: Vec<(u8, Vec<u8>, Vec<u8>)> = Vec::with_capacity(records.len() as usize);
-        for rec in records.iter() {
-            let op = rec.get_op();
-            let key = rec.get_key().map(|k| k.to_vec()).unwrap_or_default();
-            let value = rec.get_value().map(|v| v.to_vec()).unwrap_or_default();
-            let mapped_op = match op {
-                1 => WAL_OP_TXN_PUT,
-                2 => WAL_OP_TXN_DEL,
-                3 => WAL_OP_TXN_COMMIT,
-                _ => return Promise::err(capnp::Error::failed(format!("invalid txn op: {op}"))),
+        let mut page_writes: Vec<(u64, Vec<u8>)> = Vec::with_capacity(writes.len() as usize);
+        for w in writes.iter() {
+            let page_id = w.get_page_id();
+            let page = match w.get_page() {
+                Ok(p) => p.to_vec(),
+                Err(err) => return Promise::err(err),
             };
-            ops.push((mapped_op, key, value));
+            page_writes.push((page_id, page));
         }
 
         let data = self.data.clone();
         Promise::from_future(async move {
             let commit_lsn = data
-                .append_txn_batch_with_lsn_sync(request_id, start_lsn, end_lsn, ops)
+                .append_txn_batch_with_lsn_sync(request_id, start_lsn, end_lsn, page_writes)
                 .await
                 .map_err(|err| capnp::Error::failed(err.to_string()))?;
             let mut res = results.get();

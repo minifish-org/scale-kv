@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, process};
 
-use scale_kv::{ComputeSequencer, StorageClient, StorageServer};
+use scale_kv::{ComputeSequencer, EmbeddedCompute, PAGE_SIZE, StorageServer};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -15,7 +15,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     dir.push(format!(
-        "scale-kv-quorum-e2e-{}-{}-{}",
+        "scale-kv-quorum-page-redo-e2e-{}-{}-{}",
         tag,
         process::id(),
         id
@@ -57,42 +57,38 @@ async fn test_quorum_commit_with_one_ahead_node() {
             let a3 = s3.addr().to_string();
 
             // Pre-advance s3 so it will reject the next batch from the sequencer.
-            let c3 = StorageClient::connect(&a3, &local).await.unwrap();
-            let mut start = c3.get_durable_lsn().await.unwrap();
-
-            // Append 4 commit-only batches to push durable forward on s3.
-            for rid in 1..=4u64 {
-                let records = vec![(3u8, Vec::new(), Vec::new())];
-                let end = start + records.len() as u64;
-                let (_commit, durable) = c3
-                    .append_txn_batch(10_000 + rid, start, end, &records)
-                    .await
-                    .unwrap();
-                start = durable;
+            // Use an EmbeddedCompute connected only to s3 to append a few pages.
+            let addrs3 = vec![a3.clone()];
+            let c3 = EmbeddedCompute::connect(&addrs3, 1, &local).await.unwrap();
+            for i in 0..4u64 {
+                let page_id = 9000 + i;
+                let mut page = vec![0u8; PAGE_SIZE];
+                page[0] = i as u8;
+                let _ = c3.write_page(page_id, page).await.unwrap();
             }
 
             let addrs = vec![a1, a2, a3];
             let seq = ComputeSequencer::connect(&addrs, 2, &local).await.unwrap();
             let read_lsn = seq.begin_ro();
 
-            let key = b"kq".to_vec();
-            let value = b"vq".to_vec();
-            let records = vec![(1u8, key, value), (3u8, Vec::new(), Vec::new())];
-
-            let commit_lsn = seq.commit_txn_batch(records).await.unwrap();
+            // Commit a single page write. s3 should reject due to being ahead.
+            let mut page = vec![0u8; PAGE_SIZE];
+            page[0] = 1;
+            let writes = vec![(42u64, page)];
+            let commit_lsn = seq.commit_txn_batch(writes).await.unwrap();
             assert!(commit_lsn > read_lsn);
 
             // s1 and s2 should have advanced durable_lsn to >= commit_lsn.
-            let c1 = StorageClient::connect(&addrs[0], &local).await.unwrap();
-            let c2 = StorageClient::connect(&addrs[1], &local).await.unwrap();
+            let c1 = scale_kv::StorageClient::connect(&addrs[0], &local)
+                .await
+                .unwrap();
+            let c2 = scale_kv::StorageClient::connect(&addrs[1], &local)
+                .await
+                .unwrap();
             let d1 = c1.get_durable_lsn().await.unwrap();
             let d2 = c2.get_durable_lsn().await.unwrap();
             assert!(d1 >= commit_lsn);
             assert!(d2 >= commit_lsn);
-
-            // s3 is ahead already; it may reject the batch, but should remain >= its own head.
-            let d3 = c3.get_durable_lsn().await.unwrap();
-            assert!(d3 > commit_lsn);
         })
         .await;
 

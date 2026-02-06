@@ -1,18 +1,19 @@
 @0x9f5b7c9a2b4d4f1c;
 
-# A single logical record in a transaction batch.
-struct TxnRecord {
-  op @0 :UInt8;    # 1=PUT, 2=DEL, 3=COMMIT
-  key @1 :Data;
-  value @2 :Data;
+# A single page after-image write.
+struct PageWrite {
+  pageId @0 :UInt64;
+  page @1 :Data; # raw page bytes (PAGE_SIZE)
 }
 
 # A txn batch with compute-assigned LSN range.
+#
+# Aurora-style: compute sends page after-images; storage persists and replays them.
 struct TxnBatch {
   requestId @0 :UInt64; # for idempotent retry; persisted in WAL
   startLsn @1 :UInt64;
   endLsn @2 :UInt64;    # exclusive right boundary; commit point
-  records @3 :List(TxnRecord);
+  writes @3 :List(PageWrite);
 }
 
 struct PageItem {

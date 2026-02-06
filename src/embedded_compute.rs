@@ -1,34 +1,23 @@
 use crate::compute_sequencer::ComputeSequencer;
 use crate::page_bptree::{DEFAULT_PAGE_CACHE_SHARDS, PageCache};
-use crate::{Error, PageId, Result, StorageClient};
+use crate::{Error, PAGE_SIZE, Page, PageId, Result, StorageClient};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::task::LocalSet;
 
-/// Embedded compute-side API for an Aurora-style KV.
+/// Embedded compute-side API for an Aurora-style KV (page-level redo).
 ///
 /// - No compute server / network protocol required.
-/// - All writes are committed as txn WAL batches via [`ComputeSequencer`].
-/// - Reads are served from compute's in-memory MVCC state.
-///
-/// Note: page fetch (`getPage/scanPages`) is provided by storage for compute warmup,
-/// but this embedded compute currently does not rebuild state from pages yet.
+/// - All writes are committed as page after-images via [`ComputeSequencer`].
+/// - Storage persists and replays pages into PageStore.
+/// - Compute can warm up by scanning pages and caching them locally.
 #[derive(Clone)]
 pub struct EmbeddedCompute {
     sequencer: Arc<ComputeSequencer>,
     readers: Arc<Vec<StorageClient>>,
 
-    // Warmed pages. (Eventually this should back the compute-side page cache / B+Tree.)
+    /// Warmed pages. (Eventually this should back the compute-side B+Tree + data pages.)
     page_cache: Arc<PageCache>,
-
-    // key -> versions sorted by commit_lsn (append-only)
-    mvcc: Arc<Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
-}
-
-#[derive(Clone, Debug)]
-struct MvccVersion {
-    commit_lsn: u64,
-    value: Option<Vec<u8>>,
 }
 
 impl EmbeddedCompute {
@@ -44,7 +33,6 @@ impl EmbeddedCompute {
             sequencer,
             readers: Arc::new(readers),
             page_cache: Arc::new(PageCache::new(DEFAULT_PAGE_CACHE_SHARDS)),
-            mvcc: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -61,17 +49,36 @@ impl EmbeddedCompute {
         self.page_cache.len()
     }
 
+    pub fn cached_page(&self, page_id: PageId) -> Option<Page> {
+        self.page_cache.get(page_id)
+    }
+
+    /// Begin a read-write transaction context (buffer page writes until commit).
+    pub fn begin(&self) -> EmbeddedTxn {
+        EmbeddedTxn {
+            compute: self.clone(),
+            dirty: BTreeMap::new(),
+        }
+    }
+
+    /// Convenience: auto-wrap a single page write and commit.
+    pub async fn write_page(&self, page_id: PageId, page: Page) -> Result<u64> {
+        let mut txn = self.begin();
+        txn.write_page(page_id, page);
+        txn.commit().await
+    }
+
     /// Warm up compute by scanning pages from storage and caching them locally.
-    ///
-    /// This uses `scanPages` and fetches the latest pages only.
     ///
     /// Returns the number of pages cached.
     pub async fn warmup_scan_all(&self, limit_per_batch: u32) -> Result<usize> {
         let limit_per_batch = limit_per_batch.max(1);
 
-        // Pick the first reader for warmup.
         let reader = self.readers.get(0).ok_or_else(|| {
-            Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "no storage"))
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "no storage readers",
+            ))
         })?;
 
         let mut start: PageId = 0;
@@ -85,7 +92,6 @@ impl EmbeddedCompute {
                 self.page_cache.insert(*page_id, page.clone());
             }
 
-            // Continue from the largest page id we saw + 1.
             if let Some((last_id, _, _)) = pages.last() {
                 start = last_id.saturating_add(1);
             } else {
@@ -96,107 +102,39 @@ impl EmbeddedCompute {
         Ok(self.page_cache.len())
     }
 
-    /// Begin a read-write transaction context (buffer ops until commit).
-    pub fn begin(&self) -> EmbeddedTxn {
-        EmbeddedTxn {
-            compute: self.clone(),
-            records: Vec::new(),
-        }
-    }
-
-    /// Convenience: auto-wrap a single PUT in its own txn and commit.
-    pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<u64> {
-        let mut txn = self.begin();
-        txn.put(key, value);
-        txn.commit().await
-    }
-
-    /// Convenience: auto-wrap a single DELETE in its own txn and commit.
-    pub async fn delete(&self, key: Vec<u8>) -> Result<u64> {
-        let mut txn = self.begin();
-        txn.delete(key);
-        txn.commit().await
-    }
-
-    /// Read at a specific snapshot (read_lsn) from compute MVCC.
-    pub fn get_at(&self, key: &[u8], read_lsn: u64) -> Result<Option<Vec<u8>>> {
-        let store = self.mvcc.lock().unwrap();
-        let versions = store.get(key);
-        if versions.is_none() {
-            return Ok(None);
-        }
-        let versions = versions.unwrap();
-        let found = versions
-            .iter()
-            .rfind(|v| v.commit_lsn <= read_lsn)
-            .map(|v| v.value.clone())
-            .unwrap_or(None);
-        Ok(found)
-    }
-
-    /// Convenience: read at the latest quorum-durable snapshot.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let read_lsn = self.begin_ro();
-        self.get_at(key, read_lsn)
-    }
-
-    async fn commit_records(&self, mut records: Vec<(u8, Vec<u8>, Vec<u8>)>) -> Result<u64> {
-        // Ensure COMMIT marker.
-        if records.last().map(|r| r.0).is_none_or(|op| op != 3) {
-            records.push((3, Vec::new(), Vec::new()));
-        }
-
-        let commit_lsn = self.sequencer.commit_txn_batch(records.clone()).await?;
-
-        // Apply to compute MVCC at commit point.
-        let mut store = self.mvcc.lock().unwrap();
-        for (op, key, value) in records {
-            match op {
-                1 => {
-                    store.entry(key).or_default().push(MvccVersion {
-                        commit_lsn,
-                        value: Some(value),
-                    });
-                }
-                2 => {
-                    store.entry(key).or_default().push(MvccVersion {
-                        commit_lsn,
-                        value: None,
-                    });
-                }
-                3 => {}
-                _ => {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("invalid txn op: {op}"),
-                    )));
-                }
+    async fn commit_writes(&self, writes: Vec<(PageId, Page)>) -> Result<u64> {
+        // Store-side expects each record to represent one page write at one LSN.
+        for (_id, p) in &writes {
+            if p.len() != PAGE_SIZE {
+                return Err(Error::InvalidPageSize(p.len(), PAGE_SIZE));
             }
+        }
+        let commit_lsn = self.sequencer.commit_txn_batch(writes.clone()).await?;
+
+        // Apply locally to cache as well.
+        for (page_id, page) in writes {
+            self.page_cache.insert(page_id, page);
         }
 
         Ok(commit_lsn)
     }
 }
 
-/// An embedded, buffered transaction.
-///
-/// If you never call [`EmbeddedCompute::begin`], you can still use `put/delete` which
-/// auto-wrap each operation in its own txn.
+/// Buffered page-writes transaction.
 pub struct EmbeddedTxn {
     compute: EmbeddedCompute,
-    records: Vec<(u8, Vec<u8>, Vec<u8>)>,
+
+    // page_id -> latest after-image in this txn
+    dirty: BTreeMap<PageId, Page>,
 }
 
 impl EmbeddedTxn {
-    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.records.push((1, key, value));
-    }
-
-    pub fn delete(&mut self, key: Vec<u8>) {
-        self.records.push((2, key, Vec::new()));
+    pub fn write_page(&mut self, page_id: PageId, page: Page) {
+        self.dirty.insert(page_id, page);
     }
 
     pub async fn commit(self) -> Result<u64> {
-        self.compute.commit_records(self.records).await
+        let writes: Vec<(PageId, Page)> = self.dirty.into_iter().collect();
+        self.compute.commit_writes(writes).await
     }
 }

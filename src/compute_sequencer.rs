@@ -1,4 +1,3 @@
-use crate::node::{WAL_OP_TXN_COMMIT, WAL_OP_TXN_DEL, WAL_OP_TXN_PUT};
 use crate::{Error, Result, StorageClient, StorageQuorumClient};
 use futures::future::join_all;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,28 +51,32 @@ impl ComputeSequencer {
         self.request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Replicate a txn batch represented as logical ops.
+    /// Replicate a txn batch represented as page after-images.
     ///
-    /// `records` format: (op, key, value)
-    /// - op: 1=PUT, 2=DEL, 3=COMMIT
-    ///
-    /// Requirements:
-    /// - records must be non-empty
-    /// - last record must be COMMIT marker
+    /// `writes` format: (page_id, page_bytes)
     ///
     /// Returns commitLsn (= end_lsn) on success.
-    pub async fn commit_txn_batch(&self, records: Vec<(u8, Vec<u8>, Vec<u8>)>) -> Result<u64> {
-        if records.is_empty() {
-            return Err(Error::InvalidKeySize(0, 1));
-        }
-        if records.last().map(|r| r.0) != Some(3) {
+    pub async fn commit_txn_batch(&self, writes: Vec<(u64, Vec<u8>)>) -> Result<u64> {
+        const MAX_WRITES_PER_TXN: usize = 256;
+
+        if writes.is_empty() {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "txn batch must end with COMMIT marker",
+                "txn batch must be non-empty",
+            )));
+        }
+        if writes.len() > MAX_WRITES_PER_TXN {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "txn batch too large: writes={} max={}",
+                    writes.len(),
+                    MAX_WRITES_PER_TXN
+                ),
             )));
         }
 
-        let n = records.len() as u64;
+        let n = writes.len() as u64;
         let start_lsn = self.next_lsn.load(Ordering::Acquire);
         let end_lsn = start_lsn + n;
 
@@ -83,7 +86,7 @@ impl ComputeSequencer {
         let futs = self
             .clients
             .iter()
-            .map(|c| c.append_txn_batch(request_id, start_lsn, end_lsn, &records));
+            .map(|c| c.append_txn_batch(request_id, start_lsn, end_lsn, &writes));
         let results = join_all(futs).await;
 
         let mut acks: Vec<u64> = Vec::new();
@@ -138,22 +141,4 @@ impl ComputeSequencer {
 
         Ok(end_lsn)
     }
-
-    pub fn make_commit_marker() -> (u8, Vec<u8>, Vec<u8>) {
-        (3, Vec::new(), Vec::new())
-    }
-
-    pub fn make_put(key: Vec<u8>, value: Vec<u8>) -> (u8, Vec<u8>, Vec<u8>) {
-        (1, key, value)
-    }
-
-    pub fn make_del(key: Vec<u8>) -> (u8, Vec<u8>, Vec<u8>) {
-        (2, key, Vec::new())
-    }
-}
-
-// Keep these constants referenced to avoid drift between layers.
-#[allow(dead_code)]
-fn _op_sanity() {
-    let _ = (WAL_OP_TXN_PUT, WAL_OP_TXN_DEL, WAL_OP_TXN_COMMIT);
 }

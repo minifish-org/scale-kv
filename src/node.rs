@@ -283,9 +283,14 @@ pub struct WalRecord {
     pub value: Vec<u8>,
 }
 
-// WAL ops for page/slot records (legacy)
-pub const WAL_OP_PAGE_PUT: u8 = 1;
-pub const WAL_OP_PAGE_DEL: u8 = 2;
+// WAL ops for page records.
+//
+// Aurora-style: storage replays page after-images into PageStore.
+pub const WAL_OP_PAGE_IMAGE: u8 = 1;
+
+// Legacy slot-level ops (kept for potential experiments/tests).
+pub const WAL_OP_PAGE_PUT: u8 = 11;
+pub const WAL_OP_PAGE_DEL: u8 = 12;
 
 // WAL ops for txn MVCC records
 pub const WAL_OP_TXN_PUT: u8 = 11;
@@ -613,7 +618,7 @@ async fn replay_wal_segments_to_store(
                 if record.lsn <= replay.last_applied() {
                     continue;
                 }
-                // Skip txn records.
+                // Skip logical txn records (deprecated). Page-level redo uses WAL_OP_PAGE_IMAGE.
                 if record.op == WAL_OP_TXN_PUT
                     || record.op == WAL_OP_TXN_DEL
                     || record.op == WAL_OP_TXN_COMMIT
@@ -629,6 +634,13 @@ async fn replay_wal_segments_to_store(
 
 fn apply_wal_record(page: &mut [u8], record: &WalRecord) -> Result<()> {
     match record.op {
+        WAL_OP_PAGE_IMAGE => {
+            if record.value.len() != PAGE_SIZE {
+                return Err(crate::Error::InvalidPageSize(record.value.len(), PAGE_SIZE));
+            }
+            page.copy_from_slice(&record.value);
+            Ok(())
+        }
         WAL_OP_PAGE_PUT => {
             insert_record_at_slot_checked(page, record.slot_id, &record.key, &record.value)
         }
@@ -945,7 +957,7 @@ impl StorageNode {
         request_id: u64,
         start_lsn: u64,
         end_lsn: u64,
-        records: Vec<(u8, Vec<u8>, Vec<u8>)>,
+        writes: Vec<(PageId, Page)>,
     ) -> Result<u64> {
         // Idempotent retry: if we've already committed this request_id, return the same commit_lsn.
         if request_id != 0 {
@@ -954,21 +966,14 @@ impl StorageNode {
             }
         }
 
-        // Enforce: last record must be COMMIT.
-        if records.is_empty() {
+        if writes.is_empty() {
             return Err(crate::Error::Io(Error::new(
                 ErrorKind::InvalidInput,
                 "txn batch must be non-empty",
             )));
         }
-        if records.last().map(|(op, _, _)| *op) != Some(WAL_OP_TXN_COMMIT) {
-            return Err(crate::Error::Io(Error::new(
-                ErrorKind::InvalidInput,
-                "txn batch must end with COMMIT",
-            )));
-        }
 
-        let expected_end = start_lsn + records.len() as u64;
+        let expected_end = start_lsn + writes.len() as u64;
         if end_lsn != expected_end {
             return Err(crate::Error::Io(Error::new(
                 ErrorKind::InvalidInput,
@@ -979,16 +984,19 @@ impl StorageNode {
             )));
         }
 
-        let mut wal_records = Vec::with_capacity(records.len());
-        for (idx, (op, key, value)) in records.into_iter().enumerate() {
+        let mut wal_records = Vec::with_capacity(writes.len());
+        for (idx, (page_id, page)) in writes.into_iter().enumerate() {
+            if page.len() != PAGE_SIZE {
+                return Err(crate::Error::InvalidPageSize(page.len(), PAGE_SIZE));
+            }
             let lsn = start_lsn + idx as u64;
             wal_records.push(WalRecord {
                 lsn,
-                op,
-                page_id: 0,
+                op: WAL_OP_PAGE_IMAGE,
+                page_id,
                 slot_id: 0,
-                key,
-                value,
+                key: Vec::new(),
+                value: page,
             });
         }
 
@@ -1377,7 +1385,7 @@ mod tests {
             records: vec![
                 WalRecord {
                     lsn: 1,
-                    op: 1,
+                    op: WAL_OP_PAGE_PUT,
                     page_id: 7,
                     slot_id: 0,
                     key: b"k1".to_vec(),
@@ -1385,7 +1393,7 @@ mod tests {
                 },
                 WalRecord {
                     lsn: 2,
-                    op: 2,
+                    op: WAL_OP_PAGE_DEL,
                     page_id: 7,
                     slot_id: 0,
                     key: b"k1".to_vec(),
@@ -1427,7 +1435,7 @@ mod tests {
         let records = vec![
             WalRecord {
                 lsn: 1,
-                op: 1,
+                op: WAL_OP_PAGE_PUT,
                 page_id: 10,
                 slot_id: 0,
                 key: fixed_key_bytes(b"k1"),
@@ -1435,7 +1443,7 @@ mod tests {
             },
             WalRecord {
                 lsn: 2,
-                op: 1,
+                op: WAL_OP_PAGE_PUT,
                 page_id: 10,
                 slot_id: 1,
                 key: fixed_key_bytes(b"k2"),

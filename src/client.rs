@@ -59,13 +59,13 @@ impl StorageClient {
 
     /// Append a txn batch with compute-assigned LSN range.
     ///
-    /// `records`: (op, key, value), where op is 1=PUT, 2=DEL, 3=COMMIT.
+    /// Aurora-style: `writes` are page after-images (pageId + raw page bytes).
     pub async fn append_txn_batch(
         &self,
         request_id: u64,
         start_lsn: u64,
         end_lsn: u64,
-        records: &[(u8, Vec<u8>, Vec<u8>)],
+        writes: &[(PageId, Page)],
     ) -> Result<(u64, u64)> {
         let mut request = self.client.append_txn_batch_request();
         {
@@ -74,12 +74,11 @@ impl StorageClient {
             b.set_request_id(request_id);
             b.set_start_lsn(start_lsn);
             b.set_end_lsn(end_lsn);
-            let mut list = b.init_records(records.len() as u32);
-            for (i, (op, key, value)) in records.iter().enumerate() {
-                let mut rec = list.reborrow().get(i as u32);
-                rec.set_op(*op);
-                rec.set_key(key);
-                rec.set_value(value);
+            let mut list = b.init_writes(writes.len() as u32);
+            for (i, (page_id, page)) in writes.iter().enumerate() {
+                let mut w = list.reborrow().get(i as u32);
+                w.set_page_id(*page_id);
+                w.set_page(page);
             }
         }
         let response = request.send().promise.await?;
