@@ -476,6 +476,18 @@ impl EmbeddedTxn {
                 &old_value,
             )?;
 
+            if let Some(slot_key) = slotted_page::read_key(&page, slot.slot_id) {
+                if slot_key.as_slice() != key {
+                    eprintln!(
+                        "[overwrite-debug] key mismatch before overwrite: page_id={} slot_id={} key_hex={} slot_key_hex={}",
+                        slot.page_id,
+                        slot.slot_id,
+                        hex::encode(key),
+                        hex::encode(&slot_key)
+                    );
+                }
+            }
+
             slotted_page::overwrite_value(&mut page, slot.slot_id, key, value)?;
             slotted_page::write_flags(&mut page, slot.slot_id, 0);
             slotted_page::write_undo_ptr(&mut page, slot.slot_id, Some(undo_ptr));
