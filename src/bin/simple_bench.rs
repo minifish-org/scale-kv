@@ -71,6 +71,15 @@ async fn main() -> anyhow::Result<()> {
                 (records as f64) / dur.as_secs_f64()
             );
 
+            if matches!(std::env::var("SCALE_KV_VERIFY_LOAD").as_deref(), Ok("1")) {
+                eprintln!("verifying mapping after load...");
+                let mut tx = compute.begin();
+                for j in 0..(records as u64).min(10_000) {
+                    let k = key_for(j);
+                    tx.debug_check_mapping(&k).unwrap();
+                }
+            }
+
             use rand::RngCore;
             let mut rng = rand::rngs::StdRng::seed_from_u64(0x5ca1e);
 

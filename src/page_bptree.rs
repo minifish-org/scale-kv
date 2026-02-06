@@ -478,6 +478,30 @@ impl<P: PageProvider> PageBPlusTree<P> {
         out
     }
 
+    pub fn debug_leaf_entries(&self, key: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let (leaf_id, _) = self.find_leaf(key);
+        let page = match self.provider.read_page(leaf_id) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        let header = page_header(&page);
+        if header.page_type != PAGE_TYPE_LEAF {
+            return Vec::new();
+        }
+        let n = (header.key_count as usize).min(limit);
+        let mut out = Vec::with_capacity(n);
+        for idx in 0..n {
+            let Some(k) = entry_key_at(&page, idx) else {
+                break;
+            };
+            let Some(v) = entry_value_at(&page, idx) else {
+                break;
+            };
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        out
+    }
+
     pub fn range_visit(&self, start: &[u8], end: &[u8], mut f: impl FnMut(&[u8], SlotRef) -> bool) {
         let (mut leaf_id, _) = self.find_leaf(start);
 

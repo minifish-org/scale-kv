@@ -724,6 +724,53 @@ impl EmbeddedTxn {
         Ok(None)
     }
 
+    pub fn debug_check_mapping(&mut self, key: &[u8]) -> Result<()> {
+        let tree = self.compute.tree.lock().unwrap();
+        let slot = tree.get(key);
+        let leaf_entries = tree.debug_leaf_entries(key, 16);
+        drop(tree);
+
+        let Some(slot) = slot else {
+            eprintln!(
+                "[verify] missing key in btree: key_hex={}",
+                hex::encode(key)
+            );
+            return Ok(());
+        };
+
+        let page = self
+            .get_page_for_read(slot.page_id)
+            .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
+        let slot_key = slotted_page::read_key(&page, slot.slot_id);
+
+        if slot_key.as_deref() != Some(key) {
+            let slot_key_hex = slot_key
+                .as_ref()
+                .map(|k| hex::encode(k))
+                .unwrap_or_else(|| "<none>".to_string());
+            let slot_info = slotted_page::debug_slot(&page, slot.slot_id)
+                .map(|(pos, len)| format!("pos={pos} len={len}"))
+                .unwrap_or_else(|| "<none>".to_string());
+
+            let leaf_entries_hex: Vec<(String, String)> = leaf_entries
+                .into_iter()
+                .map(|(k, v)| (hex::encode(k), hex::encode(v)))
+                .collect();
+
+            eprintln!(
+                "[verify] mapping mismatch: key_hex={} slot_ref=({}, {}) slot_key_hex={} {} leaf_entries_hex={:?}",
+                hex::encode(key),
+                slot.page_id,
+                slot.slot_id,
+                slot_key_hex,
+                slot_info,
+                leaf_entries_hex
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
         // Find slotref (if any).
         let existing = {
