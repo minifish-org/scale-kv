@@ -22,8 +22,10 @@ pub struct EmbeddedCompute {
     sequencer: Arc<ComputeSequencer>,
     readers: Arc<Vec<Arc<StorageClient>>>,
 
+    min_read_lsn: Arc<std::sync::atomic::AtomicU64>,
+
     page_cache: Arc<PageCache>,
-    page_fetcher: Arc<dyn Fn(PageId) -> Option<Page>>,
+    page_fetcher: Arc<dyn Fn(PageId, u64) -> Option<Page>>,
     provider: Arc<TxnPageProvider>,
     tree: Arc<Mutex<PageBPlusTree<TxnPageProvider>>>,
 }
@@ -47,24 +49,43 @@ impl EmbeddedCompute {
             Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "no readers"))
         })?;
         let handle = tokio::runtime::Handle::current();
-        let page_fetcher: Arc<dyn Fn(PageId) -> Option<Page>> = Arc::new(move |pid| {
+        let page_fetcher: Arc<dyn Fn(PageId, u64) -> Option<Page>> = Arc::new(move |pid, need| {
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
-                    match reader0.get_page(pid).await {
-                        Ok(Some((page, _page_lsn, _durable))) => Some(page),
-                        Ok(None) => None,
-                        Err(_) => None,
+                    let mut backoff_ms = 1u64;
+                    for _ in 0..200 {
+                        match reader0.get_page(pid).await {
+                            Ok(Some((page, _page_lsn, durable))) => {
+                                if durable >= need {
+                                    return Some(page);
+                                }
+                            }
+                            Ok(None) => return None,
+                            Err(_) => {}
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(50);
                     }
+                    None
                 })
             })
         });
 
         let next_page_id = Arc::new(AtomicU64::new(1));
+        let min_read_lsn = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let min_read_lsn2 = Arc::clone(&min_read_lsn);
+        let page_fetcher2 = Arc::clone(&page_fetcher);
+
+        let fetcher_for_provider: Arc<dyn Fn(PageId) -> Option<Page>> = Arc::new(move |pid| {
+            let need = min_read_lsn2.load(std::sync::atomic::Ordering::Acquire);
+            page_fetcher2(pid, need)
+        });
+
         let provider = Arc::new(TxnPageProvider::new(
             page_cache.clone(),
             next_page_id,
             BTREE_META_PAGE_ID,
-            page_fetcher.clone(),
+            fetcher_for_provider,
         ));
         let tree = Arc::new(Mutex::new(PageBPlusTree::with_provider(
             (*provider).clone(),
@@ -73,6 +94,7 @@ impl EmbeddedCompute {
         let this = Self {
             sequencer,
             readers: Arc::new(readers),
+            min_read_lsn,
             page_cache,
             page_fetcher,
             provider,
@@ -100,11 +122,11 @@ impl EmbeddedCompute {
         self.page_cache.get(page_id)
     }
 
-    pub fn get_page_blocking(&self, page_id: PageId) -> Option<Page> {
+    pub fn get_page_blocking(&self, page_id: PageId, need_lsn: u64) -> Option<Page> {
         if let Some(p) = self.page_cache.get(page_id) {
             return Some(p);
         }
-        let p = (self.page_fetcher)(page_id)?;
+        let p = (self.page_fetcher)(page_id, need_lsn)?;
         self.page_cache.insert(page_id, p.clone());
         Some(p)
     }
@@ -216,10 +238,16 @@ impl EmbeddedCompute {
     pub fn begin(&self) -> EmbeddedTxn {
         // Clear dirty pages collected by provider from any previous operations.
         let _ = self.provider.take_dirty();
+        let read_lsn = self.begin_ro();
+        // make sure demand paging won't read behind our snapshot fence
+        self.min_read_lsn
+            .fetch_max(read_lsn, std::sync::atomic::Ordering::AcqRel);
+
         EmbeddedTxn {
             compute: self.clone(),
-            read_lsn: self.begin_ro(),
+            read_lsn,
             dirty: BTreeMap::new(),
+            ro_cache: BTreeMap::new(),
             modified: Vec::new(),
             undo_page_id: None,
         }
@@ -299,6 +327,7 @@ pub struct EmbeddedTxn {
     compute: EmbeddedCompute,
     read_lsn: u64,
     dirty: BTreeMap<PageId, Page>,
+    ro_cache: BTreeMap<PageId, Page>,
     modified: Vec<(PageId, u16, [u8; KEY_SIZE])>,
 
     // undo page writer (single page buffered)
@@ -310,11 +339,21 @@ impl EmbeddedTxn {
         self.dirty.insert(page_id, page);
     }
 
-    fn get_page_for_read(&self, page_id: PageId) -> Option<Page> {
-        self.dirty
-            .get(&page_id)
-            .cloned()
-            .or_else(|| self.compute.get_page_blocking(page_id))
+    fn get_page_for_read(&mut self, page_id: PageId) -> Option<Page> {
+        if let Some(p) = self.dirty.get(&page_id).cloned() {
+            return Some(p);
+        }
+        if let Some(p) = self.ro_cache.get(&page_id).cloned() {
+            return Some(p);
+        }
+        if let Some(p) = self.compute.page_cache.get(page_id) {
+            self.ro_cache.insert(page_id, p.clone());
+            return Some(p);
+        }
+        let p = (self.compute.page_fetcher)(page_id, self.read_lsn)?;
+        self.compute.page_cache.insert(page_id, p.clone());
+        self.ro_cache.insert(page_id, p.clone());
+        Some(p)
     }
 
     fn append_undo(
@@ -397,9 +436,7 @@ impl EmbeddedTxn {
         // Update existing record in-place.
         if let Some(slot) = existing {
             let mut page = self
-                .compute
-                .page_cache
-                .get(slot.page_id)
+                .get_page_for_read(slot.page_id)
                 .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
             // Write undo before overwriting.
             let old_commit = slotted_page::read_commit_lsn(&page, slot.slot_id, key).unwrap_or(0);
@@ -611,9 +648,7 @@ impl EmbeddedTxn {
 
         if let Some(slot) = existing {
             let mut page = self
-                .compute
-                .page_cache
-                .get(slot.page_id)
+                .get_page_for_read(slot.page_id)
                 .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
 
             // Write undo before tombstoning.
