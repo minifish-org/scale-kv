@@ -16,10 +16,10 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 lru = "0.12"
+rand = "0.8"
 
 [dev-dependencies]
 criterion = "0.5"
-rand = "0.8"
 sled = "0.34"
 tempfile = "3"
 

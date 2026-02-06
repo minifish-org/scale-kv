@@ -2,7 +2,7 @@ use crate::{Error, PAGE_SIZE, Page, PageId, Result, VALUE_SIZE};
 
 pub const UNDO_PAGE_TYPE: u8 = 1;
 
-pub const UNDO_RECORD_SIZE: usize = 56;
+pub const UNDO_RECORD_SIZE: usize = 36 + VALUE_SIZE;
 
 /// Undo pointer stored in data records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

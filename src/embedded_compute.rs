@@ -175,8 +175,15 @@ impl EmbeddedCompute {
         let _ = self.warmup_scan_all(256).await;
 
         if let Some(global_meta_bytes) = self.page_cache.get(META_PAGE_ID) {
-            let meta = MetaPage::decode(&global_meta_bytes)?;
+            let mut meta = MetaPage::decode(&global_meta_bytes)?;
             self.provider.set_next_page_id(meta.next_bptree_page_id);
+
+            // Backward-compat guard: older meta pages may have next_undo_page_id=0.
+            if meta.next_undo_page_id < 2_000_000 {
+                meta.next_undo_page_id = 2_000_000;
+                // best-effort persist
+                let _ = self.write_page(META_PAGE_ID, meta.encode()).await;
+            }
 
             // Prefer btree metapage for root.
             if let Some(btree_meta_bytes) = self.page_cache.get(BTREE_META_PAGE_ID) {
@@ -200,6 +207,7 @@ impl EmbeddedCompute {
         const BPTREE_ROOT_ID: PageId = 10;
         const DATA_BASE: PageId = 1_000_000;
         const UNDO_BASE: PageId = 2_000_000;
+        const UNDO_BASE_DEFAULT: PageId = UNDO_BASE;
         const FSM_LEVEL0_BASE: PageId = 2;
         const INIT_DATA_LEAVES: u64 = 1024; // tracks first 1024 data pages initially
 
@@ -393,6 +401,9 @@ impl EmbeddedTxn {
         let mut page = current_id
             .and_then(|pid| self.get_page_for_read(pid))
             .unwrap_or_else(undo_pg::new_undo_page);
+        if meta.next_undo_page_id < 2_000_000 {
+            meta.next_undo_page_id = 2_000_000;
+        }
         if current_id.is_none() {
             current_id = Some(meta.next_undo_page_id);
             meta.next_undo_page_id += 1;

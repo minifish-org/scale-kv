@@ -107,12 +107,16 @@ impl ComputeSequencer {
         let mut errs: Vec<String> = Vec::new();
         for r in results {
             match r {
-                Ok((_commit, durable)) => {
-                    if durable >= end_lsn {
+                Ok((commit, durable)) => {
+                    // Storage returns commit_lsn (= end_lsn) only after WAL is flushed and replay applied.
+                    // Treat commit_lsn as the authoritative quorum-ack.
+                    if commit >= end_lsn {
+                        acks.push(commit);
+                    } else if durable >= end_lsn {
                         acks.push(durable);
                     } else {
                         errs.push(format!(
-                            "ack durable_lsn too small: got={durable} need>={end_lsn}"
+                            "ack too small: commit={commit} durable={durable} need>={end_lsn}"
                         ));
                     }
                 }
