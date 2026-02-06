@@ -343,8 +343,10 @@ impl EmbeddedTxn {
         let mut fsm_meta = fsm_meta;
         if leaf_idx >= fsm_meta.leaf_count {
             // Grow FSM to cover this leaf.
+            // Grow exponentially to reduce frequency of FSM expansion.
             let desired = leaf_idx + 1;
-            let (new_meta, grow_writes) = crate::fsm_pg::ensure_capacity(&fsm_meta, desired)?;
+            let target = fsm_meta.leaf_count.saturating_mul(2).max(desired).max(1024);
+            let (new_meta, grow_writes) = crate::fsm_pg::ensure_capacity(&fsm_meta, target)?;
             for (pid, p) in grow_writes {
                 self.write_page(pid, p);
             }
