@@ -632,6 +632,25 @@ impl EmbeddedTxn {
         {
             let mut tree = self.compute.tree.lock().unwrap();
             tree.insert(key.to_vec(), slot_ref)?;
+
+            // Debug self-check: read-after-write of btree mapping.
+            if let Some(sr2) = tree.get(key) {
+                if sr2.page_id != slot_ref.page_id || sr2.slot_id != slot_ref.slot_id {
+                    eprintln!(
+                        "[selfcheck] btree slot_ref mismatch: key_hex={} wrote=({}, {}) read=({}, {})",
+                        hex::encode(key),
+                        slot_ref.page_id,
+                        slot_ref.slot_id,
+                        sr2.page_id,
+                        sr2.slot_id
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[selfcheck] btree missing immediately after insert: key_hex={}",
+                    hex::encode(key)
+                );
+            }
         }
 
         // Debug self-check: btree mapping must point to a slot whose key matches.
@@ -649,8 +668,10 @@ impl EmbeddedTxn {
                 }
             } else {
                 eprintln!(
-                    "[selfcheck] slot missing after put: key={:?} page_id={} slot_id={}",
-                    key, slot_ref.page_id, slot_ref.slot_id
+                    "[selfcheck] slot missing after put: key_hex={} page_id={} slot_id={}",
+                    hex::encode(key),
+                    slot_ref.page_id,
+                    slot_ref.slot_id
                 );
             }
         }
