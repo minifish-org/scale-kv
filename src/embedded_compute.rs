@@ -7,7 +7,7 @@ use crate::txn_page_provider::TxnPageProvider;
 use crate::{
     Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, StorageClient, VALUE_SIZE, slotted_page,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use tokio::task::LocalSet;
@@ -23,6 +23,8 @@ pub struct EmbeddedCompute {
     page_cache: Arc<PageCache>,
     provider: Arc<TxnPageProvider>,
     tree: Arc<Mutex<PageBPlusTree<TxnPageProvider>>>,
+
+    fsm: Arc<Mutex<FreeSpaceMap>>,
 }
 
 impl EmbeddedCompute {
@@ -41,12 +43,15 @@ impl EmbeddedCompute {
             (*provider).clone(),
         )));
 
+        let fsm = Arc::new(Mutex::new(FreeSpaceMap::new()));
+
         let this = Self {
             sequencer,
             readers: Arc::new(readers),
             page_cache,
             provider,
             tree,
+            fsm,
         };
 
         // Initialize or recover meta/root.
@@ -220,6 +225,66 @@ impl EmbeddedCompute {
     }
 }
 
+const BUCKET_SIZE: usize = 1024;
+
+fn bucket_count() -> usize {
+    PAGE_SIZE / BUCKET_SIZE + 1
+}
+
+fn bucket_index(free: usize) -> usize {
+    let count = bucket_count();
+    if count == 0 {
+        0
+    } else {
+        (free / BUCKET_SIZE).min(count - 1)
+    }
+}
+
+/// Very simple in-memory free-space map for data pages.
+///
+/// It only tracks pages we have already created/updated in this process.
+struct FreeSpaceMap {
+    buckets: Vec<VecDeque<PageId>>,
+    free_space: HashMap<PageId, usize>,
+}
+
+impl FreeSpaceMap {
+    fn new() -> Self {
+        let mut buckets = Vec::with_capacity(bucket_count());
+        for _ in 0..bucket_count() {
+            buckets.push(VecDeque::new());
+        }
+        Self {
+            buckets,
+            free_space: HashMap::new(),
+        }
+    }
+
+    fn track_page(&mut self, page_id: PageId, free: usize) {
+        self.free_space.insert(page_id, free);
+        let idx = bucket_index(free);
+        self.buckets[idx].push_back(page_id);
+    }
+
+    fn update_page(&mut self, page_id: PageId, free: usize) {
+        self.track_page(page_id, free)
+    }
+
+    fn pick_page(&mut self, required: usize) -> Option<PageId> {
+        let start = bucket_index(required);
+        for idx in start..self.buckets.len() {
+            while let Some(page_id) = self.buckets[idx].pop_front() {
+                if let Some(free) = self.free_space.get(&page_id) {
+                    if *free >= required {
+                        return Some(page_id);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Buffered transaction that tracks all dirty pages (tree pages + data pages + meta page).
 pub struct EmbeddedTxn {
     compute: EmbeddedCompute,
@@ -249,11 +314,34 @@ impl EmbeddedTxn {
             return Ok(slot);
         }
 
-        // Insert new record into a new data page (simple for now).
-        // TODO: add FSM and reuse existing pages with enough free space.
+        // Try reuse an existing page with enough free space.
+        // Required bytes: payload + (maybe) slot entry.
+        let required = KEY_SIZE + VALUE_SIZE + 4;
+
+        // Check candidate pages from FSM.
+        let picked = { self.compute.fsm.lock().unwrap().pick_page(required) };
+        if let Some(page_id) = picked {
+            if let Some(mut page) = self.compute.page_cache.get(page_id) {
+                if let Ok(slot_id) = slotted_page::insert_record(&mut page, key, value) {
+                    self.write_page(page_id, page.clone());
+                    // Update FSM with new free space.
+                    let free = slotted_page::page_free_space(&page);
+                    self.compute.fsm.lock().unwrap().update_page(page_id, free);
+                    return Ok(PageSlotRef { page_id, slot_id });
+                }
+            }
+        }
+
+        // Otherwise allocate a new data page.
         let data_page_id = self.compute.provider.alloc_page_id();
         let mut page = slotted_page::new_page();
         let slot_id = slotted_page::insert_record(&mut page, key, value)?;
+        let free = slotted_page::page_free_space(&page);
+        self.compute
+            .fsm
+            .lock()
+            .unwrap()
+            .track_page(data_page_id, free);
         self.write_page(data_page_id, page);
         Ok(PageSlotRef {
             page_id: data_page_id,
