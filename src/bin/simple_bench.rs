@@ -18,20 +18,14 @@ fn parse_arg(args: &[String], key: &str) -> Option<String> {
 }
 
 fn key_for(i: u64) -> Vec<u8> {
-    let mut k = format!("k{i:016}").into_bytes();
-    while k.len() < KEY_SIZE {
-        k.push(b'x');
-    }
-    k.truncate(KEY_SIZE);
+    let mut k = vec![0u8; KEY_SIZE];
+    k[..8].copy_from_slice(&i.to_le_bytes());
     k
 }
 
 fn val_for(i: u64) -> Vec<u8> {
-    let mut v = format!("v{i:016}").into_bytes();
-    while v.len() < VALUE_SIZE {
-        v.push(b'y');
-    }
-    v.truncate(VALUE_SIZE);
+    let mut v = vec![0u8; VALUE_SIZE];
+    v[..8].copy_from_slice(&i.to_le_bytes());
     v
 }
 
