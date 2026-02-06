@@ -15,6 +15,12 @@ pub use page_bptree::{
 pub mod page_store;
 pub use page_store::{BufferPoolConfig, BufferStats, CheckpointConfig, PageStore};
 
+pub mod meta_page;
+pub use meta_page::{META_PAGE_ID, MetaPage};
+
+pub mod txn_page_provider;
+pub use txn_page_provider::TxnPageProvider;
+
 pub mod node;
 pub use node::StorageNode;
 

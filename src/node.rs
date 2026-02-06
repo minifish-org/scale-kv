@@ -28,6 +28,10 @@ pub struct StorageNode {
     durable_lsn: Arc<std::sync::atomic::AtomicU64>,
     next_lsn: Arc<std::sync::atomic::AtomicU64>,
 
+    // last applied (replayed) LSN (inclusive)
+    applied_lsn: Arc<std::sync::atomic::AtomicU64>,
+    applied_notify: Arc<tokio::sync::Notify>,
+
     // MVCC store for txnGet/appendTxnBatch. Key is raw bytes.
     mvcc: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
     // requestId -> commitLsn (end_lsn) for idempotent retry
@@ -55,6 +59,8 @@ struct PageStoreReplay {
     dir: PathBuf,
     last_applied_lsn: std::sync::Mutex<u64>,
     page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
+    applied_lsn: Arc<std::sync::atomic::AtomicU64>,
+    applied_notify: Arc<tokio::sync::Notify>,
 }
 
 impl PageStoreReplay {
@@ -63,12 +69,17 @@ impl PageStoreReplay {
         dir: PathBuf,
         last_applied_lsn: u64,
         page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
+        applied_lsn: Arc<std::sync::atomic::AtomicU64>,
+        applied_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
+        applied_lsn.store(last_applied_lsn, std::sync::atomic::Ordering::Release);
         Self {
             page_store,
             dir,
             last_applied_lsn: std::sync::Mutex::new(last_applied_lsn),
             page_index,
+            applied_lsn,
+            applied_notify,
         }
     }
 
@@ -97,6 +108,9 @@ impl PageStoreReplay {
             }
         };
         if should_write {
+            self.applied_lsn
+                .store(lsn, std::sync::atomic::Ordering::Release);
+            self.applied_notify.notify_waiters();
             let _ = write_wal_state(&self.dir, lsn).await;
         }
     }
@@ -596,7 +610,14 @@ async fn replay_wal_segments_to_store(
     if segments.is_empty() {
         return Ok(());
     }
-    let replay = PageStoreReplay::new(page_store, dir.to_path_buf(), last_applied_lsn, page_index);
+    let replay = PageStoreReplay::new(
+        page_store,
+        dir.to_path_buf(),
+        last_applied_lsn,
+        page_index,
+        Arc::new(std::sync::atomic::AtomicU64::new(last_applied_lsn)),
+        Arc::new(tokio::sync::Notify::new()),
+    );
     for file_id in segments {
         let path = wal_segment_path(dir, file_id);
         let mut file = File::open(&path).await?;
@@ -833,6 +854,9 @@ impl StorageNode {
         let (wal_sender, wal_replay_rx) =
             start_wal_writer(dir.clone(), durable_lsn.clone()).await?;
 
+        let applied_lsn = Arc::new(std::sync::atomic::AtomicU64::new(last_applied_lsn));
+        let applied_notify = Arc::new(tokio::sync::Notify::new());
+
         let node = Self {
             dir: dir.clone(),
             page_store: Arc::clone(&page_store),
@@ -841,6 +865,8 @@ impl StorageNode {
             wal_replay_rx: Mutex::new(Some(wal_replay_rx)),
             durable_lsn,
             next_lsn,
+            applied_lsn,
+            applied_notify,
             mvcc,
             request_index,
         };
@@ -1027,6 +1053,7 @@ impl StorageNode {
             ))
         })?;
         let (tx, rx) = oneshot::channel();
+        let end_lsn = batch.end_lsn;
         sender
             .send(WalWriteRequest {
                 batch,
@@ -1034,8 +1061,17 @@ impl StorageNode {
             })
             .await
             .map_err(|_| crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal queue closed")))?;
-        rx.await
-            .map_err(|_| crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal ack dropped")))?
+        let durable = rx.await.map_err(|_| {
+            crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal ack dropped"))
+        })??;
+
+        // Wait until WAL replay has applied all records up to end_lsn-1.
+        let target = end_lsn.saturating_sub(1);
+        while self.applied_lsn.load(std::sync::atomic::Ordering::Acquire) < target {
+            self.applied_notify.notified().await;
+        }
+
+        Ok(durable)
     }
 
     pub async fn start_wal_replay(&self, last_applied_lsn: u64) {
@@ -1049,6 +1085,8 @@ impl StorageNode {
             self.dir.clone(),
             last_applied_lsn,
             Arc::clone(&self.page_index),
+            Arc::clone(&self.applied_lsn),
+            Arc::clone(&self.applied_notify),
         );
         let mvcc = self.mvcc.clone();
         let req_index = self.request_index.clone();
@@ -1431,6 +1469,8 @@ mod tests {
             dir.clone(),
             0,
             Arc::new(std::sync::Mutex::new(HashSet::new())),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(tokio::sync::Notify::new()),
         );
         let records = vec![
             WalRecord {

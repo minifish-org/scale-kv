@@ -481,7 +481,7 @@ fn write_header(page: &mut Page, header: PageHeader) {
     page[12..20].copy_from_slice(&header.left_child.to_le_bytes());
 }
 
-fn new_page(page_type: u8, level: u8) -> Page {
+pub fn new_page(page_type: u8, level: u8) -> Page {
     let mut page = vec![0u8; PAGE_SIZE];
     let header = PageHeader {
         page_type,

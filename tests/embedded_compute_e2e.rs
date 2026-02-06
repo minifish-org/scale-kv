@@ -57,6 +57,18 @@ async fn test_page_redo_commit_and_recover_by_scan() {
             let warmed = compute2.warmup_scan_all(256).await.unwrap();
             assert!(warmed >= 1);
 
+            if compute2.cached_page(page_id).is_none() {
+                // Debug: scan directly from storage
+                let c = scale_kv::StorageClient::connect(&addrs[0], &local)
+                    .await
+                    .unwrap();
+                let (pages, _) = c.scan_pages(0, 256).await.unwrap();
+                panic!(
+                    "page not warmed; scanPages returned ids: {:?}",
+                    pages.iter().map(|(id, _, _)| *id).collect::<Vec<_>>()
+                );
+            }
+
             let got = compute2.cached_page(page_id).unwrap();
             assert_eq!(got, page);
         })
