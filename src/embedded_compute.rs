@@ -4,7 +4,9 @@ use crate::page_bptree::{
     DEFAULT_PAGE_CACHE_SHARDS, PageBPlusTree, PageCache, PageProvider, SlotRef as PageSlotRef,
 };
 use crate::txn_page_provider::TxnPageProvider;
-use crate::{Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, StorageClient, VALUE_SIZE};
+use crate::{
+    Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, StorageClient, VALUE_SIZE, slotted_page,
+};
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -171,12 +173,20 @@ impl EmbeddedCompute {
         let tree = self.tree.lock().unwrap();
         let slot = tree.get(key);
         drop(tree);
-        let Some(slot) = slot else { return Ok(None) };
+        let Some(slot) = slot else {
+            return Ok(None);
+        };
         let page = self
             .page_cache
             .get(slot.page_id)
             .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
-        Ok(Some(read_value_from_data_page(&page)?))
+        let v = slotted_page::read_value(&page, slot.slot_id, key).ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "record missing",
+            ))
+        })?;
+        Ok(Some(v))
     }
 
     pub async fn delete(&self, key: &[u8]) -> Result<u64> {
@@ -221,25 +231,33 @@ impl EmbeddedTxn {
         self.dirty.insert(page_id, page);
     }
 
-    /// Simplest data page layout: [key(16) | value(1024) | zero padding].
-    fn alloc_or_reuse_data_page(
+    fn alloc_or_update_data_page(
         &mut self,
         existing: Option<PageSlotRef>,
         key: &[u8],
         value: &[u8],
     ) -> Result<PageSlotRef> {
-        let data_page_id = if let Some(slot) = existing {
-            slot.page_id
-        } else {
-            self.compute.provider.alloc_page_id()
-        };
-        let mut page = vec![0u8; PAGE_SIZE];
-        page[0..KEY_SIZE].copy_from_slice(key);
-        page[KEY_SIZE..KEY_SIZE + VALUE_SIZE].copy_from_slice(value);
+        if let Some(slot) = existing {
+            // In-place overwrite value.
+            let mut page = self
+                .compute
+                .page_cache
+                .get(slot.page_id)
+                .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
+            slotted_page::overwrite_value(&mut page, slot.slot_id, key, value)?;
+            self.write_page(slot.page_id, page);
+            return Ok(slot);
+        }
+
+        // Insert new record into a new data page (simple for now).
+        // TODO: add FSM and reuse existing pages with enough free space.
+        let data_page_id = self.compute.provider.alloc_page_id();
+        let mut page = slotted_page::new_page();
+        let slot_id = slotted_page::insert_record(&mut page, key, value)?;
         self.write_page(data_page_id, page);
         Ok(PageSlotRef {
             page_id: data_page_id,
-            slot_id: 0,
+            slot_id,
         })
     }
 
@@ -251,7 +269,7 @@ impl EmbeddedTxn {
         };
 
         // Write/allocate data page.
-        let slot_ref = self.alloc_or_reuse_data_page(existing, key, value)?;
+        let slot_ref = self.alloc_or_update_data_page(existing, key, value)?;
 
         // Update B+Tree mapping.
         {
@@ -268,10 +286,27 @@ impl EmbeddedTxn {
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+        // Find slotref (if any).
+        let existing = {
+            let tree = self.compute.tree.lock().unwrap();
+            tree.get(key)
+        };
+
+        if let Some(slot) = existing {
+            let mut page = self
+                .compute
+                .page_cache
+                .get(slot.page_id)
+                .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
+            slotted_page::clear_slot(&mut page, slot.slot_id);
+            self.write_page(slot.page_id, page);
+        }
+
         {
             let mut tree = self.compute.tree.lock().unwrap();
             tree.remove(key)?;
         }
+
         for (pid, page) in self.compute.provider.take_dirty() {
             self.write_page(pid, page);
         }
@@ -291,11 +326,4 @@ impl EmbeddedTxn {
         let pages: Vec<(PageId, Page)> = self.dirty.into_iter().collect();
         self.compute.commit_pages(pages).await
     }
-}
-
-fn read_value_from_data_page(page: &[u8]) -> Result<Vec<u8>> {
-    if page.len() != PAGE_SIZE {
-        return Err(Error::InvalidPageSize(page.len(), PAGE_SIZE));
-    }
-    Ok(page[KEY_SIZE..KEY_SIZE + VALUE_SIZE].to_vec())
 }
