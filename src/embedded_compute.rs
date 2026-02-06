@@ -7,7 +7,7 @@ use crate::txn_page_provider::TxnPageProvider;
 use crate::{
     Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, StorageClient, VALUE_SIZE, slotted_page,
 };
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use tokio::task::LocalSet;
@@ -23,8 +23,6 @@ pub struct EmbeddedCompute {
     page_cache: Arc<PageCache>,
     provider: Arc<TxnPageProvider>,
     tree: Arc<Mutex<PageBPlusTree<TxnPageProvider>>>,
-
-    fsm: Arc<Mutex<FreeSpaceMap>>,
 }
 
 impl EmbeddedCompute {
@@ -43,15 +41,12 @@ impl EmbeddedCompute {
             (*provider).clone(),
         )));
 
-        let fsm = Arc::new(Mutex::new(FreeSpaceMap::new()));
-
         let this = Self {
             sequencer,
             readers: Arc::new(readers),
             page_cache,
             provider,
             tree,
-            fsm,
         };
 
         // Initialize or recover meta/root.
@@ -111,28 +106,48 @@ impl EmbeddedCompute {
             let meta = MetaPage::decode(&meta_bytes)?;
             // configure provider root + next_page_id
             self.provider.set_root_page_id(meta.root_page_id);
-            self.provider.set_next_page_id(meta.next_page_id);
+            self.provider.set_next_page_id(meta.next_bptree_page_id);
             return Ok(());
         }
 
-        // Cold start: create meta page + root page as one txn.
+        // Cold start: create meta + FSM + root page as one txn.
+        // PageId plan (simple):
+        // - 0: meta
+        // - 1: fsm meta
+        // - 2.. : fsm level pages
+        // - 10.. : bptree pages
+        // - 1_000_000.. : data pages
+
+        const BPTREE_ROOT_ID: PageId = 10;
+        const DATA_BASE: PageId = 1_000_000;
+        const FSM_LEVEL0_BASE: PageId = 2;
+        const INIT_DATA_LEAVES: u64 = 1024; // tracks first 1024 data pages initially
+
+        // Stash these conventions into the page cache for later use (simple approach: store them in meta in next iteration).
+
         let mut tx = self.begin();
-        let root_id: PageId = 1;
-        let next_id: PageId = 2;
 
-        // Create empty root leaf page using a temporary in-txn provider write.
+        // Configure provider root + next_page_id (next after reserved ids).
         let mut tree = self.tree.lock().unwrap();
-        tree.provider_mut().set_root_page_id(root_id);
-        self.provider.set_next_page_id(next_id);
+        tree.provider_mut().set_root_page_id(BPTREE_ROOT_ID);
+        self.provider.set_next_page_id(BPTREE_ROOT_ID + 1);
 
-        // Root leaf page: ask the B+Tree helper to init via new_with_provider semantics.
-        // We mimic it here to avoid reallocating ids.
-        let root_page = crate::page_bptree::new_page(2, 0); // PAGE_TYPE_LEAF=2, level=0
-        tx.write_page(root_id, root_page);
+        // Root leaf page.
+        let root_page = crate::page_bptree::new_page(2, 0);
+        tx.write_page(BPTREE_ROOT_ID, root_page);
 
+        // FSM pages (empty).
+        let (_fsm_meta, fsm_writes) =
+            crate::fsm_pg::init_fsm_pages(DATA_BASE, INIT_DATA_LEAVES, FSM_LEVEL0_BASE);
+        for (pid, page) in fsm_writes {
+            tx.write_page(pid, page);
+        }
+
+        // Meta page.
         let meta = MetaPage {
-            root_page_id: root_id,
-            next_page_id: next_id,
+            root_page_id: BPTREE_ROOT_ID,
+            next_bptree_page_id: BPTREE_ROOT_ID + 1,
+            next_data_page_id: DATA_BASE,
         };
         tx.write_page(META_PAGE_ID, meta.encode());
 
@@ -225,66 +240,6 @@ impl EmbeddedCompute {
     }
 }
 
-const BUCKET_SIZE: usize = 1024;
-
-fn bucket_count() -> usize {
-    PAGE_SIZE / BUCKET_SIZE + 1
-}
-
-fn bucket_index(free: usize) -> usize {
-    let count = bucket_count();
-    if count == 0 {
-        0
-    } else {
-        (free / BUCKET_SIZE).min(count - 1)
-    }
-}
-
-/// Very simple in-memory free-space map for data pages.
-///
-/// It only tracks pages we have already created/updated in this process.
-struct FreeSpaceMap {
-    buckets: Vec<VecDeque<PageId>>,
-    free_space: HashMap<PageId, usize>,
-}
-
-impl FreeSpaceMap {
-    fn new() -> Self {
-        let mut buckets = Vec::with_capacity(bucket_count());
-        for _ in 0..bucket_count() {
-            buckets.push(VecDeque::new());
-        }
-        Self {
-            buckets,
-            free_space: HashMap::new(),
-        }
-    }
-
-    fn track_page(&mut self, page_id: PageId, free: usize) {
-        self.free_space.insert(page_id, free);
-        let idx = bucket_index(free);
-        self.buckets[idx].push_back(page_id);
-    }
-
-    fn update_page(&mut self, page_id: PageId, free: usize) {
-        self.track_page(page_id, free)
-    }
-
-    fn pick_page(&mut self, required: usize) -> Option<PageId> {
-        let start = bucket_index(required);
-        for idx in start..self.buckets.len() {
-            while let Some(page_id) = self.buckets[idx].pop_front() {
-                if let Some(free) = self.free_space.get(&page_id) {
-                    if *free >= required {
-                        return Some(page_id);
-                    }
-                }
-            }
-        }
-        None
-    }
-}
-
 /// Buffered transaction that tracks all dirty pages (tree pages + data pages + meta page).
 pub struct EmbeddedTxn {
     compute: EmbeddedCompute,
@@ -302,8 +257,8 @@ impl EmbeddedTxn {
         key: &[u8],
         value: &[u8],
     ) -> Result<PageSlotRef> {
+        // Update existing record in-place.
         if let Some(slot) = existing {
-            // In-place overwrite value.
             let mut page = self
                 .compute
                 .page_cache
@@ -314,39 +269,99 @@ impl EmbeddedTxn {
             return Ok(slot);
         }
 
-        // Try reuse an existing page with enough free space.
-        // Required bytes: payload + (maybe) slot entry.
-        let required = KEY_SIZE + VALUE_SIZE + 4;
+        // Load meta + FSM meta.
+        let meta_bytes = self
+            .compute
+            .page_cache
+            .get(META_PAGE_ID)
+            .ok_or(Error::InMemoryPageMissing(META_PAGE_ID))?;
+        let mut meta = MetaPage::decode(&meta_bytes)?;
 
-        // Check candidate pages from FSM.
-        let picked = { self.compute.fsm.lock().unwrap().pick_page(required) };
-        if let Some(page_id) = picked {
+        let fsm_meta_bytes = self
+            .compute
+            .page_cache
+            .get(crate::fsm_pg::FSM_META_PAGE_ID)
+            .ok_or(Error::InMemoryPageMissing(crate::fsm_pg::FSM_META_PAGE_ID))?;
+        let fsm_meta = crate::fsm_pg::FsmMeta::decode(&fsm_meta_bytes)?;
+
+        // Required bytes: payload + possible new slot entry.
+        let required = KEY_SIZE + VALUE_SIZE + 4;
+        let need_class = crate::fsm_pg::need_class(required);
+
+        let cache = Arc::clone(&self.compute.page_cache);
+        let get_page = move |pid: PageId| cache.get(pid);
+
+        // Try find a candidate leaf index and insert.
+        for _ in 0..8 {
+            let cand = crate::fsm_pg::find_candidate(&fsm_meta, &get_page, need_class)?;
+            let Some(leaf_idx) = cand else {
+                break;
+            };
+            let page_id = fsm_meta.data_base + leaf_idx;
             if let Some(mut page) = self.compute.page_cache.get(page_id) {
-                if let Ok(slot_id) = slotted_page::insert_record(&mut page, key, value) {
-                    self.write_page(page_id, page.clone());
-                    // Update FSM with new free space.
-                    let free = slotted_page::page_free_space(&page);
-                    self.compute.fsm.lock().unwrap().update_page(page_id, free);
-                    return Ok(PageSlotRef { page_id, slot_id });
+                match slotted_page::insert_record(&mut page, key, value) {
+                    Ok(slot_id) => {
+                        self.write_page(page_id, page.clone());
+                        let free = slotted_page::page_free_space(&page);
+                        let class = crate::fsm_pg::class_from_free_bytes(free);
+                        for (pid, p) in
+                            crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, class)?
+                        {
+                            self.write_page(pid, p);
+                        }
+                        return Ok(PageSlotRef { page_id, slot_id });
+                    }
+                    Err(_) => {
+                        // FSM hint was stale; fix it downwards based on current page header.
+                        let free = slotted_page::page_free_space(&page);
+                        let class = crate::fsm_pg::class_from_free_bytes(free);
+                        for (pid, p) in
+                            crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, class)?
+                        {
+                            self.write_page(pid, p);
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                // Page not present yet; treat as empty (class 0).
+                for (pid, p) in crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, 0)? {
+                    self.write_page(pid, p);
                 }
             }
         }
 
-        // Otherwise allocate a new data page.
-        let data_page_id = self.compute.provider.alloc_page_id();
+        // Allocate a new data page.
+        let page_id = meta.next_data_page_id;
+        if page_id < fsm_meta.data_base {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "next_data_page_id below data_base",
+            )));
+        }
+        let leaf_idx = page_id - fsm_meta.data_base;
+        if leaf_idx >= fsm_meta.leaf_count {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fsm leaf_count exceeded (need resize)",
+            )));
+        }
+
         let mut page = slotted_page::new_page();
         let slot_id = slotted_page::insert_record(&mut page, key, value)?;
+        self.write_page(page_id, page.clone());
+
         let free = slotted_page::page_free_space(&page);
-        self.compute
-            .fsm
-            .lock()
-            .unwrap()
-            .track_page(data_page_id, free);
-        self.write_page(data_page_id, page);
-        Ok(PageSlotRef {
-            page_id: data_page_id,
-            slot_id,
-        })
+        let class = crate::fsm_pg::class_from_free_bytes(free);
+        for (pid, p) in crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, class)? {
+            self.write_page(pid, p);
+        }
+
+        // Advance next_data_page_id and persist meta.
+        meta.next_data_page_id = page_id + 1;
+        self.write_page(META_PAGE_ID, meta.encode());
+
+        Ok(PageSlotRef { page_id, slot_id })
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -404,9 +419,24 @@ impl EmbeddedTxn {
     pub async fn commit(mut self) -> Result<u64> {
         // Also persist meta page updates for next_page_id/root.
         let tree = self.compute.tree.lock().unwrap();
+        let old_meta_bytes = if let Some(p) = self.dirty.get(&META_PAGE_ID) {
+            p.clone()
+        } else if let Some(p) = self.compute.page_cache.get(META_PAGE_ID) {
+            p
+        } else {
+            // During cold start, meta page may not exist yet; assume next_data_page_id is unchanged.
+            MetaPage {
+                root_page_id: tree.root_page_id(),
+                next_bptree_page_id: self.compute.provider.next_page_id(),
+                next_data_page_id: 1_000_000,
+            }
+            .encode()
+        };
+        let old_meta = MetaPage::decode(&old_meta_bytes)?;
         let meta = MetaPage {
             root_page_id: tree.root_page_id(),
-            next_page_id: self.compute.provider.next_page_id(),
+            next_bptree_page_id: self.compute.provider.next_page_id(),
+            next_data_page_id: old_meta.next_data_page_id,
         };
         drop(tree);
         self.write_page(META_PAGE_ID, meta.encode());

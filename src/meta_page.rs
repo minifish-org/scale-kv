@@ -9,11 +9,13 @@ const VERSION: u32 = 1;
 /// - [0..8)   magic
 /// - [8..12)  version (u32 LE)
 /// - [12..20) root_page_id (u64 LE)
-/// - [20..28) next_page_id (u64 LE)
+/// - [20..28) next_bptree_page_id (u64 LE)
+/// - [28..36) next_data_page_id (u64 LE)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetaPage {
     pub root_page_id: PageId,
-    pub next_page_id: PageId,
+    pub next_bptree_page_id: PageId,
+    pub next_data_page_id: PageId,
 }
 
 impl MetaPage {
@@ -22,7 +24,8 @@ impl MetaPage {
         page[0..8].copy_from_slice(MAGIC);
         page[8..12].copy_from_slice(&VERSION.to_le_bytes());
         page[12..20].copy_from_slice(&self.root_page_id.to_le_bytes());
-        page[20..28].copy_from_slice(&self.next_page_id.to_le_bytes());
+        page[20..28].copy_from_slice(&self.next_bptree_page_id.to_le_bytes());
+        page[28..36].copy_from_slice(&self.next_data_page_id.to_le_bytes());
         page
     }
 
@@ -47,11 +50,14 @@ impl MetaPage {
         }
         let mut root = [0u8; 8];
         root.copy_from_slice(&page[12..20]);
-        let mut next = [0u8; 8];
-        next.copy_from_slice(&page[20..28]);
+        let mut next_bptree = [0u8; 8];
+        next_bptree.copy_from_slice(&page[20..28]);
+        let mut next_data = [0u8; 8];
+        next_data.copy_from_slice(&page[28..36]);
         Ok(Self {
             root_page_id: u64::from_le_bytes(root),
-            next_page_id: u64::from_le_bytes(next),
+            next_bptree_page_id: u64::from_le_bytes(next_bptree),
+            next_data_page_id: u64::from_le_bytes(next_data),
         })
     }
 }

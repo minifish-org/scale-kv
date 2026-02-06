@@ -20,6 +20,8 @@ pub use meta_page::{META_PAGE_ID, MetaPage};
 
 pub mod slotted_page;
 
+pub mod fsm_pg;
+
 pub mod txn_page_provider;
 pub use txn_page_provider::TxnPageProvider;
 
