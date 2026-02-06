@@ -211,20 +211,48 @@ impl PageStore {
     }
 
     pub async fn get(&self, page_id: PageId) -> Option<Page> {
+        self.get_with_lsn(page_id).await.map(|(p, _lsn)| p)
+    }
+
+    /// Get the latest page bytes and a best-effort page LSN.
+    ///
+    /// Note: pages persisted in `pages.dat` currently do not encode LSN, so pages
+    /// loaded from disk will return `page_lsn=0`.
+    pub async fn get_with_lsn(&self, page_id: PageId) -> Option<(Page, u64)> {
         {
             let mut pool = self.buffer_pool.write().unwrap();
             if let Some(bp) = pool.get_mut(&page_id) {
                 bp.touch();
-                return Some(bp.data.to_vec());
+                return Some((bp.data.to_vec(), bp.lsn));
             }
         }
 
         let mut pf = self.page_file.lock().await;
         match pf.read_page(page_id).await {
-            Ok(Some(data)) => Some(data),
+            Ok(Some(data)) => Some((data, 0)),
             Ok(None) => None,
             Err(_) => None,
         }
+    }
+
+    /// Scan pages starting from `start_page_id` and return up to `limit` pages.
+    pub async fn scan_pages_with_lsn(
+        &self,
+        start_page_id: PageId,
+        limit: usize,
+    ) -> Vec<(PageId, u64, Page)> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return out;
+        }
+        let max_id = self.max_page_id.load(Ordering::Acquire);
+        let end = (start_page_id.saturating_add(limit as u64)).min(max_id.saturating_add(1));
+        for page_id in start_page_id..end {
+            if let Some((page, lsn)) = self.get_with_lsn(page_id).await {
+                out.push((page_id, lsn, page));
+            }
+        }
+        out
     }
 
     pub fn put(&self, page_id: PageId, data: &[u8], lsn: u64) -> Result<()> {

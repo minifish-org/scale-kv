@@ -900,6 +900,10 @@ impl StorageNode {
         Ok(())
     }
 
+    // NOTE: alloc_lsn_range was used by the legacy `append_txn_batch_sync` where storage
+    // assigned LSNs. In Aurora-style replication, compute assigns LSNs, so this is no longer
+    // used by the RPC path.
+    #[allow(dead_code)]
     fn alloc_lsn_range(&self, n: u64) -> (u64, u64) {
         if n == 0 {
             let cur = self.next_lsn.load(std::sync::atomic::Ordering::Relaxed);
@@ -912,13 +916,35 @@ impl StorageNode {
         (start, end)
     }
 
+    #[allow(dead_code)]
     pub fn txn_get(&self, key: &[u8], read_lsn: u64) -> Option<Option<Vec<u8>>> {
         mvcc_get_at(&self.mvcc, key, read_lsn)
     }
 
-    pub async fn append_txn_batch_sync(
+    /// Fetch a raw page (latest) and a best-effort page LSN.
+    pub async fn get_page_latest(&self, page_id: PageId) -> Option<(Page, u64)> {
+        self.page_store.get_with_lsn(page_id).await
+    }
+
+    /// Scan pages (latest) for warmup.
+    pub async fn scan_pages_latest(
+        &self,
+        start_page_id: PageId,
+        limit: usize,
+    ) -> Vec<(PageId, u64, Page)> {
+        self.page_store
+            .scan_pages_with_lsn(start_page_id, limit)
+            .await
+    }
+
+    /// Append a txn batch with compute-assigned LSN range.
+    ///
+    /// `end_lsn` is the exclusive right boundary; commit point uses `end_lsn`.
+    pub async fn append_txn_batch_with_lsn_sync(
         &self,
         request_id: u64,
+        start_lsn: u64,
+        end_lsn: u64,
         records: Vec<(u8, Vec<u8>, Vec<u8>)>,
     ) -> Result<u64> {
         // Idempotent retry: if we've already committed this request_id, return the same commit_lsn.
@@ -942,8 +968,16 @@ impl StorageNode {
             )));
         }
 
-        let count = records.len() as u64;
-        let (start_lsn, end_lsn) = self.alloc_lsn_range(count);
+        let expected_end = start_lsn + records.len() as u64;
+        if end_lsn != expected_end {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "txn batch end_lsn mismatch: got={} expected={}",
+                    end_lsn, expected_end
+                ),
+            )));
+        }
 
         let mut wal_records = Vec::with_capacity(records.len());
         for (idx, (op, key, value)) in records.into_iter().enumerate() {

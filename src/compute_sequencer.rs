@@ -1,4 +1,4 @@
-use crate::node::{WAL_OP_TXN_COMMIT, WalBatch, WalRecord};
+use crate::node::{WAL_OP_TXN_COMMIT, WAL_OP_TXN_DEL, WAL_OP_TXN_PUT};
 use crate::{Error, Result, StorageClient, StorageQuorumClient};
 use futures::future::join_all;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,13 +6,13 @@ use tokio::task::LocalSet;
 
 /// Compute-side sequencer.
 ///
-/// Assigns a global LSN (single-writer) and replicates the same WAL batch to storage nodes,
+/// Assigns a global LSN (single-writer) and replicates the same txn batch to storage nodes,
 /// returning success only after quorum acks.
 pub struct ComputeSequencer {
     clients: Vec<StorageClient>,
     quorum: usize,
-    next_lsn: AtomicU64, // exclusive right boundary
-    request_id: AtomicU64,
+    next_lsn: AtomicU64,    // exclusive right boundary
+    request_id: AtomicU64,  // per-sequencer request id generator
     durable_lsn: AtomicU64, // quorum-durable right boundary cache
 }
 
@@ -52,18 +52,21 @@ impl ComputeSequencer {
         self.request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Replicate a txn batch represented as WAL records.
+    /// Replicate a txn batch represented as logical ops.
+    ///
+    /// `records` format: (op, key, value)
+    /// - op: 1=PUT, 2=DEL, 3=COMMIT
     ///
     /// Requirements:
     /// - records must be non-empty
-    /// - last record must be COMMIT marker (WAL_OP_TXN_COMMIT)
+    /// - last record must be COMMIT marker
     ///
     /// Returns commitLsn (= end_lsn) on success.
-    pub async fn commit_txn_batch(&self, mut records: Vec<WalRecord>) -> Result<u64> {
+    pub async fn commit_txn_batch(&self, records: Vec<(u8, Vec<u8>, Vec<u8>)>) -> Result<u64> {
         if records.is_empty() {
             return Err(Error::InvalidKeySize(0, 1));
         }
-        if records.last().map(|r| r.op) != Some(WAL_OP_TXN_COMMIT) {
+        if records.last().map(|r| r.0) != Some(3) {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "txn batch must end with COMMIT marker",
@@ -74,28 +77,20 @@ impl ComputeSequencer {
         let start_lsn = self.next_lsn.load(Ordering::Acquire);
         let end_lsn = start_lsn + n;
 
-        // Fill record LSNs sequentially.
-        for (i, rec) in records.iter_mut().enumerate() {
-            rec.lsn = start_lsn + i as u64;
-        }
-
         let request_id = self.next_request_id();
-        let batch = WalBatch {
-            request_id,
-            start_lsn,
-            end_lsn,
-            records,
-        };
 
         // Fan-out to all storage nodes.
-        let futs = self.clients.iter().map(|c| c.append_wal(&batch));
+        let futs = self
+            .clients
+            .iter()
+            .map(|c| c.append_txn_batch(request_id, start_lsn, end_lsn, &records));
         let results = join_all(futs).await;
 
         let mut acks: Vec<u64> = Vec::new();
         let mut errs: Vec<String> = Vec::new();
         for r in results {
             match r {
-                Ok(durable) => {
+                Ok((_commit, durable)) => {
                     if durable >= end_lsn {
                         acks.push(durable);
                     } else {
@@ -144,15 +139,21 @@ impl ComputeSequencer {
         Ok(end_lsn)
     }
 
-    /// Helper: build a minimal commit-only batch (useful for tests).
-    pub fn make_commit_marker() -> WalRecord {
-        WalRecord {
-            lsn: 0,
-            op: WAL_OP_TXN_COMMIT,
-            page_id: 0,
-            slot_id: 0,
-            key: Vec::new(),
-            value: Vec::new(),
-        }
+    pub fn make_commit_marker() -> (u8, Vec<u8>, Vec<u8>) {
+        (3, Vec::new(), Vec::new())
     }
+
+    pub fn make_put(key: Vec<u8>, value: Vec<u8>) -> (u8, Vec<u8>, Vec<u8>) {
+        (1, key, value)
+    }
+
+    pub fn make_del(key: Vec<u8>) -> (u8, Vec<u8>, Vec<u8>) {
+        (2, key, Vec::new())
+    }
+}
+
+// Keep these constants referenced to avoid drift between layers.
+#[allow(dead_code)]
+fn _op_sanity() {
+    let _ = (WAL_OP_TXN_PUT, WAL_OP_TXN_DEL, WAL_OP_TXN_COMMIT);
 }

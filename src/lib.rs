@@ -19,9 +19,7 @@ pub mod node;
 pub use node::StorageNode;
 
 pub mod client;
-pub use client::{
-    BatchSender, BatchedComputeNode, BatchedStorageClientPool, ComputeNode, StorageClient,
-};
+pub use client::StorageClient;
 
 pub mod server;
 pub use server::StorageServer;

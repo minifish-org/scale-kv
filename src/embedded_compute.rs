@@ -1,19 +1,31 @@
 use crate::compute_sequencer::ComputeSequencer;
-use crate::node::{WAL_OP_TXN_COMMIT, WAL_OP_TXN_DEL, WAL_OP_TXN_PUT, WalRecord};
 use crate::{Error, Result, StorageClient};
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use tokio::task::LocalSet;
 
 /// Embedded compute-side API for an Aurora-style KV.
 ///
 /// - No compute server / network protocol required.
 /// - All writes are committed as txn WAL batches via [`ComputeSequencer`].
-/// - Reads are served via `txn_get(key, read_lsn)` against a storage node that is
-///   durable at `read_lsn`.
+/// - Reads are served from compute's in-memory MVCC state.
+///
+/// Note: page fetch (`getPage/scanPages`) is provided by storage for compute warmup,
+/// but this embedded compute currently does not rebuild state from pages yet.
 #[derive(Clone)]
 pub struct EmbeddedCompute {
     sequencer: Arc<ComputeSequencer>,
+    #[allow(dead_code)]
     readers: Arc<Vec<StorageClient>>,
+
+    // key -> versions sorted by commit_lsn (append-only)
+    mvcc: Arc<Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
+}
+
+#[derive(Clone, Debug)]
+struct MvccVersion {
+    commit_lsn: u64,
+    value: Option<Vec<u8>>,
 }
 
 impl EmbeddedCompute {
@@ -28,6 +40,7 @@ impl EmbeddedCompute {
         Ok(Self {
             sequencer,
             readers: Arc::new(readers),
+            mvcc: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -62,50 +75,63 @@ impl EmbeddedCompute {
         txn.commit().await
     }
 
-    /// Read at a specific snapshot (read_lsn).
-    pub async fn get_at(&self, key: &[u8], read_lsn: u64) -> Result<Option<Vec<u8>>> {
-        // Try to find a reader that is durable at read_lsn.
-        for c in self.readers.iter() {
-            let durable = c.get_durable_lsn().await?;
-            if durable >= read_lsn {
-                let (v, _durable2) = c.txn_get(&key.to_vec(), read_lsn).await?;
-                return Ok(v);
-            }
+    /// Read at a specific snapshot (read_lsn) from compute MVCC.
+    pub fn get_at(&self, key: &[u8], read_lsn: u64) -> Result<Option<Vec<u8>>> {
+        let store = self.mvcc.lock().unwrap();
+        let versions = store.get(key);
+        if versions.is_none() {
+            return Ok(None);
         }
-
-        // None of the nodes claims durable>=read_lsn. In a real system we'd wait or retry.
-        Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            format!(
-                "no storage node is durable at read_lsn={}; try again later",
-                read_lsn
-            ),
-        )))
+        let versions = versions.unwrap();
+        let found = versions
+            .iter()
+            .rfind(|v| v.commit_lsn <= read_lsn)
+            .map(|v| v.value.clone())
+            .unwrap_or(None);
+        Ok(found)
     }
 
     /// Convenience: read at the latest quorum-durable snapshot.
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let read_lsn = self.begin_ro();
-        self.get_at(key, read_lsn).await
+        self.get_at(key, read_lsn)
     }
 
-    async fn commit_records(&self, mut records: Vec<WalRecord>) -> Result<u64> {
+    async fn commit_records(&self, mut records: Vec<(u8, Vec<u8>, Vec<u8>)>) -> Result<u64> {
         // Ensure COMMIT marker.
-        if records
-            .last()
-            .map(|r| r.op)
-            .is_none_or(|op| op != WAL_OP_TXN_COMMIT)
-        {
-            records.push(WalRecord {
-                lsn: 0,
-                op: WAL_OP_TXN_COMMIT,
-                page_id: 0,
-                slot_id: 0,
-                key: Vec::new(),
-                value: Vec::new(),
-            });
+        if records.last().map(|r| r.0).is_none_or(|op| op != 3) {
+            records.push((3, Vec::new(), Vec::new()));
         }
-        self.sequencer.commit_txn_batch(records).await
+
+        let commit_lsn = self.sequencer.commit_txn_batch(records.clone()).await?;
+
+        // Apply to compute MVCC at commit point.
+        let mut store = self.mvcc.lock().unwrap();
+        for (op, key, value) in records {
+            match op {
+                1 => {
+                    store.entry(key).or_default().push(MvccVersion {
+                        commit_lsn,
+                        value: Some(value),
+                    });
+                }
+                2 => {
+                    store.entry(key).or_default().push(MvccVersion {
+                        commit_lsn,
+                        value: None,
+                    });
+                }
+                3 => {}
+                _ => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid txn op: {op}"),
+                    )));
+                }
+            }
+        }
+
+        Ok(commit_lsn)
     }
 }
 
@@ -115,30 +141,16 @@ impl EmbeddedCompute {
 /// auto-wrap each operation in its own txn.
 pub struct EmbeddedTxn {
     compute: EmbeddedCompute,
-    records: Vec<WalRecord>,
+    records: Vec<(u8, Vec<u8>, Vec<u8>)>,
 }
 
 impl EmbeddedTxn {
     pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.records.push(WalRecord {
-            lsn: 0,
-            op: WAL_OP_TXN_PUT,
-            page_id: 0,
-            slot_id: 0,
-            key,
-            value,
-        });
+        self.records.push((1, key, value));
     }
 
     pub fn delete(&mut self, key: Vec<u8>) {
-        self.records.push(WalRecord {
-            lsn: 0,
-            op: WAL_OP_TXN_DEL,
-            page_id: 0,
-            slot_id: 0,
-            key,
-            value: Vec::new(),
-        });
+        self.records.push((2, key, Vec::new()));
     }
 
     pub async fn commit(self) -> Result<u64> {

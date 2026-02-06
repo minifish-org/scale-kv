@@ -43,7 +43,7 @@ async fn test_embedded_compute_put_get_and_txn_commit() {
 
             // Auto-txn single op.
             let c1 = compute.put(b"k1".to_vec(), b"v1".to_vec()).await.unwrap();
-            let v = compute.get_at(b"k1", c1).await.unwrap();
+            let v = compute.get_at(b"k1", c1).unwrap();
             assert_eq!(v, Some(b"v1".to_vec()));
 
             // Buffered txn with 2 ops.
@@ -54,15 +54,15 @@ async fn test_embedded_compute_put_get_and_txn_commit() {
             let commit_lsn = txn.commit().await.unwrap();
 
             // Old snapshot: k2 absent and k1 still present.
-            let old_k2 = compute.get_at(b"k2", read_before).await.unwrap();
+            let old_k2 = compute.get_at(b"k2", read_before).unwrap();
             assert_eq!(old_k2, None);
-            let old_k1 = compute.get_at(b"k1", read_before).await.unwrap();
+            let old_k1 = compute.get_at(b"k1", read_before).unwrap();
             assert_eq!(old_k1, Some(b"v1".to_vec()));
 
             // New snapshot at commit point.
-            let new_k2 = compute.get_at(b"k2", commit_lsn).await.unwrap();
+            let new_k2 = compute.get_at(b"k2", commit_lsn).unwrap();
             assert_eq!(new_k2, Some(b"v2".to_vec()));
-            let new_k1 = compute.get_at(b"k1", commit_lsn).await.unwrap();
+            let new_k1 = compute.get_at(b"k1", commit_lsn).unwrap();
             assert_eq!(new_k1, None);
         })
         .await;
