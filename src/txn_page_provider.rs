@@ -13,6 +13,7 @@ pub struct TxnPageProvider {
     next_page_id: Arc<AtomicU64>,
     root: Arc<AtomicU64>,
     btree_meta_page_id: PageId,
+    fetcher: Arc<dyn Fn(PageId) -> Option<Page>>,
 
     dirty: Arc<Mutex<BTreeMap<PageId, Page>>>,
 }
@@ -22,12 +23,14 @@ impl TxnPageProvider {
         pages: Arc<PageCache>,
         next_page_id: Arc<AtomicU64>,
         btree_meta_page_id: PageId,
+        fetcher: Arc<dyn Fn(PageId) -> Option<Page>>,
     ) -> Self {
         Self {
             pages,
             next_page_id,
             root: Arc::new(AtomicU64::new(0)),
             btree_meta_page_id,
+            fetcher,
             dirty: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -54,7 +57,13 @@ impl TxnPageProvider {
 
 impl PageProvider for TxnPageProvider {
     fn read_page(&self, page_id: PageId) -> Option<Page> {
-        self.pages.get(page_id)
+        if let Some(p) = self.pages.get(page_id) {
+            return Some(p);
+        }
+        // Demand paging on miss.
+        let p = (self.fetcher)(page_id)?;
+        self.pages.insert(page_id, p.clone());
+        Some(p)
     }
 
     fn write_page(&self, page_id: PageId, page: Page) {

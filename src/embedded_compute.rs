@@ -20,9 +20,10 @@ use tokio::task::LocalSet;
 #[derive(Clone)]
 pub struct EmbeddedCompute {
     sequencer: Arc<ComputeSequencer>,
-    readers: Arc<Vec<StorageClient>>,
+    readers: Arc<Vec<Arc<StorageClient>>>,
 
     page_cache: Arc<PageCache>,
+    page_fetcher: Arc<dyn Fn(PageId) -> Option<Page>>,
     provider: Arc<TxnPageProvider>,
     tree: Arc<Mutex<PageBPlusTree<TxnPageProvider>>>,
 }
@@ -31,17 +32,39 @@ impl EmbeddedCompute {
     pub async fn connect(addrs: &[String], quorum: usize, local: &LocalSet) -> Result<Self> {
         let sequencer = Arc::new(ComputeSequencer::connect(addrs, quorum, local).await?);
 
-        let mut readers = Vec::with_capacity(addrs.len());
+        let mut readers: Vec<Arc<StorageClient>> = Vec::with_capacity(addrs.len());
         for addr in addrs {
-            readers.push(StorageClient::connect(addr, local).await?);
+            readers.push(Arc::new(StorageClient::connect(addr, local).await?));
         }
 
-        let page_cache = Arc::new(PageCache::new(DEFAULT_PAGE_CACHE_SHARDS));
+        let page_cache = Arc::new(PageCache::new_with_capacity(
+            DEFAULT_PAGE_CACHE_SHARDS,
+            32 * 1024,
+        ));
+
+        // Demand page fetcher (cache miss -> storage getPage).
+        let reader0 = readers.get(0).cloned().ok_or_else(|| {
+            Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "no readers"))
+        })?;
+        let handle = tokio::runtime::Handle::current();
+        let page_fetcher: Arc<dyn Fn(PageId) -> Option<Page>> = Arc::new(move |pid| {
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    match reader0.get_page(pid).await {
+                        Ok(Some((page, _page_lsn, _durable))) => Some(page),
+                        Ok(None) => None,
+                        Err(_) => None,
+                    }
+                })
+            })
+        });
+
         let next_page_id = Arc::new(AtomicU64::new(1));
         let provider = Arc::new(TxnPageProvider::new(
             page_cache.clone(),
             next_page_id,
             BTREE_META_PAGE_ID,
+            page_fetcher.clone(),
         ));
         let tree = Arc::new(Mutex::new(PageBPlusTree::with_provider(
             (*provider).clone(),
@@ -51,6 +74,7 @@ impl EmbeddedCompute {
             sequencer,
             readers: Arc::new(readers),
             page_cache,
+            page_fetcher,
             provider,
             tree,
         };
@@ -74,6 +98,15 @@ impl EmbeddedCompute {
 
     pub fn cached_page(&self, page_id: PageId) -> Option<Page> {
         self.page_cache.get(page_id)
+    }
+
+    pub fn get_page_blocking(&self, page_id: PageId) -> Option<Page> {
+        if let Some(p) = self.page_cache.get(page_id) {
+            return Some(p);
+        }
+        let p = (self.page_fetcher)(page_id)?;
+        self.page_cache.insert(page_id, p.clone());
+        Some(p)
     }
 
     /// Warm up compute by scanning pages from storage and caching them locally.
@@ -281,7 +314,7 @@ impl EmbeddedTxn {
         self.dirty
             .get(&page_id)
             .cloned()
-            .or_else(|| self.compute.page_cache.get(page_id))
+            .or_else(|| self.compute.get_page_blocking(page_id))
     }
 
     fn append_undo(

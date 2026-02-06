@@ -1,8 +1,8 @@
 use crate::{Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 
 const PAGE_TYPE_INTERNAL: u8 = 1;
 const PAGE_TYPE_LEAF: u8 = 2;
@@ -103,15 +103,26 @@ impl PageProvider for InMemoryPageProvider {
 pub const DEFAULT_PAGE_CACHE_SHARDS: usize = 64;
 
 pub struct PageCache {
-    shards: Vec<RwLock<HashMap<PageId, Page>>>,
+    shards: Vec<std::sync::Mutex<lru::LruCache<PageId, Page>>>,
 }
 
 impl PageCache {
+    /// Create an LRU page cache with a fixed total capacity (in pages).
     pub fn new(shards: usize) -> Self {
+        Self::new_with_capacity(shards, 8192)
+    }
+
+    pub fn new_with_capacity(shards: usize, capacity_pages: usize) -> Self {
+        use std::num::NonZeroUsize;
+
         let count = shards.max(1);
+        let cap = capacity_pages.max(1);
+        let per = (cap + count - 1) / count;
+        let per = NonZeroUsize::new(per.max(1)).unwrap();
+
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
-            out.push(RwLock::new(HashMap::new()));
+            out.push(std::sync::Mutex::new(lru::LruCache::new(per)));
         }
         Self { shards: out }
     }
@@ -122,23 +133,28 @@ impl PageCache {
 
     pub fn get(&self, page_id: PageId) -> Option<Page> {
         let idx = self.shard(page_id);
-        self.shards[idx].read().unwrap().get(&page_id).cloned()
+        self.shards[idx].lock().unwrap().get(&page_id).cloned()
     }
 
     pub fn insert(&self, page_id: PageId, page: Page) {
         let idx = self.shard(page_id);
-        self.shards[idx].write().unwrap().insert(page_id, page);
+        self.shards[idx].lock().unwrap().put(page_id, page);
     }
 
     pub fn contains(&self, page_id: PageId) -> bool {
         let idx = self.shard(page_id);
-        self.shards[idx].read().unwrap().contains_key(&page_id)
+        self.shards[idx].lock().unwrap().contains(&page_id)
+    }
+
+    pub fn remove(&self, page_id: PageId) {
+        let idx = self.shard(page_id);
+        let _ = self.shards[idx].lock().unwrap().pop(&page_id);
     }
 
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.read().unwrap().len())
+            .map(|shard| shard.lock().unwrap().len())
             .sum()
     }
 }
