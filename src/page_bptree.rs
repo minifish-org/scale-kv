@@ -341,7 +341,7 @@ impl<P: PageProvider> PageBPlusTree<P> {
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Result<()> {
-        let (leaf_id, _) = self.find_leaf(key);
+        let (leaf_id, mut stack) = self.find_leaf(key);
         let leaf = self.provider.read_page(leaf_id).unwrap();
         let (found, pos) = match find_key_pos(&leaf, key) {
             Some(result) => result,
@@ -355,10 +355,11 @@ impl<P: PageProvider> PageBPlusTree<P> {
         let mut rebuilt = rebuild_page_with_remove(&leaf, header, pos)?;
         self.len = self.len.saturating_sub(1);
 
-        // If this leaf becomes empty and is not the root, unlink it from the leaf chain.
-        // (We do NOT yet recycle page ids; this is a scan optimization and a step toward page deletion.)
-        let new_header = leaf_page_header(&rebuilt);
+        // If this leaf becomes empty and is not the root, delete it from the parent
+        // (no page id reuse) and unlink it from the leaf chain.
+        let mut new_header = leaf_page_header(&rebuilt);
         if new_header.key_count == 0 && leaf_id != self.provider.root_page_id() {
+            // 1) unlink from leaf chain
             if let Some(prev_id) = new_header.prev_leaf {
                 if let Some(mut prev_page) = self.provider.read_page(prev_id) {
                     let mut ph = leaf_page_header(&prev_page);
@@ -375,11 +376,55 @@ impl<P: PageProvider> PageBPlusTree<P> {
                     self.provider.write_page(next_id, next_page);
                 }
             }
+            new_header.prev_leaf = None;
+            write_header(&mut rebuilt, new_header);
 
-            let mut h = new_header;
-            h.prev_leaf = None;
-            // keep next_leaf pointing right so point-lookups can still correct via next.
-            write_header(&mut rebuilt, h);
+            // 2) delete reference from parent (no rebalancing; parent may become sparse)
+            if let Some(parent_id) = stack.pop() {
+                if let Some(mut parent) = self.provider.read_page(parent_id) {
+                    let ph = page_header(&parent);
+                    if ph.page_type == PAGE_TYPE_INTERNAL {
+                        let mut child_index = None;
+                        if ph.left_child == leaf_id {
+                            child_index = Some(0usize);
+                        } else {
+                            for idx in 0..ph.key_count as usize {
+                                let v = entry_value_at(&parent, idx).unwrap();
+                                if decode_child_id(v) == leaf_id {
+                                    child_index = Some(idx + 1);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Some(j) = child_index {
+                            let mut entries = collect_entries(&parent);
+                            let mut new_ph = ph;
+                            if j == 0 {
+                                // remove left_child: promote child1 to left_child, drop entry0
+                                if !entries.is_empty() {
+                                    new_ph.left_child = decode_child_id(&entries[0].1);
+                                    entries.remove(0);
+                                }
+                            } else {
+                                // remove entry(j-1), which points to child j
+                                if j - 1 < entries.len() {
+                                    entries.remove(j - 1);
+                                }
+                            }
+
+                            // If this was the root and now has 0 keys, collapse root to its only child.
+                            if parent_id == self.provider.root_page_id() && entries.is_empty() {
+                                let new_root = new_ph.left_child;
+                                self.provider.set_root_page_id(new_root);
+                            } else {
+                                encode_entries(&mut parent, &entries, new_ph)?;
+                                self.provider.write_page(parent_id, parent);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         self.provider.write_page(leaf_id, rebuilt);
