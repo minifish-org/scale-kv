@@ -8,15 +8,16 @@ const PAGE_TYPE_INTERNAL: u8 = 1;
 const PAGE_TYPE_LEAF: u8 = 2;
 
 const HIGH_KEY_SIZE: usize = KEY_SIZE;
-const HEADER_SIZE: usize = 40; // padded header
+const HEADER_SIZE: usize = 48; // padded header
 // layout:
 // 0: page_type u8
 // 1: level u8
 // 2..4: key_count u16
-// 4..12: next_leaf u64 (0 means none)
-// 12..20: left_child u64
-// 20: high_key_present u8
-// 21..(21+HIGH_KEY_SIZE): high_key bytes
+// 4..12: prev_leaf u64 (0 means none)
+// 12..20: next_leaf u64 (0 means none)
+// 20..28: left_child u64
+// 28: high_key_present u8
+// 29..(29+HIGH_KEY_SIZE): high_key bytes
 
 const OFFSET_ENTRY_SIZE: usize = 2;
 const SLOT_REF_SIZE: usize = 10;
@@ -302,32 +303,86 @@ impl<P: PageProvider> PageBPlusTree<P> {
 
         let mut entries = collect_entries(&leaf);
         entries.insert(pos, (key, encoded));
-        let (separator, right_page) = split_leaf(&leaf, &entries)?;
+        let (separator, pages) = split_leaf(&leaf, &entries)?;
         let right_id = self.provider.alloc_page_id();
-        let mut left_page = right_page.0;
-        let right_page_buf = right_page.1;
-        let mut left_header = leaf_page_header(&left_page);
-        left_header.next_leaf = Some(right_id);
-        write_header(&mut left_page, left_header);
+        let mut left_page = pages.0;
+        let mut right_page = pages.1;
+
+        // Wire sibling links.
+        let old_header = leaf_page_header(&leaf);
+
+        {
+            let mut left_header = leaf_page_header(&left_page);
+            left_header.next_leaf = Some(right_id);
+            left_header.prev_leaf = old_header.prev_leaf;
+            write_header(&mut left_page, left_header);
+        }
+        {
+            let mut right_header = leaf_page_header(&right_page);
+            right_header.prev_leaf = Some(leaf_id);
+            right_header.next_leaf = old_header.next_leaf;
+            write_header(&mut right_page, right_header);
+        }
+
+        // Fix successor's prev pointer if there was an old next.
+        if let Some(next_id) = old_header.next_leaf {
+            if let Some(mut next_page) = self.provider.read_page(next_id) {
+                let mut nh = leaf_page_header(&next_page);
+                nh.prev_leaf = Some(right_id);
+                write_header(&mut next_page, nh);
+                self.provider.write_page(next_id, next_page);
+            }
+        }
+
         self.provider.write_page(leaf_id, left_page);
-        self.provider.write_page(right_id, right_page_buf);
+        self.provider.write_page(right_id, right_page);
         self.len += 1;
         self.insert_into_parent(leaf_id, right_id, separator, stack)
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Result<()> {
         let (leaf_id, _) = self.find_leaf(key);
-        let mut leaf = self.provider.read_page(leaf_id).unwrap();
+        let leaf = self.provider.read_page(leaf_id).unwrap();
         let (found, pos) = match find_key_pos(&leaf, key) {
             Some(result) => result,
             None => (false, 0),
         };
-        if found {
-            let header = leaf_page_header(&leaf);
-            let rebuilt = rebuild_page_with_remove(&leaf, header, pos)?;
-            self.len = self.len.saturating_sub(1);
-            self.provider.write_page(leaf_id, rebuilt);
+        if !found {
+            return Ok(());
         }
+
+        let header = leaf_page_header(&leaf);
+        let mut rebuilt = rebuild_page_with_remove(&leaf, header, pos)?;
+        self.len = self.len.saturating_sub(1);
+
+        // If this leaf becomes empty and is not the root, unlink it from the leaf chain.
+        // (We do NOT yet recycle page ids; this is a scan optimization and a step toward page deletion.)
+        let new_header = leaf_page_header(&rebuilt);
+        if new_header.key_count == 0 && leaf_id != self.provider.root_page_id() {
+            if let Some(prev_id) = new_header.prev_leaf {
+                if let Some(mut prev_page) = self.provider.read_page(prev_id) {
+                    let mut ph = leaf_page_header(&prev_page);
+                    ph.next_leaf = new_header.next_leaf;
+                    write_header(&mut prev_page, ph);
+                    self.provider.write_page(prev_id, prev_page);
+                }
+            }
+            if let Some(next_id) = new_header.next_leaf {
+                if let Some(mut next_page) = self.provider.read_page(next_id) {
+                    let mut nh = leaf_page_header(&next_page);
+                    nh.prev_leaf = new_header.prev_leaf;
+                    write_header(&mut next_page, nh);
+                    self.provider.write_page(next_id, next_page);
+                }
+            }
+
+            let mut h = new_header;
+            h.prev_leaf = None;
+            // keep next_leaf pointing right so point-lookups can still correct via next.
+            write_header(&mut rebuilt, h);
+        }
+
+        self.provider.write_page(leaf_id, rebuilt);
         Ok(())
     }
 
@@ -341,7 +396,26 @@ impl<P: PageProvider> PageBPlusTree<P> {
     }
 
     pub fn range_visit(&self, start: &[u8], end: &[u8], mut f: impl FnMut(&[u8], SlotRef) -> bool) {
-        let (leaf_id, _) = self.find_leaf(start);
+        let (mut leaf_id, _) = self.find_leaf(start);
+
+        // Same high-key correction as point lookup.
+        loop {
+            let page = match self.provider.read_page(leaf_id) {
+                Some(page) => page,
+                None => break,
+            };
+            let header = leaf_page_header(&page);
+            if let Some(hk) = header.high_key {
+                if start > hk.as_slice() {
+                    if let Some(next) = header.next_leaf {
+                        leaf_id = next;
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+
         let mut current = Some(leaf_id);
         while let Some(page_id) = current {
             let page = match self.provider.read_page(page_id) {
@@ -472,6 +546,7 @@ struct PageHeader {
     page_type: u8,
     level: u8,
     key_count: u16,
+    prev_leaf: Option<PageId>,
     next_leaf: Option<PageId>,
     left_child: PageId,
     high_key: Option<[u8; HIGH_KEY_SIZE]>,
@@ -481,12 +556,13 @@ fn page_header(page: &Page) -> PageHeader {
     let page_type = page[0];
     let level = page[1];
     let key_count = u16::from_le_bytes([page[2], page[3]]);
-    let next_leaf = u64::from_le_bytes(page[4..12].try_into().unwrap());
-    let left_child = u64::from_le_bytes(page[12..20].try_into().unwrap());
-    let high_present = page[20] != 0;
+    let prev_leaf = u64::from_le_bytes(page[4..12].try_into().unwrap());
+    let next_leaf = u64::from_le_bytes(page[12..20].try_into().unwrap());
+    let left_child = u64::from_le_bytes(page[20..28].try_into().unwrap());
+    let high_present = page[28] != 0;
     let high_key = if high_present {
         let mut hk = [0u8; HIGH_KEY_SIZE];
-        hk.copy_from_slice(&page[21..21 + HIGH_KEY_SIZE]);
+        hk.copy_from_slice(&page[29..29 + HIGH_KEY_SIZE]);
         Some(hk)
     } else {
         None
@@ -495,6 +571,11 @@ fn page_header(page: &Page) -> PageHeader {
         page_type,
         level,
         key_count,
+        prev_leaf: if prev_leaf == 0 {
+            None
+        } else {
+            Some(prev_leaf)
+        },
         next_leaf: if next_leaf == 0 {
             None
         } else {
@@ -513,23 +594,29 @@ fn write_header(page: &mut Page, header: PageHeader) {
     page[0] = header.page_type;
     page[1] = header.level;
     page[2..4].copy_from_slice(&header.key_count.to_le_bytes());
+
+    let prev_leaf = header.prev_leaf.unwrap_or(0);
+    page[4..12].copy_from_slice(&prev_leaf.to_le_bytes());
+
     let next_leaf = header.next_leaf.unwrap_or(0);
-    page[4..12].copy_from_slice(&next_leaf.to_le_bytes());
-    page[12..20].copy_from_slice(&header.left_child.to_le_bytes());
+    page[12..20].copy_from_slice(&next_leaf.to_le_bytes());
+
+    page[20..28].copy_from_slice(&header.left_child.to_le_bytes());
 
     match header.high_key {
         Some(hk) => {
-            page[20] = 1;
-            page[21..21 + HIGH_KEY_SIZE].copy_from_slice(&hk);
+            page[28] = 1;
+            page[29..29 + HIGH_KEY_SIZE].copy_from_slice(&hk);
         }
         None => {
-            page[20] = 0;
-            page[21..21 + HIGH_KEY_SIZE].fill(0);
+            page[28] = 0;
+            page[29..29 + HIGH_KEY_SIZE].fill(0);
         }
     }
+
     // padding
-    if HEADER_SIZE > 21 + HIGH_KEY_SIZE {
-        page[21 + HIGH_KEY_SIZE..HEADER_SIZE].fill(0);
+    if HEADER_SIZE > 29 + HIGH_KEY_SIZE {
+        page[29 + HIGH_KEY_SIZE..HEADER_SIZE].fill(0);
     }
 }
 
@@ -539,6 +626,7 @@ pub fn new_page(page_type: u8, level: u8) -> Page {
         page_type,
         level,
         key_count: 0,
+        prev_leaf: None,
         next_leaf: None,
         left_child: 0,
         high_key: None,
@@ -859,10 +947,8 @@ fn split_leaf(page: &Page, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8>, (
     let sep = right_entries[0].0.clone();
 
     // Preserve existing high_key as right high_key; set left high_key to sep.
-    right_header.next_leaf = left_header.next_leaf;
     right_header.high_key = left_header.high_key;
 
-    left_header.next_leaf = None;
     let mut hk = [0u8; HIGH_KEY_SIZE];
     hk.copy_from_slice(&sep);
     left_header.high_key = Some(hk);
