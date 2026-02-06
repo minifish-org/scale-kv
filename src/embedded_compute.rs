@@ -39,9 +39,20 @@ impl EmbeddedCompute {
             readers.push(Arc::new(StorageClient::connect(addr, local).await?));
         }
 
+        // Buffer pool sizing:
+        // Align with PostgreSQL default shared_buffers=128MB.
+        // Our page size is 16KB, so 128MB ~= 8192 pages.
+        // Override via env SCALE_KV_PAGE_CACHE_PAGES.
+        let default_pages: usize = 8 * 1024;
+        let capacity_pages: usize = std::env::var("SCALE_KV_PAGE_CACHE_PAGES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_pages);
+
         let page_cache = Arc::new(PageCache::new_with_capacity(
             DEFAULT_PAGE_CACHE_SHARDS,
-            32 * 1024,
+            capacity_pages,
         ));
 
         // Demand page fetcher (cache miss -> storage getPage).
