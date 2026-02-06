@@ -4,6 +4,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(debug_assertions)]
+use hex;
+
 const PAGE_TYPE_INTERNAL: u8 = 1;
 const PAGE_TYPE_LEAF: u8 = 2;
 
@@ -948,6 +951,18 @@ fn find_in_leaf(page: &Page, key: &[u8]) -> Option<SlotRef> {
         match mid_key.cmp(key) {
             std::cmp::Ordering::Equal => {
                 let value = entry_value_at(page, mid)?;
+                #[cfg(debug_assertions)]
+                {
+                    let sr = decode_slot_ref(value);
+                    eprintln!(
+                        "[btree-get] equal mid={} key_hex={} slot_ref=({}, {}) value_hex={}",
+                        mid,
+                        hex::encode(key),
+                        sr.page_id,
+                        sr.slot_id,
+                        hex::encode(value)
+                    );
+                }
                 return Some(decode_slot_ref(value));
             }
             std::cmp::Ordering::Less => lo = mid + 1,
