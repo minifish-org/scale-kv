@@ -11,11 +11,13 @@ const VERSION: u32 = 1;
 /// - [12..20) root_page_id (u64 LE)
 /// - [20..28) next_bptree_page_id (u64 LE)
 /// - [28..36) next_data_page_id (u64 LE)
+/// - [36..44) next_undo_page_id (u64 LE)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetaPage {
     pub root_page_id: PageId,
     pub next_bptree_page_id: PageId,
     pub next_data_page_id: PageId,
+    pub next_undo_page_id: PageId,
 }
 
 impl MetaPage {
@@ -26,6 +28,7 @@ impl MetaPage {
         page[12..20].copy_from_slice(&self.root_page_id.to_le_bytes());
         page[20..28].copy_from_slice(&self.next_bptree_page_id.to_le_bytes());
         page[28..36].copy_from_slice(&self.next_data_page_id.to_le_bytes());
+        page[36..44].copy_from_slice(&self.next_undo_page_id.to_le_bytes());
         page
     }
 
@@ -54,10 +57,13 @@ impl MetaPage {
         next_bptree.copy_from_slice(&page[20..28]);
         let mut next_data = [0u8; 8];
         next_data.copy_from_slice(&page[28..36]);
+        let mut next_undo = [0u8; 8];
+        next_undo.copy_from_slice(&page[36..44]);
         Ok(Self {
             root_page_id: u64::from_le_bytes(root),
             next_bptree_page_id: u64::from_le_bytes(next_bptree),
             next_data_page_id: u64::from_le_bytes(next_data),
+            next_undo_page_id: u64::from_le_bytes(next_undo),
         })
     }
 }

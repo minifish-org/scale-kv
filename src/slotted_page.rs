@@ -47,8 +47,11 @@ fn find_free_slot(page: &[u8], slots: u16) -> Option<u16> {
     None
 }
 
+const MVCC_HEADER_SIZE: usize = 8 + 8 + 2 + 2; // commit_lsn, undo_page_id, undo_slot_id, flags
+const FLAG_TOMBSTONE: u16 = 1;
+
 fn payload_len() -> usize {
-    KEY_SIZE + VALUE_SIZE
+    KEY_SIZE + VALUE_SIZE + MVCC_HEADER_SIZE
 }
 
 pub fn new_page() -> Page {
@@ -90,10 +93,20 @@ pub fn read_value(page: &[u8], slot_id: u16, key: &[u8]) -> Option<Vec<u8>> {
     }
     let v0 = pos + KEY_SIZE;
     let v1 = v0 + VALUE_SIZE;
+
+    // MVCC header
+    let flags_off = v1 + 8 + 8 + 2;
+    let flags = u16::from_le_bytes(page[flags_off..flags_off + 2].try_into().unwrap());
+    if (flags & FLAG_TOMBSTONE) != 0 {
+        return None;
+    }
+
     Some(page[v0..v1].to_vec())
 }
 
 /// Overwrite value in place at slot, verifying key matches.
+///
+/// Does not update commit_lsn; caller should set it at commit time.
 pub fn overwrite_value(page: &mut [u8], slot_id: u16, key: &[u8], value: &[u8]) -> Result<()> {
     if page.len() != PAGE_SIZE {
         return Err(Error::InvalidPageSize(page.len(), PAGE_SIZE));
@@ -125,6 +138,119 @@ pub fn overwrite_value(page: &mut [u8], slot_id: u16, key: &[u8], value: &[u8]) 
     let v1 = v0 + VALUE_SIZE;
     page[v0..v1].copy_from_slice(value);
     Ok(())
+}
+
+pub fn read_commit_lsn(page: &[u8], slot_id: u16, key: &[u8]) -> Option<u64> {
+    if page.len() != PAGE_SIZE || key.len() != KEY_SIZE {
+        return None;
+    }
+    let (pos, len) = read_slot(page, slot_id);
+    if len as usize != payload_len() {
+        return None;
+    }
+    let pos = pos as usize;
+    if pos + payload_len() > PAGE_SIZE {
+        return None;
+    }
+    if &page[pos..pos + KEY_SIZE] != key {
+        return None;
+    }
+    let off = pos + KEY_SIZE + VALUE_SIZE;
+    Some(u64::from_le_bytes(page[off..off + 8].try_into().unwrap()))
+}
+
+pub fn write_commit_lsn(page: &mut [u8], slot_id: u16, commit_lsn: u64) {
+    if page.len() != PAGE_SIZE {
+        return;
+    }
+    let (pos, len) = read_slot(page, slot_id);
+    if len as usize != payload_len() {
+        return;
+    }
+    let pos = pos as usize;
+    let off = pos + KEY_SIZE + VALUE_SIZE;
+    page[off..off + 8].copy_from_slice(&commit_lsn.to_le_bytes());
+}
+
+pub fn read_undo_ptr(page: &[u8], slot_id: u16, key: &[u8]) -> Option<crate::undo_pg::UndoPtr> {
+    if page.len() != PAGE_SIZE || key.len() != KEY_SIZE {
+        return None;
+    }
+    let (pos, len) = read_slot(page, slot_id);
+    if len as usize != payload_len() {
+        return None;
+    }
+    let pos = pos as usize;
+    if &page[pos..pos + KEY_SIZE] != key {
+        return None;
+    }
+    let off = pos + KEY_SIZE + VALUE_SIZE + 8;
+    let pid = u64::from_le_bytes(page[off..off + 8].try_into().unwrap());
+    if pid == 0 {
+        return None;
+    }
+    let sid_off = off + 8;
+    let sid = u16::from_le_bytes(page[sid_off..sid_off + 2].try_into().unwrap());
+    Some(crate::undo_pg::UndoPtr {
+        page_id: pid,
+        slot_id: sid,
+    })
+}
+
+pub fn write_undo_ptr(page: &mut [u8], slot_id: u16, undo: Option<crate::undo_pg::UndoPtr>) {
+    if page.len() != PAGE_SIZE {
+        return;
+    }
+    let (pos, len) = read_slot(page, slot_id);
+    if len as usize != payload_len() {
+        return;
+    }
+    let pos = pos as usize;
+    let off = pos + KEY_SIZE + VALUE_SIZE + 8;
+    let (pid, sid) = undo.map(|u| (u.page_id, u.slot_id)).unwrap_or((0, 0));
+    page[off..off + 8].copy_from_slice(&pid.to_le_bytes());
+    page[off + 8..off + 10].copy_from_slice(&sid.to_le_bytes());
+}
+
+pub fn read_flags(page: &[u8], slot_id: u16, key: &[u8]) -> Option<u16> {
+    if page.len() != PAGE_SIZE || key.len() != KEY_SIZE {
+        return None;
+    }
+    let (pos, len) = read_slot(page, slot_id);
+    if len as usize != payload_len() {
+        return None;
+    }
+    let pos = pos as usize;
+    if &page[pos..pos + KEY_SIZE] != key {
+        return None;
+    }
+    let off = pos + KEY_SIZE + VALUE_SIZE + 8 + 8 + 2;
+    Some(u16::from_le_bytes(page[off..off + 2].try_into().unwrap()))
+}
+
+pub fn write_flags(page: &mut [u8], slot_id: u16, flags: u16) {
+    if page.len() != PAGE_SIZE {
+        return;
+    }
+    let (pos, len) = read_slot(page, slot_id);
+    if len as usize != payload_len() {
+        return;
+    }
+    let pos = pos as usize;
+    let off = pos + KEY_SIZE + VALUE_SIZE + 8 + 8 + 2;
+    page[off..off + 2].copy_from_slice(&flags.to_le_bytes());
+}
+
+pub fn mark_tombstone(page: &mut [u8], slot_id: u16) {
+    let (pos, len) = read_slot(page, slot_id);
+    if len as usize != payload_len() {
+        return;
+    }
+    let pos = pos as usize;
+    let off = pos + KEY_SIZE + VALUE_SIZE + 8 + 8 + 2;
+    let mut flags = u16::from_le_bytes(page[off..off + 2].try_into().unwrap());
+    flags |= FLAG_TOMBSTONE;
+    page[off..off + 2].copy_from_slice(&flags.to_le_bytes());
 }
 
 /// Insert a record into a slotted page and return the slot id.
@@ -167,6 +293,16 @@ pub fn insert_record(page: &mut [u8], key: &[u8], value: &[u8]) -> Result<u16> {
     page[cursor..cursor + KEY_SIZE].copy_from_slice(key);
     cursor += KEY_SIZE;
     page[cursor..cursor + VALUE_SIZE].copy_from_slice(value);
+    cursor += VALUE_SIZE;
+
+    // MVCC header defaults: commit_lsn=0, undo_ptr=nil, flags=0.
+    page[cursor..cursor + 8].copy_from_slice(&0u64.to_le_bytes());
+    cursor += 8;
+    page[cursor..cursor + 8].copy_from_slice(&0u64.to_le_bytes());
+    cursor += 8;
+    page[cursor..cursor + 2].copy_from_slice(&0u16.to_le_bytes());
+    cursor += 2;
+    page[cursor..cursor + 2].copy_from_slice(&0u16.to_le_bytes());
 
     // Update slot directory.
     write_slot(page, slot_id, payload_offset, payload_len() as u16);

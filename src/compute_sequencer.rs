@@ -51,37 +51,51 @@ impl ComputeSequencer {
         self.request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Replicate a txn batch represented as page after-images.
-    ///
-    /// `writes` format: (page_id, page_bytes)
-    ///
-    /// Returns commitLsn (= end_lsn) on success.
-    pub async fn commit_txn_batch(&self, writes: Vec<(u64, Vec<u8>)>) -> Result<u64> {
+    pub fn reserve_txn(&self, n_writes: usize) -> Result<(u64, u64, u64)> {
         const MAX_WRITES_PER_TXN: usize = 256;
-
-        if writes.is_empty() {
+        if n_writes == 0 {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "txn batch must be non-empty",
             )));
         }
-        if writes.len() > MAX_WRITES_PER_TXN {
+        if n_writes > MAX_WRITES_PER_TXN {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "txn batch too large: writes={} max={}",
-                    writes.len(),
-                    MAX_WRITES_PER_TXN
+                    n_writes, MAX_WRITES_PER_TXN
                 ),
             )));
         }
 
-        let n = writes.len() as u64;
-        let start_lsn = self.next_lsn.load(Ordering::Acquire);
+        let n = n_writes as u64;
+        let start_lsn = self.next_lsn.fetch_add(n, Ordering::AcqRel);
         let end_lsn = start_lsn + n;
-
         let request_id = self.next_request_id();
+        Ok((request_id, start_lsn, end_lsn))
+    }
 
+    /// Replicate a txn batch represented as page after-images.
+    ///
+    /// Convenience wrapper: reserves an LSN range then commits.
+    /// Returns commitLsn (= end_lsn) on success.
+    pub async fn commit_txn_batch(&self, writes: Vec<(u64, Vec<u8>)>) -> Result<u64> {
+        let (request_id, start_lsn, end_lsn) = self.reserve_txn(writes.len())?;
+        self.commit_reserved_txn_batch(request_id, start_lsn, end_lsn, writes)
+            .await
+    }
+
+    /// Replicate a reserved txn batch represented as page after-images.
+    ///
+    /// Returns commitLsn (= end_lsn) on success.
+    pub async fn commit_reserved_txn_batch(
+        &self,
+        request_id: u64,
+        start_lsn: u64,
+        end_lsn: u64,
+        writes: Vec<(u64, Vec<u8>)>,
+    ) -> Result<u64> {
         // Fan-out to all storage nodes.
         let futs = self
             .clients
@@ -137,7 +151,6 @@ impl ComputeSequencer {
         acks.sort_unstable_by(|a, b| b.cmp(a));
         let quorum_durable = acks[self.quorum - 1];
         self.durable_lsn.fetch_max(quorum_durable, Ordering::AcqRel);
-        self.next_lsn.store(end_lsn, Ordering::Release);
 
         Ok(end_lsn)
     }
