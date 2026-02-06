@@ -90,6 +90,17 @@ pub fn read_key(page: &[u8], slot_id: u16) -> Option<Vec<u8>> {
     Some(page[pos..pos + KEY_SIZE].to_vec())
 }
 
+pub fn debug_slot(page: &[u8], slot_id: u16) -> Option<(u16, u16)> {
+    if page.len() != PAGE_SIZE {
+        return None;
+    }
+    let (slots, _free_start, _free_end) = read_header(page);
+    if slot_id >= slots {
+        return None;
+    }
+    Some(read_slot(page, slot_id))
+}
+
 /// Read the value at a slot, verifying the key matches.
 pub fn read_value(page: &[u8], slot_id: u16, key: &[u8]) -> Option<Vec<u8>> {
     if page.len() != PAGE_SIZE || key.len() != KEY_SIZE {

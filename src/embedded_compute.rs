@@ -478,10 +478,14 @@ impl EmbeddedTxn {
 
             if let Some(slot_key) = slotted_page::read_key(&page, slot.slot_id) {
                 if slot_key.as_slice() != key {
+                    let slot_info = slotted_page::debug_slot(&page, slot.slot_id)
+                        .map(|(pos, len)| format!("pos={pos} len={len}"))
+                        .unwrap_or_else(|| "<none>".to_string());
                     eprintln!(
-                        "[overwrite-debug] key mismatch before overwrite: page_id={} slot_id={} key_hex={} slot_key_hex={}",
+                        "[overwrite-debug] key mismatch before overwrite: page_id={} slot_id={} {} key_hex={} slot_key_hex={}",
                         slot.page_id,
                         slot.slot_id,
+                        slot_info,
                         hex::encode(key),
                         hex::encode(&slot_key)
                     );
