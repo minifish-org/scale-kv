@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(debug_assertions)]
 use hex;
 
 const PAGE_TYPE_INTERNAL: u8 = 1;
@@ -951,8 +950,7 @@ fn find_in_leaf(page: &Page, key: &[u8]) -> Option<SlotRef> {
         match mid_key.cmp(key) {
             std::cmp::Ordering::Equal => {
                 let value = entry_value_at(page, mid)?;
-                #[cfg(debug_assertions)]
-                {
+                if matches!(std::env::var("SCALE_KV_BTREE_DEBUG").as_deref(), Ok("1")) {
                     let sr = decode_slot_ref(value);
                     eprintln!(
                         "[btree-get] equal mid={} key_hex={} slot_ref=({}, {}) value_hex={}",
