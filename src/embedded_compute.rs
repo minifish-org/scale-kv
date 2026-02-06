@@ -340,11 +340,15 @@ impl EmbeddedTxn {
             )));
         }
         let leaf_idx = page_id - fsm_meta.data_base;
+        let mut fsm_meta = fsm_meta;
         if leaf_idx >= fsm_meta.leaf_count {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "fsm leaf_count exceeded (need resize)",
-            )));
+            // Grow FSM to cover this leaf.
+            let desired = leaf_idx + 1;
+            let (new_meta, grow_writes) = crate::fsm_pg::ensure_capacity(&fsm_meta, desired)?;
+            for (pid, p) in grow_writes {
+                self.write_page(pid, p);
+            }
+            fsm_meta = new_meta;
         }
 
         let mut page = slotted_page::new_page();
