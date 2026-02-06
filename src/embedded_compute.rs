@@ -515,6 +515,7 @@ impl EmbeddedTxn {
             .compute
             .page_cache
             .get(META_PAGE_ID)
+            .or_else(|| self.dirty.get(&META_PAGE_ID).cloned())
             .ok_or(Error::InMemoryPageMissing(META_PAGE_ID))?;
         let mut meta = MetaPage::decode(&meta_bytes)?;
 
@@ -522,6 +523,7 @@ impl EmbeddedTxn {
             .compute
             .page_cache
             .get(crate::fsm_pg::FSM_META_PAGE_ID)
+            .or_else(|| self.dirty.get(&crate::fsm_pg::FSM_META_PAGE_ID).cloned())
             .ok_or(Error::InMemoryPageMissing(crate::fsm_pg::FSM_META_PAGE_ID))?;
         let fsm_meta = crate::fsm_pg::FsmMeta::decode(&fsm_meta_bytes)?;
 
@@ -540,7 +542,7 @@ impl EmbeddedTxn {
                 break;
             };
             let page_id = fsm_meta.data_base + leaf_idx;
-            if let Some(mut page) = self.compute.page_cache.get(page_id) {
+            if let Some(mut page) = self.get_page_for_read(page_id) {
                 match slotted_page::insert_record(&mut page, key, value) {
                     Ok(slot_id) => {
                         self.write_page(page_id, page.clone());
