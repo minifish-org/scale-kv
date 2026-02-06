@@ -408,7 +408,34 @@ impl EmbeddedTxn {
                 .get(slot.page_id)
                 .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
             slotted_page::clear_slot(&mut page, slot.slot_id);
-            self.write_page(slot.page_id, page);
+            self.write_page(slot.page_id, page.clone());
+
+            // Update FSM to reflect increased free space.
+            let fsm_meta_bytes = self
+                .compute
+                .page_cache
+                .get(crate::fsm_pg::FSM_META_PAGE_ID)
+                .or_else(|| self.dirty.get(&crate::fsm_pg::FSM_META_PAGE_ID).cloned())
+                .ok_or(Error::InMemoryPageMissing(crate::fsm_pg::FSM_META_PAGE_ID))?;
+            let fsm_meta = crate::fsm_pg::FsmMeta::decode(&fsm_meta_bytes)?;
+
+            if slot.page_id >= fsm_meta.data_base {
+                let leaf_idx = slot.page_id - fsm_meta.data_base;
+                if leaf_idx < fsm_meta.leaf_count {
+                    let free = slotted_page::page_free_space(&page);
+                    let class = crate::fsm_pg::class_from_free_bytes(free);
+                    let cache = Arc::clone(&self.compute.page_cache);
+                    let dirty_snapshot = self.dirty.clone();
+                    let get_page = move |pid: PageId| {
+                        dirty_snapshot.get(&pid).cloned().or_else(|| cache.get(pid))
+                    };
+                    for (pid, p) in
+                        crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, class)?
+                    {
+                        self.write_page(pid, p);
+                    }
+                }
+            }
         }
 
         {
