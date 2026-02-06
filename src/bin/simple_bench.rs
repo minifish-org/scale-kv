@@ -18,9 +18,9 @@ fn parse_arg(args: &[String], key: &str) -> Option<String> {
 }
 
 fn key_for(i: u64) -> Vec<u8> {
-    let mut k = vec![0u8; KEY_SIZE];
-    k[..8].copy_from_slice(&i.to_le_bytes());
-    k
+    // 16-byte ascii key, preserves lexical order for numeric ids.
+    let s = format!("{i:016}");
+    s.into_bytes()
 }
 
 fn val_for(i: u64) -> Vec<u8> {
