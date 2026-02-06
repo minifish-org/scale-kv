@@ -481,13 +481,21 @@ impl EmbeddedTxn {
                     let slot_info = slotted_page::debug_slot(&page, slot.slot_id)
                         .map(|(pos, len)| format!("pos={pos} len={len}"))
                         .unwrap_or_else(|| "<none>".to_string());
+                    let leaf_keys = {
+                        let tree = self.compute.tree.lock().unwrap();
+                        tree.debug_leaf_keys(key, 8)
+                    };
+                    let leaf_keys_hex: Vec<String> =
+                        leaf_keys.iter().map(|k| hex::encode(k)).collect();
+
                     eprintln!(
-                        "[overwrite-debug] key mismatch before overwrite: page_id={} slot_id={} {} key_hex={} slot_key_hex={}",
+                        "[overwrite-debug] key mismatch before overwrite: page_id={} slot_id={} {} key_hex={} slot_key_hex={} leaf_keys_hex={:?}",
                         slot.page_id,
                         slot.slot_id,
                         slot_info,
                         hex::encode(key),
-                        hex::encode(&slot_key)
+                        hex::encode(&slot_key),
+                        leaf_keys_hex
                     );
                 }
             }
