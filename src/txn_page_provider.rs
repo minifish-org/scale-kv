@@ -12,16 +12,22 @@ pub struct TxnPageProvider {
     pages: Arc<PageCache>,
     next_page_id: Arc<AtomicU64>,
     root: Arc<AtomicU64>,
+    btree_meta_page_id: PageId,
 
     dirty: Arc<Mutex<BTreeMap<PageId, Page>>>,
 }
 
 impl TxnPageProvider {
-    pub fn new(pages: Arc<PageCache>, next_page_id: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        pages: Arc<PageCache>,
+        next_page_id: Arc<AtomicU64>,
+        btree_meta_page_id: PageId,
+    ) -> Self {
         Self {
             pages,
             next_page_id,
             root: Arc::new(AtomicU64::new(0)),
+            btree_meta_page_id,
             dirty: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -66,5 +72,13 @@ impl PageProvider for TxnPageProvider {
 
     fn set_root_page_id(&self, page_id: PageId) {
         self.root.store(page_id, Ordering::Relaxed);
+
+        // Persist B-Tree meta page as a normal page after-image.
+        let meta = crate::btree_meta::BtreeMeta {
+            root_page_id: page_id,
+        };
+        let page = meta.encode();
+        self.pages.insert(self.btree_meta_page_id, page.clone());
+        self.record_dirty(self.btree_meta_page_id, &page);
     }
 }

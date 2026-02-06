@@ -18,6 +18,9 @@ pub use page_store::{BufferPoolConfig, BufferStats, CheckpointConfig, PageStore}
 pub mod meta_page;
 pub use meta_page::{META_PAGE_ID, MetaPage};
 
+pub mod btree_meta;
+pub use btree_meta::{BTREE_META_PAGE_ID, BtreeMeta};
+
 pub mod slotted_page;
 
 pub mod fsm_pg;

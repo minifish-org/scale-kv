@@ -4,6 +4,7 @@ use crate::page_bptree::{
     DEFAULT_PAGE_CACHE_SHARDS, PageBPlusTree, PageCache, PageProvider, SlotRef as PageSlotRef,
 };
 use crate::txn_page_provider::TxnPageProvider;
+use crate::{BTREE_META_PAGE_ID, BtreeMeta};
 use crate::{
     Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, StorageClient, VALUE_SIZE, slotted_page,
 };
@@ -36,7 +37,11 @@ impl EmbeddedCompute {
 
         let page_cache = Arc::new(PageCache::new(DEFAULT_PAGE_CACHE_SHARDS));
         let next_page_id = Arc::new(AtomicU64::new(1));
-        let provider = Arc::new(TxnPageProvider::new(page_cache.clone(), next_page_id));
+        let provider = Arc::new(TxnPageProvider::new(
+            page_cache.clone(),
+            next_page_id,
+            BTREE_META_PAGE_ID,
+        ));
         let tree = Arc::new(Mutex::new(PageBPlusTree::with_provider(
             (*provider).clone(),
         )));
@@ -102,11 +107,18 @@ impl EmbeddedCompute {
         // Warmup first (best-effort). If storage is empty, we'll init below.
         let _ = self.warmup_scan_all(256).await;
 
-        if let Some(meta_bytes) = self.page_cache.get(META_PAGE_ID) {
-            let meta = MetaPage::decode(&meta_bytes)?;
-            // configure provider root + next_page_id
-            self.provider.set_root_page_id(meta.root_page_id);
+        if let Some(global_meta_bytes) = self.page_cache.get(META_PAGE_ID) {
+            let meta = MetaPage::decode(&global_meta_bytes)?;
             self.provider.set_next_page_id(meta.next_bptree_page_id);
+
+            // Prefer btree metapage for root.
+            if let Some(btree_meta_bytes) = self.page_cache.get(BTREE_META_PAGE_ID) {
+                let bm = BtreeMeta::decode(&btree_meta_bytes)?;
+                self.provider.set_root_page_id(bm.root_page_id);
+            } else {
+                // Fallback: root in global meta.
+                self.provider.set_root_page_id(meta.root_page_id);
+            }
             return Ok(());
         }
 
@@ -135,6 +147,15 @@ impl EmbeddedCompute {
         // Root leaf page.
         let root_page = crate::page_bptree::new_page(2, 0);
         tx.write_page(BPTREE_ROOT_ID, root_page);
+
+        // B-Tree metapage.
+        tx.write_page(
+            BTREE_META_PAGE_ID,
+            BtreeMeta {
+                root_page_id: BPTREE_ROOT_ID,
+            }
+            .encode(),
+        );
 
         // FSM pages (empty).
         let (_fsm_meta, fsm_writes) =

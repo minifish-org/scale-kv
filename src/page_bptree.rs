@@ -7,7 +7,17 @@ use std::sync::{Arc, RwLock};
 const PAGE_TYPE_INTERNAL: u8 = 1;
 const PAGE_TYPE_LEAF: u8 = 2;
 
-const HEADER_SIZE: usize = 1 + 1 + 2 + 8 + 8; // type, level, key_count, next_leaf, left_child
+const HIGH_KEY_SIZE: usize = KEY_SIZE;
+const HEADER_SIZE: usize = 40; // padded header
+// layout:
+// 0: page_type u8
+// 1: level u8
+// 2..4: key_count u16
+// 4..12: next_leaf u64 (0 means none)
+// 12..20: left_child u64
+// 20: high_key_present u8
+// 21..(21+HIGH_KEY_SIZE): high_key bytes
+
 const OFFSET_ENTRY_SIZE: usize = 2;
 const SLOT_REF_SIZE: usize = 10;
 const CHILD_ID_SIZE: usize = 8;
@@ -237,9 +247,26 @@ impl<P: PageProvider> PageBPlusTree<P> {
     }
 
     pub fn get(&self, key: &[u8]) -> Option<SlotRef> {
-        let (leaf_id, _) = self.find_leaf(key);
-        let page = self.provider.read_page(leaf_id)?;
-        find_in_leaf(&page, key)
+        let (mut leaf_id, _) = self.find_leaf(key);
+
+        // High-key correction: if key is above this leaf's range, follow next_leaf.
+        loop {
+            let page = self.provider.read_page(leaf_id)?;
+            if page_header(&page).page_type != PAGE_TYPE_LEAF {
+                break;
+            }
+            if let Some(hk) = page_header(&page).high_key {
+                if key > hk.as_slice() {
+                    if let Some(next) = page_header(&page).next_leaf {
+                        leaf_id = next;
+                        continue;
+                    }
+                }
+            }
+            return find_in_leaf(&page, key);
+        }
+
+        None
     }
 
     pub fn insert(&mut self, key: Vec<u8>, slot_ref: SlotRef) -> Result<()> {
@@ -447,6 +474,7 @@ struct PageHeader {
     key_count: u16,
     next_leaf: Option<PageId>,
     left_child: PageId,
+    high_key: Option<[u8; HIGH_KEY_SIZE]>,
 }
 
 fn page_header(page: &Page) -> PageHeader {
@@ -455,6 +483,14 @@ fn page_header(page: &Page) -> PageHeader {
     let key_count = u16::from_le_bytes([page[2], page[3]]);
     let next_leaf = u64::from_le_bytes(page[4..12].try_into().unwrap());
     let left_child = u64::from_le_bytes(page[12..20].try_into().unwrap());
+    let high_present = page[20] != 0;
+    let high_key = if high_present {
+        let mut hk = [0u8; HIGH_KEY_SIZE];
+        hk.copy_from_slice(&page[21..21 + HIGH_KEY_SIZE]);
+        Some(hk)
+    } else {
+        None
+    };
     PageHeader {
         page_type,
         level,
@@ -465,6 +501,7 @@ fn page_header(page: &Page) -> PageHeader {
             Some(next_leaf)
         },
         left_child,
+        high_key,
     }
 }
 
@@ -479,6 +516,21 @@ fn write_header(page: &mut Page, header: PageHeader) {
     let next_leaf = header.next_leaf.unwrap_or(0);
     page[4..12].copy_from_slice(&next_leaf.to_le_bytes());
     page[12..20].copy_from_slice(&header.left_child.to_le_bytes());
+
+    match header.high_key {
+        Some(hk) => {
+            page[20] = 1;
+            page[21..21 + HIGH_KEY_SIZE].copy_from_slice(&hk);
+        }
+        None => {
+            page[20] = 0;
+            page[21..21 + HIGH_KEY_SIZE].fill(0);
+        }
+    }
+    // padding
+    if HEADER_SIZE > 21 + HIGH_KEY_SIZE {
+        page[21 + HIGH_KEY_SIZE..HEADER_SIZE].fill(0);
+    }
 }
 
 pub fn new_page(page_type: u8, level: u8) -> Page {
@@ -489,6 +541,7 @@ pub fn new_page(page_type: u8, level: u8) -> Page {
         key_count: 0,
         next_leaf: None,
         left_child: 0,
+        high_key: None,
     };
     write_header(&mut page, header);
     page
@@ -803,11 +856,20 @@ fn split_leaf(page: &Page, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8>, (
     let mut right = new_page(PAGE_TYPE_LEAF, 0);
     let mut left_header = leaf_page_header(page);
     let mut right_header = leaf_page_header(page);
+    let sep = right_entries[0].0.clone();
+
+    // Preserve existing high_key as right high_key; set left high_key to sep.
     right_header.next_leaf = left_header.next_leaf;
+    right_header.high_key = left_header.high_key;
+
     left_header.next_leaf = None;
+    let mut hk = [0u8; HIGH_KEY_SIZE];
+    hk.copy_from_slice(&sep);
+    left_header.high_key = Some(hk);
+
     encode_entries(&mut left, left_entries, left_header)?;
     encode_entries(&mut right, right_entries, right_header)?;
-    Ok((right_entries[0].0.clone(), (left, right)))
+    Ok((sep, (left, right)))
 }
 
 fn split_internal(page: &Page, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8>, (Page, Page))> {
@@ -817,9 +879,18 @@ fn split_internal(page: &Page, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8
     let right_entries = &entries[mid + 1..];
     let mut left = new_page(PAGE_TYPE_INTERNAL, page_header(page).level);
     let mut right = new_page(PAGE_TYPE_INTERNAL, page_header(page).level);
-    let left_header = page_header(page);
+    let old_hk = page_header(page).high_key;
+    let mut left_header = page_header(page);
     let mut right_header = page_header(page);
+
+    // High key for left internal becomes separator; right inherits old high_key.
+    let mut hk = [0u8; HIGH_KEY_SIZE];
+    hk.copy_from_slice(&separator);
+    left_header.high_key = Some(hk);
+
+    right_header.high_key = old_hk;
     right_header.left_child = decode_child_id(&entries[mid].1);
+
     encode_entries(&mut left, left_entries, left_header)?;
     encode_entries(&mut right, right_entries, right_header)?;
     Ok((separator, (left, right)))
