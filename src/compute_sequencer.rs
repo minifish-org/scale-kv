@@ -1,4 +1,4 @@
-use crate::node::{WalBatch, WalRecord, WAL_OP_TXN_COMMIT};
+use crate::node::{WAL_OP_TXN_COMMIT, WalBatch, WalRecord};
 use crate::{Error, Result, StorageClient, StorageQuorumClient};
 use futures::future::join_all;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,9 +11,9 @@ use tokio::task::LocalSet;
 pub struct ComputeSequencer {
     clients: Vec<StorageClient>,
     quorum: usize,
-    next_lsn: AtomicU64,      // exclusive right boundary
+    next_lsn: AtomicU64, // exclusive right boundary
     request_id: AtomicU64,
-    durable_lsn: AtomicU64,   // quorum-durable right boundary cache
+    durable_lsn: AtomicU64, // quorum-durable right boundary cache
 }
 
 impl ComputeSequencer {
@@ -99,7 +99,9 @@ impl ComputeSequencer {
                     if durable >= end_lsn {
                         acks.push(durable);
                     } else {
-                        errs.push(format!("ack durable_lsn too small: got={durable} need>={end_lsn}"));
+                        errs.push(format!(
+                            "ack durable_lsn too small: got={durable} need>={end_lsn}"
+                        ));
                     }
                 }
                 Err(e) => {
@@ -109,7 +111,11 @@ impl ComputeSequencer {
         }
 
         if acks.len() < self.quorum {
-            let mut msg = format!("quorum not reached: acks={} quorum={}", acks.len(), self.quorum);
+            let mut msg = format!(
+                "quorum not reached: acks={} quorum={}",
+                acks.len(),
+                self.quorum
+            );
             if !errs.is_empty() {
                 msg.push_str("; errors=[");
                 for (i, e) in errs.iter().take(3).enumerate() {
@@ -123,7 +129,10 @@ impl ComputeSequencer {
                 }
                 msg.push(']');
             }
-            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::Other, msg)));
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                msg,
+            )));
         }
 
         // Quorum-durable point is the quorum-th largest durable among acks.

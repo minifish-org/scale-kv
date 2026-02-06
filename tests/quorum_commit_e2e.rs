@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, process};
 
-use scale_kv::node::{WalBatch, WalRecord, WAL_OP_TXN_COMMIT, WAL_OP_TXN_DEL, WAL_OP_TXN_PUT};
+use scale_kv::node::{WAL_OP_TXN_COMMIT, WAL_OP_TXN_DEL, WAL_OP_TXN_PUT, WalBatch, WalRecord};
 use scale_kv::{ComputeSequencer, StorageClient, StorageServer};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -15,7 +15,12 @@ fn tcp_bind_allowed() -> bool {
 fn temp_dir(tag: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    dir.push(format!("scale-kv-quorum-e2e-{}-{}-{}", tag, process::id(), id));
+    dir.push(format!(
+        "scale-kv-quorum-e2e-{}-{}-{}",
+        tag,
+        process::id(),
+        id
+    ));
     fs::create_dir_all(&dir).expect("failed to create temp dir");
     dir
 }
@@ -38,9 +43,15 @@ async fn test_quorum_commit_with_one_ahead_node() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let s1 = StorageServer::start_with_dir(addr, dir1.clone()).await.unwrap();
-            let s2 = StorageServer::start_with_dir(addr, dir2.clone()).await.unwrap();
-            let s3 = StorageServer::start_with_dir(addr, dir3.clone()).await.unwrap();
+            let s1 = StorageServer::start_with_dir(addr, dir1.clone())
+                .await
+                .unwrap();
+            let s2 = StorageServer::start_with_dir(addr, dir2.clone())
+                .await
+                .unwrap();
+            let s3 = StorageServer::start_with_dir(addr, dir3.clone())
+                .await
+                .unwrap();
 
             let a1 = s1.addr().to_string();
             let a2 = s2.addr().to_string();

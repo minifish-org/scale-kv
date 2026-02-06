@@ -41,7 +41,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let server = StorageServer::start_with_dir(addr, dir.clone()).await?;
-    eprintln!("storage_server listening on {} (dir={})", server.addr(), dir.display());
+    eprintln!(
+        "storage_server listening on {} (dir={})",
+        server.addr(),
+        dir.display()
+    );
 
     // park forever
     futures::future::pending::<()>().await;

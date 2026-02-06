@@ -57,10 +57,8 @@ async fn test_txn_snapshot_mvcc_and_idempotent_commit() {
                 (OP_PUT, key.clone(), val.clone()),
                 (OP_COMMIT, Vec::new(), Vec::new()),
             ];
-            let (commit_lsn_1, durable_1) = client
-                .append_txn_batch(request_id, &records)
-                .await
-                .unwrap();
+            let (commit_lsn_1, durable_1) =
+                client.append_txn_batch(request_id, &records).await.unwrap();
             assert!(durable_1 >= commit_lsn_1);
 
             // Old snapshot must not see the new write.
@@ -72,10 +70,8 @@ async fn test_txn_snapshot_mvcc_and_idempotent_commit() {
             assert_eq!(seen_new, Some(val.clone()));
 
             // Idempotent retry with same requestId should return same commitLsn.
-            let (commit_lsn_2, _durable_2) = client
-                .append_txn_batch(request_id, &records)
-                .await
-                .unwrap();
+            let (commit_lsn_2, _durable_2) =
+                client.append_txn_batch(request_id, &records).await.unwrap();
             assert_eq!(commit_lsn_1, commit_lsn_2);
 
             // A new txn deleting the key.

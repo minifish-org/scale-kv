@@ -1,4 +1,4 @@
-use scale_kv::{ComputeNode, StorageServer, KEY_SIZE, VALUE_SIZE};
+use scale_kv::{ComputeNode, KEY_SIZE, StorageServer, VALUE_SIZE};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

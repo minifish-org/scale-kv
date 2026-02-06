@@ -1,16 +1,16 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use rand::RngCore;
-use rand::rngs::StdRng;
 use rand::SeedableRng;
-use scale_kv::{ComputeNode, StorageServer};
+use rand::rngs::StdRng;
 use scale_kv::page_bptree::{InMemoryPageProvider, PageBPlusTree, SlotRef as BptreeSlotRef};
+use scale_kv::{ComputeNode, StorageServer};
 use sled::Config;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use std::env;
 use tokio::runtime::Builder;
 use tokio::task::LocalSet;
 
@@ -137,7 +137,10 @@ fn pregen_keys_str_from_ranks(ranks: &[u64]) -> Vec<String> {
 }
 
 fn pregen_latest_keys_str_from_ranks(ranks: &[u64]) -> Vec<String> {
-    ranks.iter().map(|&rank| latest_key_from_rank(rank)).collect()
+    ranks
+        .iter()
+        .map(|&rank| latest_key_from_rank(rank))
+        .collect()
 }
 
 fn pregen_range_keys_str_from_ranks(ranks: &[u64]) -> Vec<(String, String)> {
@@ -211,8 +214,6 @@ fn rpc_workers() -> usize {
         .unwrap_or(1)
 }
 
-
-
 fn sled_enabled() -> bool {
     matches!(
         env::var("SCALE_KV_RUN_SLED").as_deref(),
@@ -235,7 +236,9 @@ fn in_memory_compute() -> bool {
 }
 
 fn bench_set() -> Option<String> {
-    env::var("SCALE_KV_BENCH_SET").ok().map(|v| v.to_lowercase())
+    env::var("SCALE_KV_BENCH_SET")
+        .ok()
+        .map(|v| v.to_lowercase())
 }
 
 fn bench_filter() -> Option<HashSet<String>> {
@@ -247,11 +250,7 @@ fn bench_filter() -> Option<HashSet<String>> {
             set.insert(trimmed.to_string());
         }
     }
-    if set.is_empty() {
-        None
-    } else {
-        Some(set)
-    }
+    if set.is_empty() { None } else { Some(set) }
 }
 
 fn bench_allowed(name: &str, is_sled: bool) -> bool {
@@ -528,7 +527,6 @@ fn bench_throughput_get(c: &mut Criterion) {
     });
     group.finish();
 }
-
 
 fn bench_batch_put(c: &mut Criterion) {
     if !bench_allowed("batch_put_16k", false) {

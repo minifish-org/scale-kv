@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use scale_kv::node::{WalBatch, WalRecord};
-use scale_kv::{StorageClient, StorageNode, StorageServer, PAGE_SIZE};
+use scale_kv::{PAGE_SIZE, StorageClient, StorageNode, StorageServer};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -15,7 +15,11 @@ fn tcp_bind_allowed() -> bool {
 fn temp_dir() -> PathBuf {
     let mut dir = std::env::temp_dir();
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    dir.push(format!("scale-kv-storage-test-{}-{}", std::process::id(), id));
+    dir.push(format!(
+        "scale-kv-storage-test-{}-{}",
+        std::process::id(),
+        id
+    ));
     fs::create_dir_all(&dir).expect("failed to create temp dir");
     dir
 }

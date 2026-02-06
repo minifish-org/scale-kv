@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use scale_kv::{ComputeNode, StorageServer, KEY_SIZE, VALUE_SIZE};
+use scale_kv::{ComputeNode, KEY_SIZE, StorageServer, VALUE_SIZE};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -11,7 +11,11 @@ fn tcp_bind_allowed() -> bool {
 fn temp_dir() -> std::path::PathBuf {
     let mut dir = std::env::temp_dir();
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    dir.push(format!("scale-kv-compute-test-{}-{}", std::process::id(), id));
+    dir.push(format!(
+        "scale-kv-compute-test-{}-{}",
+        std::process::id(),
+        id
+    ));
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     dir
 }
@@ -75,7 +79,10 @@ async fn test_compute_multi_and_range() {
             assert_eq!(values[1], Some(v2));
             assert_eq!(values[2], Some(v3));
 
-            let range = compute.range(&fixed_key("a1"), &fixed_key("a9")).await.unwrap();
+            let range = compute
+                .range(&fixed_key("a1"), &fixed_key("a9"))
+                .await
+                .unwrap();
             assert_eq!(range.len(), 2);
             assert_eq!(range[0].0, fixed_key("a1"));
             assert_eq!(range[1].0, fixed_key("a2"));
@@ -93,7 +100,9 @@ async fn test_compute_wal_queue_async() {
     local
         .run_until(async {
             let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone()).await.unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
+                .await
+                .unwrap();
             let compute = ComputeNode::with_storage(&server.addr().to_string(), &local)
                 .await
                 .unwrap();

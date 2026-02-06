@@ -8,13 +8,8 @@ pub use common::*;
 
 pub mod page_bptree;
 pub use page_bptree::{
-    InMemoryPageProvider,
-    PageBPlusTree,
-    PageCache,
-    PageProvider,
-    SharedPageProvider,
-    SlotRef as PageSlotRef,
-    DEFAULT_PAGE_CACHE_SHARDS,
+    DEFAULT_PAGE_CACHE_SHARDS, InMemoryPageProvider, PageBPlusTree, PageCache, PageProvider,
+    SharedPageProvider, SlotRef as PageSlotRef,
 };
 
 pub mod page_store;
@@ -24,7 +19,9 @@ pub mod node;
 pub use node::StorageNode;
 
 pub mod client;
-pub use client::{BatchSender, BatchedComputeNode, BatchedStorageClientPool, ComputeNode, StorageClient};
+pub use client::{
+    BatchSender, BatchedComputeNode, BatchedStorageClientPool, ComputeNode, StorageClient,
+};
 
 pub mod server;
 pub use server::StorageServer;
@@ -36,6 +33,9 @@ pub use quorum_client::StorageQuorumClient;
 
 pub mod compute_sequencer;
 pub use compute_sequencer::ComputeSequencer;
+
+pub mod embedded_compute;
+pub use embedded_compute::{EmbeddedCompute, EmbeddedTxn};
 
 pub mod txn_kv;
 pub use txn_kv::{Txn, TxnError, TxnManager};

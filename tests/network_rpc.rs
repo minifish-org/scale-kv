@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, process};
 
-use scale_kv::{StorageClient, StorageServer, PAGE_SIZE};
+use scale_kv::{PAGE_SIZE, StorageClient, StorageServer};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 

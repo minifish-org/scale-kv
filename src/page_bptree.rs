@@ -1,4 +1,4 @@
-use crate::{Error, Page, PageId, Result, KEY_SIZE, PAGE_SIZE};
+use crate::{Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -256,7 +256,8 @@ impl<P: PageProvider> PageBPlusTree<P> {
         let encoded = encode_slot_ref(slot_ref);
 
         if found {
-            let offset = entry_offset_at(&leaf, pos).ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
+            let offset = entry_offset_at(&leaf, pos)
+                .ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
             let value_offset = offset + KEY_SIZE;
             leaf[value_offset..value_offset + SLOT_REF_SIZE].copy_from_slice(&encoded);
             self.provider.write_page(leaf_id, leaf);
@@ -264,9 +265,7 @@ impl<P: PageProvider> PageBPlusTree<P> {
         }
 
         let total = header.key_count as usize + 1;
-        let size = HEADER_SIZE
-            + total * OFFSET_ENTRY_SIZE
-            + total * entry_size(PAGE_TYPE_LEAF);
+        let size = HEADER_SIZE + total * OFFSET_ENTRY_SIZE + total * entry_size(PAGE_TYPE_LEAF);
         if size <= PAGE_SIZE {
             let rebuilt = rebuild_page_with_insert(&leaf, header, pos, &key, &encoded)?;
             self.provider.write_page(leaf_id, rebuilt);
@@ -314,12 +313,7 @@ impl<P: PageProvider> PageBPlusTree<P> {
         out
     }
 
-    pub fn range_visit(
-        &self,
-        start: &[u8],
-        end: &[u8],
-        mut f: impl FnMut(&[u8], SlotRef) -> bool,
-    ) {
+    pub fn range_visit(&self, start: &[u8], end: &[u8], mut f: impl FnMut(&[u8], SlotRef) -> bool) {
         let (leaf_id, _) = self.find_leaf(start);
         let mut current = Some(leaf_id);
         while let Some(page_id) = current {
@@ -408,7 +402,11 @@ impl<P: PageProvider> PageBPlusTree<P> {
         let parent_id = stack.pop().unwrap();
         let mut parent = self.provider.read_page(parent_id).unwrap();
         let header = page_header(&parent);
-        let mut pos = if header.left_child == left_id { 0 } else { usize::MAX };
+        let mut pos = if header.left_child == left_id {
+            0
+        } else {
+            usize::MAX
+        };
         if pos == usize::MAX {
             let key_count = header.key_count as usize;
             for idx in 0..key_count {
@@ -424,9 +422,7 @@ impl<P: PageProvider> PageBPlusTree<P> {
         }
 
         let total = header.key_count as usize + 1;
-        let size = HEADER_SIZE
-            + total * OFFSET_ENTRY_SIZE
-            + total * entry_size(PAGE_TYPE_INTERNAL);
+        let size = HEADER_SIZE + total * OFFSET_ENTRY_SIZE + total * entry_size(PAGE_TYPE_INTERNAL);
         if size <= PAGE_SIZE {
             let encoded = encode_child_id(right_id);
             let rebuilt = rebuild_page_with_insert(&parent, header, pos, &separator, &encoded)?;
@@ -546,10 +542,7 @@ fn decode_entries(page: &Page) -> Vec<(Vec<u8>, Vec<u8>)> {
     entries
 }
 
-fn for_each_entry<'a>(
-    page: &'a Page,
-    mut f: impl FnMut(&'a [u8], &'a [u8]) -> bool,
-) {
+fn for_each_entry<'a>(page: &'a Page, mut f: impl FnMut(&'a [u8], &'a [u8]) -> bool) {
     let header = page_header(page);
     let value_size = entry_value_size(header.page_type);
     let start = data_start(header.key_count);
@@ -673,8 +666,10 @@ fn rebuild_page_with_insert(
             (key, value)
         } else {
             let idx = if pos < insert_pos { pos } else { pos - 1 };
-            let k = entry_key_at(page, idx).ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
-            let v = entry_value_at(page, idx).ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
+            let k =
+                entry_key_at(page, idx).ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
+            let v =
+                entry_value_at(page, idx).ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
             (k, v)
         };
 
@@ -689,11 +684,7 @@ fn rebuild_page_with_insert(
     Ok(out)
 }
 
-fn rebuild_page_with_remove(
-    page: &Page,
-    header: PageHeader,
-    remove_pos: usize,
-) -> Result<Page> {
+fn rebuild_page_with_remove(page: &Page, header: PageHeader, remove_pos: usize) -> Result<Page> {
     let value_size = entry_value_size(header.page_type);
     let total = header.key_count as usize;
     if remove_pos >= total {
@@ -799,9 +790,8 @@ fn fits_in_page(entries: &[(Vec<u8>, Vec<u8>)]) -> bool {
         return HEADER_SIZE <= PAGE_SIZE;
     }
     let value_size = entries[0].1.len();
-    let size = HEADER_SIZE
-        + entries.len() * OFFSET_ENTRY_SIZE
-        + entries.len() * (KEY_SIZE + value_size);
+    let size =
+        HEADER_SIZE + entries.len() * OFFSET_ENTRY_SIZE + entries.len() * (KEY_SIZE + value_size);
     size <= PAGE_SIZE
 }
 
@@ -861,8 +851,8 @@ mod tests {
     use super::{InMemoryPageProvider, PageBPlusTree, PageProvider, SlotRef};
     use crate::KEY_SIZE;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicU64;
     use std::sync::RwLock;
+    use std::sync::atomic::AtomicU64;
 
     fn key_for(i: u32) -> Vec<u8> {
         let mut key = format!("k{:03}", i).into_bytes();

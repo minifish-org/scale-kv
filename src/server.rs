@@ -1,17 +1,16 @@
+use crate::node::{WAL_OP_TXN_COMMIT, WAL_OP_TXN_DEL, WAL_OP_TXN_PUT, WalBatch, WalRecord};
 use crate::storage_capnp::storage;
-use crate::node::{WalBatch, WalRecord, WAL_OP_TXN_COMMIT, WAL_OP_TXN_DEL, WAL_OP_TXN_PUT};
 use crate::{Result, StorageNode};
 use capnp::capability::Promise;
+use capnp_rpc::RpcSystem;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::twoparty::VatNetwork;
-use capnp_rpc::RpcSystem;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-
 
 pub struct StorageServer {
     data: Arc<StorageNode>,
@@ -260,11 +259,7 @@ impl storage::Server for StorageService {
                 1 => WAL_OP_TXN_PUT,
                 2 => WAL_OP_TXN_DEL,
                 3 => WAL_OP_TXN_COMMIT,
-                _ => {
-                    return Promise::err(capnp::Error::failed(format!(
-                        "invalid txn op: {op}"
-                    )))
-                }
+                _ => return Promise::err(capnp::Error::failed(format!("invalid txn op: {op}"))),
             };
             ops.push((mapped_op, key, value));
         }
@@ -281,7 +276,6 @@ impl storage::Server for StorageService {
             Ok(())
         })
     }
-
 }
 
 fn map_join_error(err: task::JoinError) -> capnp::Error {

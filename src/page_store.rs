@@ -1,4 +1,4 @@
-use crate::{Page, PageId, Result, PAGE_SIZE};
+use crate::{PAGE_SIZE, Page, PageId, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -517,7 +517,9 @@ mod tests {
             std::process::id(),
             id
         ));
-        fs::create_dir_all(&dir).await.expect("failed to create temp dir");
+        fs::create_dir_all(&dir)
+            .await
+            .expect("failed to create temp dir");
         dir
     }
 

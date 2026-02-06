@@ -1,5 +1,5 @@
 use crate::page_store::PageStore;
-use crate::{Page, PageId, Result, Value, KEY_SIZE, PAGE_SIZE, VALUE_SIZE};
+use crate::{KEY_SIZE, PAGE_SIZE, Page, PageId, Result, VALUE_SIZE, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 
 const PAGE_HEADER_SIZE: usize = 6;
 const SLOT_ENTRY_SIZE: usize = 4;
@@ -105,7 +105,8 @@ impl PageStoreReplay {
         let page_id = record.page_id;
         let lsn = record.lsn;
         let page = self
-            .read_page(page_id).await
+            .read_page(page_id)
+            .await
             .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
         let mut page = page;
         apply_wal_record(&mut page, &record)?;
@@ -149,7 +150,11 @@ impl WalWriter {
             segments.sort_unstable();
             let file_id = *segments.last().unwrap();
             let path = wal_segment_path(&dir, file_id);
-            let file = OpenOptions::new().append(true).read(true).open(path).await?;
+            let file = OpenOptions::new()
+                .append(true)
+                .read(true)
+                .open(path)
+                .await?;
             let size = file.metadata().await?.len();
             (file_id, file, size)
         };
@@ -558,7 +563,8 @@ async fn replay_page_records(
     }
     let mut max_lsn = 0u64;
     let page = replay
-        .read_page(page_id).await
+        .read_page(page_id)
+        .await
         .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
     let mut page = page;
     for record in records {
@@ -838,7 +844,9 @@ impl StorageNode {
             Some(sender) => Ok(sender
                 .send(WalWriteRequest { batch, ack: None })
                 .await
-                .map_err(|_| crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal queue closed")))?),
+                .map_err(|_| {
+                    crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal queue closed"))
+                })?),
             None => Err(crate::Error::Io(Error::new(
                 ErrorKind::BrokenPipe,
                 "wal queue not initialized",
@@ -875,7 +883,8 @@ impl StorageNode {
                 ErrorKind::InvalidInput,
                 format!(
                     "wal batch length mismatch: records={} range_len={}",
-                    batch.records.len(), expected_len
+                    batch.records.len(),
+                    expected_len
                 ),
             )));
         }
@@ -970,7 +979,10 @@ impl StorageNode {
         self.validate_incoming_wal_batch(&batch)?;
         let sender = self.wal_sender.lock().await;
         let sender = sender.as_ref().ok_or_else(|| {
-            crate::Error::Io(Error::new(ErrorKind::BrokenPipe, "wal queue not initialized"))
+            crate::Error::Io(Error::new(
+                ErrorKind::BrokenPipe,
+                "wal queue not initialized",
+            ))
         })?;
         let (tx, rx) = oneshot::channel();
         sender
@@ -1120,7 +1132,7 @@ async fn read_wal_state(dir: &Path) -> Result<WalState> {
         Err(err) if err.kind() == ErrorKind::NotFound => {
             return Ok(WalState {
                 last_applied_lsn: 0,
-            })
+            });
         }
         Err(err) => return Err(err.into()),
     };
@@ -1159,7 +1171,9 @@ mod tests {
         let mut dir = std::env::temp_dir();
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         dir.push(format!("scale-kv-test-{}-{}", std::process::id(), id));
-        fs::create_dir_all(&dir).await.expect("failed to create temp dir");
+        fs::create_dir_all(&dir)
+            .await
+            .expect("failed to create temp dir");
         dir
     }
 
@@ -1416,8 +1430,20 @@ mod tests {
     fn test_wal_slot_key_mismatch_is_rejected() {
         let mut page = vec![0u8; PAGE_SIZE];
         write_header(&mut page, 0, PAGE_HEADER_SIZE as u16, PAGE_SIZE as u16);
-        insert_record_at_slot_checked(&mut page, 0, &fixed_key_bytes(b"k1"), &vec![b'v'; VALUE_SIZE]).unwrap();
-        let err = insert_record_at_slot_checked(&mut page, 0, &fixed_key_bytes(b"k2"), &vec![b'w'; VALUE_SIZE]).unwrap_err();
+        insert_record_at_slot_checked(
+            &mut page,
+            0,
+            &fixed_key_bytes(b"k1"),
+            &vec![b'v'; VALUE_SIZE],
+        )
+        .unwrap();
+        let err = insert_record_at_slot_checked(
+            &mut page,
+            0,
+            &fixed_key_bytes(b"k2"),
+            &vec![b'w'; VALUE_SIZE],
+        )
+        .unwrap_err();
         assert!(format!("{err}").contains("wal replay slot key mismatch"));
     }
 

@@ -20,17 +20,11 @@ async fn test_smoke() {
 
             let key = fixed_key("key1");
             compute.put(&key, &value1).await.unwrap();
-            assert_eq!(
-                compute.get(&key).await.unwrap(),
-                Some(value1.clone())
-            );
+            assert_eq!(compute.get(&key).await.unwrap(), Some(value1.clone()));
             assert!(compute.exists(&key));
 
             compute.put(&key, &value2).await.unwrap();
-            assert_eq!(
-                compute.get(&key).await.unwrap(),
-                Some(value2.clone())
-            );
+            assert_eq!(compute.get(&key).await.unwrap(), Some(value2.clone()));
 
             assert!(compute.delete(&key).await.unwrap());
             assert_eq!(compute.get(&key).await.unwrap(), None);

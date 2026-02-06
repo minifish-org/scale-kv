@@ -38,8 +38,7 @@ pub type Result<T> = std::result::Result<T, TxnError>;
 
 pub trait TxnStorage: Send + Sync + std::fmt::Debug {
     fn load_snapshot(&self) -> Result<Option<(BTreeMap<Key, Vec<Version>>, u64)>>;
-    fn write_snapshot(&self, commit_ts: u64, store: &BTreeMap<Key, Vec<Version>>)
-        -> Result<()>;
+    fn write_snapshot(&self, commit_ts: u64, store: &BTreeMap<Key, Vec<Version>>) -> Result<()>;
     fn replay_wal(
         &self,
         base_store: BTreeMap<Key, Vec<Version>>,
@@ -75,11 +74,7 @@ impl TxnStorage for LocalFileStorage {
         load_snapshot_file(&snapshot_path(&self.wal_path))
     }
 
-    fn write_snapshot(
-        &self,
-        commit_ts: u64,
-        store: &BTreeMap<Key, Vec<Version>>,
-    ) -> Result<()> {
+    fn write_snapshot(&self, commit_ts: u64, store: &BTreeMap<Key, Vec<Version>>) -> Result<()> {
         write_snapshot_file(&snapshot_path(&self.wal_path), commit_ts, store)
     }
 
@@ -122,7 +117,9 @@ struct QuorumReplica {
 
 #[derive(Clone, Debug)]
 enum QuorumOp {
-    Append { record: Arc<Vec<u8>> },
+    Append {
+        record: Arc<Vec<u8>>,
+    },
     Snapshot {
         commit_ts: u64,
         store: Arc<BTreeMap<Key, Vec<Version>>>,
@@ -134,9 +131,7 @@ impl QuorumOp {
     fn apply(&self, storage: &LocalFileStorage) -> Result<()> {
         match self {
             QuorumOp::Append { record } => storage.append_wal_record(record.as_slice()),
-            QuorumOp::Snapshot { commit_ts, store } => {
-                storage.write_snapshot(*commit_ts, store)
-            }
+            QuorumOp::Snapshot { commit_ts, store } => storage.write_snapshot(*commit_ts, store),
             QuorumOp::Truncate => storage.truncate_wal(),
         }
     }
@@ -250,8 +245,10 @@ fn repair_worker(replicas: Arc<Vec<QuorumReplica>>, repair_rx: mpsc::Receiver<Re
     const REPAIR_BASE_DELAY_MS: u64 = 50;
     while let Ok(mut task) = repair_rx.recv() {
         loop {
-            if with_replica(&replicas, task.replica_index, |storage| task.op.apply(storage))
-                .is_ok()
+            if with_replica(&replicas, task.replica_index, |storage| {
+                task.op.apply(storage)
+            })
+            .is_ok()
             {
                 break;
             }
@@ -300,11 +297,7 @@ impl TxnStorage for QuorumStorage {
         }
     }
 
-    fn write_snapshot(
-        &self,
-        commit_ts: u64,
-        store: &BTreeMap<Key, Vec<Version>>,
-    ) -> Result<()> {
+    fn write_snapshot(&self, commit_ts: u64, store: &BTreeMap<Key, Vec<Version>>) -> Result<()> {
         let op = QuorumOp::Snapshot {
             commit_ts,
             store: Arc::new(store.clone()),
@@ -570,11 +563,7 @@ fn parse_key(key: &[u8]) -> Result<Key> {
     Ok(out)
 }
 
-fn read_at_ts(
-    store: &BTreeMap<Key, Vec<Version>>,
-    key: &Key,
-    read_ts: u64,
-) -> Option<Value> {
+fn read_at_ts(store: &BTreeMap<Key, Vec<Version>>, key: &Key, read_ts: u64) -> Option<Value> {
     let versions = store.get(key)?;
     versions
         .iter()
@@ -712,19 +701,14 @@ fn load_snapshot_file(path: &Path) -> Result<Option<(BTreeMap<Key, Vec<Version>>
         }
         let value = data[cursor..cursor + len].to_vec();
         cursor += len;
-        store
-            .entry(key)
-            .or_default()
-            .push(Version {
-                commit_ts,
-                value: Some(value),
-            });
+        store.entry(key).or_default().push(Version {
+            commit_ts,
+            value: Some(value),
+        });
     }
 
     if cursor != data.len() {
-        return Err(TxnError::CorruptWal(
-            "snapshot length mismatch".to_string(),
-        ));
+        return Err(TxnError::CorruptWal("snapshot length mismatch".to_string()));
     }
 
     Ok(Some((store, commit_ts)))
@@ -750,7 +734,9 @@ fn write_snapshot_file(
     }
 
     if entries.len() > u32::MAX as usize {
-        return Err(TxnError::CorruptWal("too many snapshot entries".to_string()));
+        return Err(TxnError::CorruptWal(
+            "too many snapshot entries".to_string(),
+        ));
     }
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
 
@@ -810,8 +796,8 @@ fn decode_payload(payload: &[u8]) -> Result<(u64, Vec<(Key, Option<Value>)>)> {
                 if cursor + 4 > payload.len() {
                     return Err(TxnError::CorruptWal("payload truncated".to_string()));
                 }
-                let len = u32::from_le_bytes(payload[cursor..cursor + 4].try_into().unwrap())
-                    as usize;
+                let len =
+                    u32::from_le_bytes(payload[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
                 if len > VALUE_SIZE {
                     return Err(TxnError::InvalidValueSize(len, VALUE_SIZE));
