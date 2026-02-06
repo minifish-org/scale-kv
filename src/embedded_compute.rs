@@ -355,7 +355,13 @@ pub struct EmbeddedTxn {
 
 impl EmbeddedTxn {
     pub fn write_page(&mut self, page_id: PageId, page: Page) {
-        self.dirty.insert(page_id, page);
+        // Stage into txn-local dirty map.
+        self.dirty.insert(page_id, page.clone());
+        // Also update shared page_cache so helper subsystems (e.g. FSM hint tree)
+        // that consult only page_cache can observe txn-local changes.
+        // NOTE: EmbeddedCompute currently assumes a single writer; if we later add
+        // concurrent txns, this must become txn-scoped.
+        self.compute.page_cache.insert(page_id, page);
     }
 
     fn get_page_for_read(&mut self, page_id: PageId) -> Option<Page> {
@@ -511,19 +517,21 @@ impl EmbeddedTxn {
         }
 
         // Load meta + FSM meta.
+        // IMPORTANT: within a txn, always prefer dirty pages over shared page_cache.
+        // Otherwise we may re-read stale meta/FSM and reallocate the same page ids.
         let meta_bytes = self
-            .compute
-            .page_cache
-            .get(META_PAGE_ID)
-            .or_else(|| self.dirty.get(&META_PAGE_ID).cloned())
+            .dirty
+            .get(&META_PAGE_ID)
+            .cloned()
+            .or_else(|| self.compute.page_cache.get(META_PAGE_ID))
             .ok_or(Error::InMemoryPageMissing(META_PAGE_ID))?;
         let mut meta = MetaPage::decode(&meta_bytes)?;
 
         let fsm_meta_bytes = self
-            .compute
-            .page_cache
-            .get(crate::fsm_pg::FSM_META_PAGE_ID)
-            .or_else(|| self.dirty.get(&crate::fsm_pg::FSM_META_PAGE_ID).cloned())
+            .dirty
+            .get(&crate::fsm_pg::FSM_META_PAGE_ID)
+            .cloned()
+            .or_else(|| self.compute.page_cache.get(crate::fsm_pg::FSM_META_PAGE_ID))
             .ok_or(Error::InMemoryPageMissing(crate::fsm_pg::FSM_META_PAGE_ID))?;
         let fsm_meta = crate::fsm_pg::FsmMeta::decode(&fsm_meta_bytes)?;
 
@@ -545,6 +553,32 @@ impl EmbeddedTxn {
             if let Some(mut page) = self.get_page_for_read(page_id) {
                 match slotted_page::insert_record(&mut page, key, value) {
                     Ok(slot_id) => {
+                        // Debug assert: the inserted slot must contain this key.
+                        if cfg!(debug_assertions) {
+                            if let Some(slot_key) = slotted_page::read_key(&page, slot_id) {
+                                if slot_key.as_slice() != key {
+                                    let slot_info = slotted_page::debug_slot(&page, slot_id)
+                                        .map(|(pos, len)| format!("pos={pos} len={len}"))
+                                        .unwrap_or_else(|| "<none>".to_string());
+                                    panic!(
+                                        "[data-assert] insert_record key mismatch: page_id={} slot_id={} {} key_hex={} slot_key_hex={}",
+                                        page_id,
+                                        slot_id,
+                                        slot_info,
+                                        hex::encode(key),
+                                        hex::encode(slot_key)
+                                    );
+                                }
+                            } else {
+                                panic!(
+                                    "[data-assert] insert_record slot missing: page_id={} slot_id={} key_hex={}",
+                                    page_id,
+                                    slot_id,
+                                    hex::encode(key)
+                                );
+                            }
+                        }
+
                         self.write_page(page_id, page.clone());
                         // New record: remember to stamp commit_lsn.
                         self.modified
@@ -603,6 +637,32 @@ impl EmbeddedTxn {
 
         let mut page = slotted_page::new_page();
         let slot_id = slotted_page::insert_record(&mut page, key, value)?;
+
+        if cfg!(debug_assertions) {
+            if let Some(slot_key) = slotted_page::read_key(&page, slot_id) {
+                if slot_key.as_slice() != key {
+                    let slot_info = slotted_page::debug_slot(&page, slot_id)
+                        .map(|(pos, len)| format!("pos={pos} len={len}"))
+                        .unwrap_or_else(|| "<none>".to_string());
+                    panic!(
+                        "[data-assert] new_page insert key mismatch: page_id={} slot_id={} {} key_hex={} slot_key_hex={}",
+                        page_id,
+                        slot_id,
+                        slot_info,
+                        hex::encode(key),
+                        hex::encode(slot_key)
+                    );
+                }
+            } else {
+                panic!(
+                    "[data-assert] new_page insert slot missing: page_id={} slot_id={} key_hex={}",
+                    page_id,
+                    slot_id,
+                    hex::encode(key)
+                );
+            }
+        }
+
         self.modified
             .push((page_id, slot_id, key.try_into().unwrap()));
         self.write_page(page_id, page.clone());

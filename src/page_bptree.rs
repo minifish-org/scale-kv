@@ -300,6 +300,10 @@ impl<P: PageProvider> PageBPlusTree<P> {
             None => (false, 0),
         };
         let encoded = encode_slot_ref(slot_ref);
+        #[cfg(debug_assertions)]
+        let key_for_assert = key.clone();
+        #[cfg(debug_assertions)]
+        let encoded_for_assert = encoded.clone();
 
         if found {
             let offset = entry_offset_at(&leaf, pos)
@@ -307,6 +311,11 @@ impl<P: PageProvider> PageBPlusTree<P> {
             let value_offset = offset + KEY_SIZE;
             leaf[value_offset..value_offset + SLOT_REF_SIZE].copy_from_slice(&encoded);
             self.provider.write_page(leaf_id, leaf);
+
+            // Debug assert: the leaf entry value must match what we wrote.
+            if cfg!(debug_assertions) {
+                self.debug_assert_leaf_value(&key_for_assert, &encoded_for_assert);
+            }
             return Ok(());
         }
 
@@ -316,6 +325,10 @@ impl<P: PageProvider> PageBPlusTree<P> {
             let rebuilt = rebuild_page_with_insert(&leaf, header, pos, &key, &encoded)?;
             self.provider.write_page(leaf_id, rebuilt);
             self.len += 1;
+
+            if cfg!(debug_assertions) {
+                self.debug_assert_leaf_value(&key_for_assert, &encoded_for_assert);
+            }
             return Ok(());
         }
 
@@ -355,7 +368,13 @@ impl<P: PageProvider> PageBPlusTree<P> {
         self.provider.write_page(leaf_id, left_page);
         self.provider.write_page(right_id, right_page);
         self.len += 1;
-        self.insert_into_parent(leaf_id, right_id, separator, stack)
+        let r = self.insert_into_parent(leaf_id, right_id, separator, stack);
+
+        if cfg!(debug_assertions) {
+            self.debug_assert_leaf_value(&key_for_assert, &encoded_for_assert);
+        }
+
+        r
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Result<()> {
@@ -500,6 +519,134 @@ impl<P: PageProvider> PageBPlusTree<P> {
             out.push((k.to_vec(), v.to_vec()));
         }
         out
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_leaf_value(&self, key: &[u8], expected_value: &[u8]) {
+        let expected = decode_slot_ref(expected_value);
+
+        // 1) tree.get(key) must match expected
+        match self.get(key) {
+            Some(actual) => {
+                if actual.page_id != expected.page_id || actual.slot_id != expected.slot_id {
+                    let entries = self.debug_leaf_entries(key, 32);
+                    let entries_hex: Vec<(String, String)> = entries
+                        .into_iter()
+                        .map(|(k, v)| (hex::encode(k), hex::encode(v)))
+                        .collect();
+                    panic!(
+                        "[btree-assert] get() mismatch: key_hex={} expected=({}, {}) actual=({}, {}) leaf_entries_hex={:?}",
+                        hex::encode(key),
+                        expected.page_id,
+                        expected.slot_id,
+                        actual.page_id,
+                        actual.slot_id,
+                        entries_hex
+                    );
+                }
+            }
+            None => {
+                let entries = self.debug_leaf_entries(key, 32);
+                let entries_hex: Vec<(String, String)> = entries
+                    .into_iter()
+                    .map(|(k, v)| (hex::encode(k), hex::encode(v)))
+                    .collect();
+                panic!(
+                    "[btree-assert] missing after insert: key_hex={} expected=({}, {}) leaf_entries_hex={:?}",
+                    hex::encode(key),
+                    expected.page_id,
+                    expected.slot_id,
+                    entries_hex
+                );
+            }
+        }
+
+        // 2) leaf page entry bytes must match expected_value
+        let (leaf_id, _) = self.find_leaf(key);
+        let Some(page) = self.provider.read_page(leaf_id) else {
+            panic!(
+                "[btree-assert] leaf missing: key_hex={} leaf_id={}",
+                hex::encode(key),
+                leaf_id
+            );
+        };
+        let Some((found, pos)) = find_key_pos(&page, key) else {
+            panic!(
+                "[btree-assert] find_key_pos failed: key_hex={} leaf_id={}",
+                hex::encode(key),
+                leaf_id
+            );
+        };
+        if !found {
+            let entries = self.debug_leaf_entries(key, 32);
+            let entries_hex: Vec<(String, String)> = entries
+                .into_iter()
+                .map(|(k, v)| (hex::encode(k), hex::encode(v)))
+                .collect();
+            panic!(
+                "[btree-assert] key not found in leaf: key_hex={} leaf_id={} pos={} leaf_entries_hex={:?}",
+                hex::encode(key),
+                leaf_id,
+                pos,
+                entries_hex
+            );
+        }
+        let Some(actual_value) = entry_value_at(&page, pos) else {
+            panic!(
+                "[btree-assert] entry_value_at failed: key_hex={} leaf_id={} pos={}",
+                hex::encode(key),
+                leaf_id,
+                pos
+            );
+        };
+        if actual_value != expected_value {
+            let entries = self.debug_leaf_entries(key, 32);
+            let entries_hex: Vec<(String, String)> = entries
+                .into_iter()
+                .map(|(k, v)| (hex::encode(k), hex::encode(v)))
+                .collect();
+            panic!(
+                "[btree-assert] leaf value mismatch: key_hex={} leaf_id={} pos={} expected_value_hex={} actual_value_hex={} leaf_entries_hex={:?}",
+                hex::encode(key),
+                leaf_id,
+                pos,
+                hex::encode(expected_value),
+                hex::encode(actual_value),
+                entries_hex
+            );
+        }
+
+        // 3) symptom check: leaf with >1 key but all values identical
+        if page_header(&page).page_type == PAGE_TYPE_LEAF {
+            let entries = collect_entries(&page);
+            if entries.len() > 1 {
+                let mut first: Option<Vec<u8>> = None;
+                let mut all_same = true;
+                for (_k, v) in &entries {
+                    if let Some(f) = &first {
+                        if v != f {
+                            all_same = false;
+                            break;
+                        }
+                    } else {
+                        first = Some(v.clone());
+                    }
+                }
+                if all_same {
+                    let entries_hex: Vec<(String, String)> = entries
+                        .into_iter()
+                        .map(|(k, v)| (hex::encode(k), hex::encode(v)))
+                        .collect();
+                    panic!(
+                        "[btree-assert] leaf has all-same values: leaf_id={} key_count={} value_hex={} entries_hex={:?}",
+                        leaf_id,
+                        page_header(&page).key_count,
+                        first.as_ref().map(|v| hex::encode(v)).unwrap_or_default(),
+                        entries_hex
+                    );
+                }
+            }
+        }
     }
 
     pub fn range_visit(&self, start: &[u8], end: &[u8], mut f: impl FnMut(&[u8], SlotRef) -> bool) {
