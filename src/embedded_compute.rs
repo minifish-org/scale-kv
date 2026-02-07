@@ -267,6 +267,7 @@ impl EmbeddedCompute {
             next_bptree_page_id: BPTREE_ROOT_ID + 1,
             next_data_page_id: DATA_BASE,
             next_undo_page_id: UNDO_BASE,
+            undo_free: Vec::new(),
         };
         tx.write_page(META_PAGE_ID, meta.encode());
 
@@ -443,7 +444,66 @@ impl EmbeddedCompute {
 
         // Commit as a normal txn so GC is logged and durable.
         tx.commit().await?;
+
+        // Best-effort undo-page sweep: build a live set from data pages and free unreachable undo pages.
+        // This is O(total_pages) and should be used sparingly (manual only).
+        let _ = self.gc_sweep_undo(gc_lsn).await;
+
         Ok(pages_scanned)
+    }
+
+    async fn gc_sweep_undo(&self, gc_lsn: u64) -> Result<()> {
+        use std::collections::HashSet;
+
+        let meta_bytes = if let Some(p) = self.page_cache.get(META_PAGE_ID) {
+            p
+        } else {
+            self.get_page(META_PAGE_ID, gc_lsn)
+                .await
+                .ok_or(Error::InMemoryPageMissing(META_PAGE_ID))?
+        };
+        let mut meta = MetaPage::decode(&meta_bytes)?;
+
+        const DATA_BASE: PageId = 1_000_000;
+        const UNDO_BASE: PageId = 2_000_000;
+
+        // 1) Collect all live undo pages reachable from data-page head pointers.
+        let mut live_undo: HashSet<PageId> = HashSet::new();
+
+        for page_id in DATA_BASE..meta.next_data_page_id {
+            let Some(page) = self.get_page(page_id, gc_lsn).await else {
+                continue;
+            };
+            let slots = slotted_page::slot_count(&page);
+            for slot_id in 0..slots {
+                let Some(key) = slotted_page::read_key(&page, slot_id) else {
+                    continue;
+                };
+                let mut ptr = slotted_page::read_undo_ptr(&page, slot_id, &key);
+                while let Some(p) = ptr {
+                    if !live_undo.insert(p.page_id) {
+                        // already visited this page id, but still need to progress the chain
+                    }
+                    // read undo record to follow prev
+                    let upage = self.get_page(p.page_id, gc_lsn).await;
+                    let Some(upage) = upage else { break; };
+                    let rec = undo_pg::read_record(&upage, p.slot_id)?;
+                    ptr = rec.prev;
+                }
+            }
+        }
+
+        // 2) Free unreachable undo pages.
+        // Note: we only add to freelist; actual reuse happens in append_undo.
+        for pid in UNDO_BASE..meta.next_undo_page_id {
+            if !live_undo.contains(&pid) {
+                meta.push_free_undo(pid);
+            }
+        }
+
+        // Persist meta update.
+        let _ = self.write_page(META_PAGE_ID, meta.encode()).await?;
+        Ok(())
     }
 
     async fn commit_pages_reserved(
@@ -561,8 +621,12 @@ impl EmbeddedTxn {
             meta.next_undo_page_id = 2_000_000;
         }
         if current_id.is_none() {
-            current_id = Some(meta.next_undo_page_id);
-            meta.next_undo_page_id += 1;
+            if let Some(free) = meta.pop_free_undo() {
+                current_id = Some(free);
+            } else {
+                current_id = Some(meta.next_undo_page_id);
+                meta.next_undo_page_id += 1;
+            }
         }
 
         let mut old_value_arr = [0u8; VALUE_SIZE];
@@ -583,8 +647,11 @@ impl EmbeddedTxn {
                 let pid = current_id.unwrap();
                 self.write_page(pid, page);
 
-                let new_pid = meta.next_undo_page_id;
-                meta.next_undo_page_id += 1;
+                let new_pid = meta.pop_free_undo().unwrap_or_else(|| {
+                    let pid = meta.next_undo_page_id;
+                    meta.next_undo_page_id += 1;
+                    pid
+                });
                 let mut new_page = undo_pg::new_undo_page();
                 let s = undo_pg::append_record(&mut new_page, &rec)?;
                 current_id = Some(new_pid);
@@ -1038,6 +1105,7 @@ impl EmbeddedTxn {
                 next_bptree_page_id: self.compute.provider.next_page_id(),
                 next_data_page_id: 1_000_000,
                 next_undo_page_id: 2_000_000,
+                undo_free: Vec::new(),
             }
             .encode()
         };
@@ -1047,6 +1115,7 @@ impl EmbeddedTxn {
             next_bptree_page_id: self.compute.provider.next_page_id(),
             next_data_page_id: old_meta.next_data_page_id,
             next_undo_page_id: old_meta.next_undo_page_id,
+            undo_free: old_meta.undo_free.clone(),
         };
         drop(tree);
         self.write_page(META_PAGE_ID, meta.encode());
