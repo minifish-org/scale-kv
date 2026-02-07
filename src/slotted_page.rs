@@ -83,6 +83,44 @@ pub fn clear_slot(page: &mut [u8], slot_id: u16) {
     write_slot(page, slot_id, 0, 0);
 }
 
+/// Defragment payload area by packing all live payloads at the end of the page.
+/// Slot ids are preserved; only slot offsets change.
+pub fn defragment(page: &mut [u8]) -> Result<()> {
+    if page.len() != PAGE_SIZE {
+        return Err(Error::InvalidPageSize(page.len(), PAGE_SIZE));
+    }
+    let (slots, free_start, _free_end) = read_header(page);
+
+    // Collect live slots with their payload bytes.
+    let mut live: Vec<(u16, Vec<u8>)> = Vec::new();
+    for slot_id in 0..slots {
+        let (pos, len) = read_slot(page, slot_id);
+        if len == 0 {
+            continue;
+        }
+        let pos = pos as usize;
+        let len = len as usize;
+        if pos + len > PAGE_SIZE {
+            return Err(Error::InvalidPageSize(pos + len, PAGE_SIZE));
+        }
+        live.push((slot_id, page[pos..pos + len].to_vec()));
+    }
+
+    // Pack from the end.
+    let mut free_end = PAGE_SIZE as u16;
+    for (slot_id, payload) in live {
+        let len = payload.len() as u16;
+        let new_pos = free_end - len;
+        let np = new_pos as usize;
+        page[np..np + payload.len()].copy_from_slice(&payload);
+        write_slot(page, slot_id, new_pos, len);
+        free_end = new_pos;
+    }
+
+    write_header(page, slots, free_start, free_end);
+    Ok(())
+}
+
 pub fn read_key(page: &[u8], slot_id: u16) -> Option<Vec<u8>> {
     if page.len() != PAGE_SIZE {
         return None;

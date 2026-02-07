@@ -403,6 +403,8 @@ impl EmbeddedCompute {
             }
 
             if changed {
+                // Reclaim payload space (slot ids stay stable).
+                let _ = slotted_page::defragment(&mut page);
                 tx.write_page(page_id, page);
             }
         }
