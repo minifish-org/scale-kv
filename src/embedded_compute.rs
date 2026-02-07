@@ -361,6 +361,12 @@ impl EmbeddedCompute {
 
         let mut tx = self.begin();
 
+        // Load FSM meta (best-effort). If missing, we can still GC but won't update FSM hints.
+        let fsm_meta = match tx.get_page_for_read(crate::fsm_pg::FSM_META_PAGE_ID).await {
+            Some(p) => crate::fsm_pg::FsmMeta::decode(&p).ok(),
+            None => None,
+        };
+
         let mut pages_scanned = 0usize;
         for page_id in DATA_BASE..end {
             if pages_scanned >= budget_pages {
@@ -405,6 +411,32 @@ impl EmbeddedCompute {
             if changed {
                 // Reclaim payload space (slot ids stay stable).
                 let _ = slotted_page::defragment(&mut page);
+
+                // Update FSM hint based on new free space.
+                if let Some(fsm_meta) = fsm_meta {
+                    if page_id >= fsm_meta.data_base {
+                        let leaf_idx = page_id - fsm_meta.data_base;
+                        if leaf_idx < fsm_meta.leaf_count {
+                            let free = slotted_page::page_free_space(&page);
+                            let class = crate::fsm_pg::class_from_free_bytes(free);
+
+                            // Read helper prefers txn dirty pages.
+                            let get_page = |pid: PageId| {
+                                tx.dirty
+                                    .get(&pid)
+                                    .cloned()
+                                    .or_else(|| tx.compute.page_cache.get(pid))
+                            };
+
+                            if let Ok(writes) = crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, class) {
+                                for (pid, p) in writes {
+                                    tx.write_page(pid, p);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 tx.write_page(page_id, page);
             }
         }
