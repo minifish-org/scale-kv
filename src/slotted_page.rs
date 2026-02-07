@@ -68,6 +68,14 @@ pub fn page_free_space(page: &[u8]) -> usize {
     free_end.saturating_sub(free_start) as usize
 }
 
+pub fn slot_count(page: &[u8]) -> u16 {
+    if page.len() != PAGE_SIZE {
+        return 0;
+    }
+    let (slots, _free_start, _free_end) = read_header(page);
+    slots
+}
+
 pub fn clear_slot(page: &mut [u8], slot_id: u16) {
     if page.len() != PAGE_SIZE {
         return;

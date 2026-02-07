@@ -334,6 +334,84 @@ impl EmbeddedCompute {
         tx.commit().await
     }
 
+    /// Run one GC pass over data pages up to `budget_pages` pages.
+    ///
+    /// For now this performs a correctness-first physical delete:
+    /// - If a record is a tombstone and its commit_lsn <= gc_lsn, remove it from the B+Tree and
+    ///   clear its slot entry.
+    /// - Also clears the record's undo_ptr.
+    ///
+    /// NOTE: This does not compact payload space inside a slotted page yet; it only frees the slot
+    /// directory entry for reuse.
+    pub async fn gc_once(&self, budget_pages: usize) -> Result<usize> {
+        let gc_lsn = self.gc_lsn();
+
+        // Load meta to discover scan range.
+        let meta_bytes = if let Some(p) = self.page_cache.get(META_PAGE_ID) {
+            p
+        } else {
+            self.get_page(META_PAGE_ID, gc_lsn)
+                .await
+                .ok_or(Error::InMemoryPageMissing(META_PAGE_ID))?
+        };
+        let meta = MetaPage::decode(&meta_bytes)?;
+
+        const DATA_BASE: PageId = 1_000_000;
+        let end = meta.next_data_page_id;
+
+        let mut tx = self.begin();
+
+        let mut pages_scanned = 0usize;
+        for page_id in DATA_BASE..end {
+            if pages_scanned >= budget_pages {
+                break;
+            }
+            pages_scanned += 1;
+
+            let Some(mut page) = tx.get_page_for_read(page_id).await else {
+                continue;
+            };
+
+            let slots = slotted_page::slot_count(&page);
+            let mut changed = false;
+
+            for slot_id in 0..slots {
+                let Some(key) = slotted_page::read_key(&page, slot_id) else {
+                    continue;
+                };
+
+                let Some(commit_lsn) = slotted_page::read_commit_lsn(&page, slot_id, &key) else {
+                    continue;
+                };
+                let flags = slotted_page::read_flags(&page, slot_id, &key).unwrap_or(0);
+
+                // Only consider tombstones whose tombstone commit is visible to all active readers.
+                if (flags & 1) != 0 && commit_lsn <= gc_lsn {
+                    // Remove mapping and clear slot.
+                    {
+                        let mut tree = tx.compute.tree.lock().await;
+                        let _ = tree.remove(&key).await;
+                    }
+                    slotted_page::write_undo_ptr(&mut page, slot_id, None);
+                    slotted_page::clear_slot(&mut page, slot_id);
+                    changed = true;
+                } else if commit_lsn <= gc_lsn {
+                    // Visible to all: we can drop undo chain to cap history.
+                    slotted_page::write_undo_ptr(&mut page, slot_id, None);
+                    changed = true;
+                }
+            }
+
+            if changed {
+                tx.write_page(page_id, page);
+            }
+        }
+
+        // Commit as a normal txn so GC is logged and durable.
+        tx.commit().await?;
+        Ok(pages_scanned)
+    }
+
     async fn commit_pages_reserved(
         &self,
         request_id: u64,
