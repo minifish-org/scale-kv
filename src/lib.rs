@@ -8,7 +8,7 @@ pub use common::*;
 
 pub mod page_bptree;
 pub use page_bptree::{
-    DEFAULT_PAGE_CACHE_SHARDS, InMemoryPageProvider, PageBPlusTree, PageCache, PageProvider,
+    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, InMemoryPageProvider, PageBPlusTree, PageCache,
     SharedPageProvider, SlotRef as PageSlotRef,
 };
 

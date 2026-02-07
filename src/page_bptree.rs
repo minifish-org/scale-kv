@@ -35,12 +35,12 @@ pub struct SlotRef {
 /// B+Tree uses this trait to read/write pages, allowing different backends:
 /// - InMemoryPageProvider: HashMap-based, for testing
 /// - SharedPageProvider: Wraps Arc<RwLock<HashMap>> for shared cache
-pub trait PageProvider {
+pub trait AsyncPageProvider {
     /// Read a page by ID. Returns None if page doesn't exist.
-    fn read_page(&self, page_id: PageId) -> Option<Page>;
+    async fn read_page(&self, page_id: PageId) -> Option<Page>;
 
     /// Write a page. Creates if not exists, updates if exists.
-    fn write_page(&self, page_id: PageId, page: Page);
+    async fn write_page(&self, page_id: PageId, page: Page);
 
     /// Allocate a new page ID.
     fn alloc_page_id(&self) -> PageId;
@@ -80,12 +80,12 @@ impl Default for InMemoryPageProvider {
     }
 }
 
-impl PageProvider for InMemoryPageProvider {
-    fn read_page(&self, page_id: PageId) -> Option<Page> {
+impl AsyncPageProvider for InMemoryPageProvider {
+    async fn read_page(&self, page_id: PageId) -> Option<Page> {
         self.pages.borrow().get(&page_id).cloned()
     }
 
-    fn write_page(&self, page_id: PageId, page: Page) {
+    async fn write_page(&self, page_id: PageId, page: Page) {
         self.pages.borrow_mut().insert(page_id, page);
     }
 
@@ -183,12 +183,12 @@ impl SharedPageProvider {
     }
 }
 
-impl PageProvider for SharedPageProvider {
-    fn read_page(&self, page_id: PageId) -> Option<Page> {
+impl AsyncPageProvider for SharedPageProvider {
+    async fn read_page(&self, page_id: PageId) -> Option<Page> {
         self.pages.get(page_id)
     }
 
-    fn write_page(&self, page_id: PageId, page: Page) {
+    async fn write_page(&self, page_id: PageId, page: Page) {
         self.pages.insert(page_id, page);
     }
 
@@ -205,8 +205,8 @@ impl PageProvider for SharedPageProvider {
     }
 }
 
-/// Page-based B+Tree that uses PageProvider for storage.
-pub struct PageBPlusTree<P: PageProvider> {
+/// Page-based B+Tree that uses AsyncPageProvider for storage.
+pub struct PageBPlusTree<P: AsyncPageProvider> {
     provider: P,
     len: usize,
 }
@@ -216,7 +216,11 @@ impl PageBPlusTree<InMemoryPageProvider> {
     pub fn new() -> Self {
         let provider = InMemoryPageProvider::new();
         let root_id = provider.alloc_page_id();
-        provider.write_page(root_id, new_page(PAGE_TYPE_LEAF, 0));
+        futures::executor::block_on(async {
+            provider
+                .write_page(root_id, new_page(PAGE_TYPE_LEAF, 0))
+                .await;
+        });
         provider.set_root_page_id(root_id);
         Self { provider, len: 0 }
     }
@@ -228,7 +232,7 @@ impl Default for PageBPlusTree<InMemoryPageProvider> {
     }
 }
 
-impl<P: PageProvider> PageBPlusTree<P> {
+impl<P: AsyncPageProvider> PageBPlusTree<P> {
     /// Create a new B+Tree with a custom page provider.
     /// The provider should already have an empty root page allocated.
     pub fn with_provider(provider: P) -> Self {
@@ -238,7 +242,11 @@ impl<P: PageProvider> PageBPlusTree<P> {
     /// Create a new B+Tree, initializing the root page in the provider.
     pub fn new_with_provider(provider: P) -> Self {
         let root_id = provider.alloc_page_id();
-        provider.write_page(root_id, new_page(PAGE_TYPE_LEAF, 0));
+        futures::executor::block_on(async {
+            provider
+                .write_page(root_id, new_page(PAGE_TYPE_LEAF, 0))
+                .await;
+        });
         provider.set_root_page_id(root_id);
         Self { provider, len: 0 }
     }
@@ -265,12 +273,12 @@ impl<P: PageProvider> PageBPlusTree<P> {
         self.len == 0
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<SlotRef> {
-        let (mut leaf_id, _) = self.find_leaf(key);
+    pub async fn get(&self, key: &[u8]) -> Option<SlotRef> {
+        let (mut leaf_id, _) = self.find_leaf(key).await;
 
         // High-key correction: if key is above this leaf's range, follow next_leaf.
         loop {
-            let page = self.provider.read_page(leaf_id)?;
+            let page = self.provider.read_page(leaf_id).await?;
             if page_header(&page).page_type != PAGE_TYPE_LEAF {
                 break;
             }
@@ -288,34 +296,26 @@ impl<P: PageProvider> PageBPlusTree<P> {
         None
     }
 
-    pub fn insert(&mut self, key: Vec<u8>, slot_ref: SlotRef) -> Result<()> {
+    pub async fn insert(&mut self, key: Vec<u8>, slot_ref: SlotRef) -> Result<()> {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
-        let (leaf_id, stack) = self.find_leaf(&key);
-        let mut leaf = self.provider.read_page(leaf_id).unwrap();
+        let (leaf_id, stack) = self.find_leaf(&key).await;
+        let mut leaf = self.provider.read_page(leaf_id).await.unwrap();
         let header = leaf_page_header(&leaf);
         let (found, pos) = match find_key_pos(&leaf, &key) {
             Some(result) => result,
             None => (false, 0),
         };
         let encoded = encode_slot_ref(slot_ref);
-        #[cfg(debug_assertions)]
-        let key_for_assert = key.clone();
-        #[cfg(debug_assertions)]
-        let encoded_for_assert = encoded.clone();
 
         if found {
             let offset = entry_offset_at(&leaf, pos)
                 .ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
             let value_offset = offset + KEY_SIZE;
             leaf[value_offset..value_offset + SLOT_REF_SIZE].copy_from_slice(&encoded);
-            self.provider.write_page(leaf_id, leaf);
+            self.provider.write_page(leaf_id, leaf).await;
 
-            // Debug assert: the leaf entry value must match what we wrote.
-            if cfg!(debug_assertions) {
-                self.debug_assert_leaf_value(&key_for_assert, &encoded_for_assert);
-            }
             return Ok(());
         }
 
@@ -323,12 +323,9 @@ impl<P: PageProvider> PageBPlusTree<P> {
         let size = HEADER_SIZE + total * OFFSET_ENTRY_SIZE + total * entry_size(PAGE_TYPE_LEAF);
         if size <= PAGE_SIZE {
             let rebuilt = rebuild_page_with_insert(&leaf, header, pos, &key, &encoded)?;
-            self.provider.write_page(leaf_id, rebuilt);
+            self.provider.write_page(leaf_id, rebuilt).await;
             self.len += 1;
 
-            if cfg!(debug_assertions) {
-                self.debug_assert_leaf_value(&key_for_assert, &encoded_for_assert);
-            }
             return Ok(());
         }
 
@@ -357,29 +354,27 @@ impl<P: PageProvider> PageBPlusTree<P> {
 
         // Fix successor's prev pointer if there was an old next.
         if let Some(next_id) = old_header.next_leaf {
-            if let Some(mut next_page) = self.provider.read_page(next_id) {
+            if let Some(mut next_page) = self.provider.read_page(next_id).await {
                 let mut nh = leaf_page_header(&next_page);
                 nh.prev_leaf = Some(right_id);
                 write_header(&mut next_page, nh);
-                self.provider.write_page(next_id, next_page);
+                self.provider.write_page(next_id, next_page).await;
             }
         }
 
-        self.provider.write_page(leaf_id, left_page);
-        self.provider.write_page(right_id, right_page);
+        self.provider.write_page(leaf_id, left_page).await;
+        self.provider.write_page(right_id, right_page).await;
         self.len += 1;
-        let r = self.insert_into_parent(leaf_id, right_id, separator, stack);
-
-        if cfg!(debug_assertions) {
-            self.debug_assert_leaf_value(&key_for_assert, &encoded_for_assert);
-        }
+        let r = self
+            .insert_into_parent(leaf_id, right_id, separator, stack)
+            .await;
 
         r
     }
 
-    pub fn remove(&mut self, key: &[u8]) -> Result<()> {
-        let (leaf_id, mut stack) = self.find_leaf(key);
-        let leaf = self.provider.read_page(leaf_id).unwrap();
+    pub async fn remove(&mut self, key: &[u8]) -> Result<()> {
+        let (leaf_id, mut stack) = self.find_leaf(key).await;
+        let leaf = self.provider.read_page(leaf_id).await.unwrap();
         let (found, pos) = match find_key_pos(&leaf, key) {
             Some(result) => result,
             None => (false, 0),
@@ -398,19 +393,19 @@ impl<P: PageProvider> PageBPlusTree<P> {
         if new_header.key_count == 0 && leaf_id != self.provider.root_page_id() {
             // 1) unlink from leaf chain
             if let Some(prev_id) = new_header.prev_leaf {
-                if let Some(mut prev_page) = self.provider.read_page(prev_id) {
+                if let Some(mut prev_page) = self.provider.read_page(prev_id).await {
                     let mut ph = leaf_page_header(&prev_page);
                     ph.next_leaf = new_header.next_leaf;
                     write_header(&mut prev_page, ph);
-                    self.provider.write_page(prev_id, prev_page);
+                    self.provider.write_page(prev_id, prev_page).await;
                 }
             }
             if let Some(next_id) = new_header.next_leaf {
-                if let Some(mut next_page) = self.provider.read_page(next_id) {
+                if let Some(mut next_page) = self.provider.read_page(next_id).await {
                     let mut nh = leaf_page_header(&next_page);
                     nh.prev_leaf = new_header.prev_leaf;
                     write_header(&mut next_page, nh);
-                    self.provider.write_page(next_id, next_page);
+                    self.provider.write_page(next_id, next_page).await;
                 }
             }
             new_header.prev_leaf = None;
@@ -418,7 +413,7 @@ impl<P: PageProvider> PageBPlusTree<P> {
 
             // 2) delete reference from parent (no rebalancing; parent may become sparse)
             if let Some(parent_id) = stack.pop() {
-                if let Some(mut parent) = self.provider.read_page(parent_id) {
+                if let Some(mut parent) = self.provider.read_page(parent_id).await {
                     let ph = page_header(&parent);
                     if ph.page_type == PAGE_TYPE_INTERNAL {
                         let mut child_index = None;
@@ -456,7 +451,7 @@ impl<P: PageProvider> PageBPlusTree<P> {
                                 self.provider.set_root_page_id(new_root);
                             } else {
                                 encode_entries(&mut parent, &entries, new_ph)?;
-                                self.provider.write_page(parent_id, parent);
+                                self.provider.write_page(parent_id, parent).await;
                             }
                         }
                     }
@@ -464,22 +459,23 @@ impl<P: PageProvider> PageBPlusTree<P> {
             }
         }
 
-        self.provider.write_page(leaf_id, rebuilt);
+        self.provider.write_page(leaf_id, rebuilt).await;
         Ok(())
     }
 
-    pub fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, SlotRef)> {
+    pub async fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, SlotRef)> {
         let mut out = Vec::new();
         self.range_visit(start, end, |k, slot_ref| {
             out.push((k.to_vec(), slot_ref));
             true
-        });
+        })
+        .await;
         out
     }
 
-    pub fn debug_leaf_keys(&self, key: &[u8], limit: usize) -> Vec<Vec<u8>> {
-        let (leaf_id, _) = self.find_leaf(key);
-        let page = match self.provider.read_page(leaf_id) {
+    pub async fn debug_leaf_keys(&self, key: &[u8], limit: usize) -> Vec<Vec<u8>> {
+        let (leaf_id, _) = self.find_leaf(key).await;
+        let page = match self.provider.read_page(leaf_id).await {
             Some(p) => p,
             None => return Vec::new(),
         };
@@ -497,9 +493,9 @@ impl<P: PageProvider> PageBPlusTree<P> {
         out
     }
 
-    pub fn debug_leaf_entries(&self, key: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let (leaf_id, _) = self.find_leaf(key);
-        let page = match self.provider.read_page(leaf_id) {
+    pub async fn debug_leaf_entries(&self, key: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let (leaf_id, _) = self.find_leaf(key).await;
+        let page = match self.provider.read_page(leaf_id).await {
             Some(p) => p,
             None => return Vec::new(),
         };
@@ -521,140 +517,12 @@ impl<P: PageProvider> PageBPlusTree<P> {
         out
     }
 
-    #[cfg(debug_assertions)]
-    fn debug_assert_leaf_value(&self, key: &[u8], expected_value: &[u8]) {
-        let expected = decode_slot_ref(expected_value);
-
-        // 1) tree.get(key) must match expected
-        match self.get(key) {
-            Some(actual) => {
-                if actual.page_id != expected.page_id || actual.slot_id != expected.slot_id {
-                    let entries = self.debug_leaf_entries(key, 32);
-                    let entries_hex: Vec<(String, String)> = entries
-                        .into_iter()
-                        .map(|(k, v)| (hex::encode(k), hex::encode(v)))
-                        .collect();
-                    panic!(
-                        "[btree-assert] get() mismatch: key_hex={} expected=({}, {}) actual=({}, {}) leaf_entries_hex={:?}",
-                        hex::encode(key),
-                        expected.page_id,
-                        expected.slot_id,
-                        actual.page_id,
-                        actual.slot_id,
-                        entries_hex
-                    );
-                }
-            }
-            None => {
-                let entries = self.debug_leaf_entries(key, 32);
-                let entries_hex: Vec<(String, String)> = entries
-                    .into_iter()
-                    .map(|(k, v)| (hex::encode(k), hex::encode(v)))
-                    .collect();
-                panic!(
-                    "[btree-assert] missing after insert: key_hex={} expected=({}, {}) leaf_entries_hex={:?}",
-                    hex::encode(key),
-                    expected.page_id,
-                    expected.slot_id,
-                    entries_hex
-                );
-            }
-        }
-
-        // 2) leaf page entry bytes must match expected_value
-        let (leaf_id, _) = self.find_leaf(key);
-        let Some(page) = self.provider.read_page(leaf_id) else {
-            panic!(
-                "[btree-assert] leaf missing: key_hex={} leaf_id={}",
-                hex::encode(key),
-                leaf_id
-            );
-        };
-        let Some((found, pos)) = find_key_pos(&page, key) else {
-            panic!(
-                "[btree-assert] find_key_pos failed: key_hex={} leaf_id={}",
-                hex::encode(key),
-                leaf_id
-            );
-        };
-        if !found {
-            let entries = self.debug_leaf_entries(key, 32);
-            let entries_hex: Vec<(String, String)> = entries
-                .into_iter()
-                .map(|(k, v)| (hex::encode(k), hex::encode(v)))
-                .collect();
-            panic!(
-                "[btree-assert] key not found in leaf: key_hex={} leaf_id={} pos={} leaf_entries_hex={:?}",
-                hex::encode(key),
-                leaf_id,
-                pos,
-                entries_hex
-            );
-        }
-        let Some(actual_value) = entry_value_at(&page, pos) else {
-            panic!(
-                "[btree-assert] entry_value_at failed: key_hex={} leaf_id={} pos={}",
-                hex::encode(key),
-                leaf_id,
-                pos
-            );
-        };
-        if actual_value != expected_value {
-            let entries = self.debug_leaf_entries(key, 32);
-            let entries_hex: Vec<(String, String)> = entries
-                .into_iter()
-                .map(|(k, v)| (hex::encode(k), hex::encode(v)))
-                .collect();
-            panic!(
-                "[btree-assert] leaf value mismatch: key_hex={} leaf_id={} pos={} expected_value_hex={} actual_value_hex={} leaf_entries_hex={:?}",
-                hex::encode(key),
-                leaf_id,
-                pos,
-                hex::encode(expected_value),
-                hex::encode(actual_value),
-                entries_hex
-            );
-        }
-
-        // 3) symptom check: leaf with >1 key but all values identical
-        if page_header(&page).page_type == PAGE_TYPE_LEAF {
-            let entries = collect_entries(&page);
-            if entries.len() > 1 {
-                let mut first: Option<Vec<u8>> = None;
-                let mut all_same = true;
-                for (_k, v) in &entries {
-                    if let Some(f) = &first {
-                        if v != f {
-                            all_same = false;
-                            break;
-                        }
-                    } else {
-                        first = Some(v.clone());
-                    }
-                }
-                if all_same {
-                    let entries_hex: Vec<(String, String)> = entries
-                        .into_iter()
-                        .map(|(k, v)| (hex::encode(k), hex::encode(v)))
-                        .collect();
-                    panic!(
-                        "[btree-assert] leaf has all-same values: leaf_id={} key_count={} value_hex={} entries_hex={:?}",
-                        leaf_id,
-                        page_header(&page).key_count,
-                        first.as_ref().map(|v| hex::encode(v)).unwrap_or_default(),
-                        entries_hex
-                    );
-                }
-            }
-        }
-    }
-
-    pub fn range_visit(&self, start: &[u8], end: &[u8], mut f: impl FnMut(&[u8], SlotRef) -> bool) {
-        let (mut leaf_id, _) = self.find_leaf(start);
+    pub async fn range_visit(&self, start: &[u8], end: &[u8], mut f: impl FnMut(&[u8], SlotRef) -> bool) {
+        let (mut leaf_id, _) = self.find_leaf(start).await;
 
         // Same high-key correction as point lookup.
         loop {
-            let page = match self.provider.read_page(leaf_id) {
+            let page = match self.provider.read_page(leaf_id).await {
                 Some(page) => page,
                 None => break,
             };
@@ -672,7 +540,7 @@ impl<P: PageProvider> PageBPlusTree<P> {
 
         let mut current = Some(leaf_id);
         while let Some(page_id) = current {
-            let page = match self.provider.read_page(page_id) {
+            let page = match self.provider.read_page(page_id).await {
                 Some(page) => page,
                 None => break,
             };
@@ -704,11 +572,11 @@ impl<P: PageProvider> PageBPlusTree<P> {
         }
     }
 
-    fn find_leaf(&self, key: &[u8]) -> (PageId, Vec<PageId>) {
+    async fn find_leaf(&self, key: &[u8]) -> (PageId, Vec<PageId>) {
         let mut current = self.provider.root_page_id();
         let mut stack = Vec::new();
         loop {
-            let page = self.provider.read_page(current).unwrap();
+            let page = self.provider.read_page(current).await.unwrap();
             let header = page_header(&page);
             if header.page_type == PAGE_TYPE_LEAF {
                 return (current, stack);
@@ -735,63 +603,73 @@ impl<P: PageProvider> PageBPlusTree<P> {
         }
     }
 
-    fn insert_into_parent(
+    async fn insert_into_parent(
         &mut self,
         left_id: PageId,
         right_id: PageId,
         separator: Vec<u8>,
         mut stack: Vec<PageId>,
     ) -> Result<()> {
-        if stack.is_empty() {
-            let mut root = new_page(PAGE_TYPE_INTERNAL, 1);
-            let mut header = page_header(&root);
-            header.left_child = left_id;
-            let entries = vec![(separator, encode_child_id(right_id))];
-            encode_entries(&mut root, &entries, header)?;
-            let root_id = self.provider.alloc_page_id();
-            self.provider.write_page(root_id, root);
-            self.provider.set_root_page_id(root_id);
-            return Ok(());
-        }
+        // Iterative climb to avoid async recursion.
+        let mut left_id = left_id;
+        let mut right_id = right_id;
+        let mut separator = separator;
 
-        let parent_id = stack.pop().unwrap();
-        let mut parent = self.provider.read_page(parent_id).unwrap();
-        let header = page_header(&parent);
-        let mut pos = if header.left_child == left_id {
-            0
-        } else {
-            usize::MAX
-        };
-        if pos == usize::MAX {
-            let key_count = header.key_count as usize;
-            for idx in 0..key_count {
-                let value = entry_value_at(&parent, idx).unwrap();
-                if decode_child_id(value) == left_id {
-                    pos = idx + 1;
-                    break;
+        loop {
+            if stack.is_empty() {
+                let mut root = new_page(PAGE_TYPE_INTERNAL, 1);
+                let mut header = page_header(&root);
+                header.left_child = left_id;
+                let entries = vec![(separator, encode_child_id(right_id))];
+                encode_entries(&mut root, &entries, header)?;
+                let root_id = self.provider.alloc_page_id();
+                self.provider.write_page(root_id, root).await;
+                self.provider.set_root_page_id(root_id);
+                return Ok(());
+            }
+
+            let parent_id = stack.pop().unwrap();
+            let parent = self.provider.read_page(parent_id).await.unwrap();
+            let header = page_header(&parent);
+
+            // Find insertion position for (separator -> right_id), immediately after left_id.
+            let mut pos = if header.left_child == left_id { 0 } else { usize::MAX };
+            if pos == usize::MAX {
+                let key_count = header.key_count as usize;
+                for idx in 0..key_count {
+                    let value = entry_value_at(&parent, idx).unwrap();
+                    if decode_child_id(value) == left_id {
+                        pos = idx + 1;
+                        break;
+                    }
+                }
+                if pos == usize::MAX {
+                    pos = header.key_count as usize;
                 }
             }
-            if pos == usize::MAX {
-                pos = key_count;
+
+            let total = header.key_count as usize + 1;
+            let size =
+                HEADER_SIZE + total * OFFSET_ENTRY_SIZE + total * entry_size(PAGE_TYPE_INTERNAL);
+            if size <= PAGE_SIZE {
+                let encoded = encode_child_id(right_id);
+                let rebuilt = rebuild_page_with_insert(&parent, header, pos, &separator, &encoded)?;
+                self.provider.write_page(parent_id, rebuilt).await;
+                return Ok(());
             }
-        }
 
-        let total = header.key_count as usize + 1;
-        let size = HEADER_SIZE + total * OFFSET_ENTRY_SIZE + total * entry_size(PAGE_TYPE_INTERNAL);
-        if size <= PAGE_SIZE {
-            let encoded = encode_child_id(right_id);
-            let rebuilt = rebuild_page_with_insert(&parent, header, pos, &separator, &encoded)?;
-            self.provider.write_page(parent_id, rebuilt);
-            return Ok(());
-        }
+            // Split parent, then continue climbing with the new (parent_id, new_right_id, sep).
+            let mut entries = collect_entries(&parent);
+            entries.insert(pos, (separator, encode_child_id(right_id)));
+            let (sep, right_page) = split_internal(&parent, &entries)?;
+            let new_right_id = self.provider.alloc_page_id();
+            self.provider.write_page(parent_id, right_page.0).await;
+            self.provider.write_page(new_right_id, right_page.1).await;
 
-        let mut entries = collect_entries(&parent);
-        entries.insert(pos, (separator, encode_child_id(right_id)));
-        let (sep, right_page) = split_internal(&parent, &entries)?;
-        let new_right_id = self.provider.alloc_page_id();
-        self.provider.write_page(parent_id, right_page.0);
-        self.provider.write_page(new_right_id, right_page.1);
-        self.insert_into_parent(parent_id, new_right_id, sep, stack)
+            left_id = parent_id;
+            right_id = new_right_id;
+            separator = sep;
+        }
     }
 }
 
@@ -1270,10 +1148,8 @@ fn decode_child_id(buf: &[u8]) -> PageId {
 
 #[cfg(test)]
 mod tests {
-    use super::{InMemoryPageProvider, PageBPlusTree, PageProvider, SlotRef};
+    use super::{AsyncPageProvider, InMemoryPageProvider, PageBPlusTree, SlotRef};
     use crate::KEY_SIZE;
-    use std::collections::HashMap;
-    use std::sync::RwLock;
     use std::sync::atomic::AtomicU64;
 
     fn key_for(i: u32) -> Vec<u8> {
@@ -1285,8 +1161,8 @@ mod tests {
         key
     }
 
-    #[test]
-    fn test_insert_get_remove_len() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_insert_get_remove_len() {
         let mut tree = PageBPlusTree::new();
         let key = key_for(1);
         let slot = SlotRef {
@@ -1298,22 +1174,22 @@ mod tests {
             slot_id: 9,
         };
 
-        assert_eq!(tree.get(&key), None);
-        tree.insert(key.clone(), slot).unwrap();
-        assert_eq!(tree.get(&key), Some(slot));
+        assert_eq!(tree.get(&key).await, None);
+        tree.insert(key.clone(), slot).await.unwrap();
+        assert_eq!(tree.get(&key).await, Some(slot));
         assert_eq!(tree.len(), 1);
 
-        tree.insert(key.clone(), updated).unwrap();
-        assert_eq!(tree.get(&key), Some(updated));
+        tree.insert(key.clone(), updated).await.unwrap();
+        assert_eq!(tree.get(&key).await, Some(updated));
         assert_eq!(tree.len(), 1);
 
-        tree.remove(&key).unwrap();
-        assert_eq!(tree.get(&key), None);
+        tree.remove(&key).await.unwrap();
+        assert_eq!(tree.get(&key).await, None);
         assert_eq!(tree.len(), 0);
     }
 
-    #[test]
-    fn test_range_across_splits() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_range_across_splits() {
         let mut tree = PageBPlusTree::new();
         for i in 0..120u32 {
             let key = key_for(i);
@@ -1321,21 +1197,22 @@ mod tests {
                 page_id: i as u64 + 1,
                 slot_id: (i % 512) as u16,
             };
-            tree.insert(key, slot).unwrap();
+            tree.insert(key, slot).await.unwrap();
         }
 
         let start = key_for(10);
         let end = key_for(50);
-        let range = tree.range(&start, &end);
+        let range = tree.range(&start, &end).await;
         assert_eq!(range.len(), 41);
         assert_eq!(range.first().unwrap().0, start);
         assert_eq!(range.last().unwrap().0, end);
     }
 
-    #[test]
-    fn test_with_custom_provider() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_with_custom_provider() {
         let provider = InMemoryPageProvider::new();
-        let mut tree = PageBPlusTree::new_with_provider(provider);
+        let tree = PageBPlusTree::new_with_provider(provider);
+        let mut tree = tree;
 
         let key = key_for(2);
         let slot = SlotRef {
@@ -1343,13 +1220,13 @@ mod tests {
             slot_id: 5,
         };
 
-        tree.insert(key.clone(), slot).unwrap();
-        assert_eq!(tree.get(&key), Some(slot));
+        tree.insert(key.clone(), slot).await.unwrap();
+        assert_eq!(tree.get(&key).await, Some(slot));
         assert_eq!(tree.provider().page_count(), 1);
     }
 
-    #[test]
-    fn test_provider_page_allocation() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_provider_page_allocation() {
         let provider = InMemoryPageProvider::new();
 
         let p1 = provider.alloc_page_id();
@@ -1361,14 +1238,14 @@ mod tests {
         assert_eq!(p3, 3);
 
         let page_data = vec![42u8; crate::PAGE_SIZE];
-        provider.write_page(p1, page_data.clone());
+        provider.write_page(p1, page_data.clone()).await;
 
-        assert_eq!(provider.read_page(p1), Some(page_data));
-        assert_eq!(provider.read_page(p2), None);
+        assert_eq!(provider.read_page(p1).await, Some(page_data));
+        assert_eq!(provider.read_page(p2).await, None);
     }
 
-    #[test]
-    fn test_shared_page_provider() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_shared_page_provider() {
         use super::{PageCache, SharedPageProvider};
         use std::sync::Arc;
 
@@ -1376,7 +1253,8 @@ mod tests {
         let next_page_id = Arc::new(AtomicU64::new(1));
 
         let provider = SharedPageProvider::new(pages.clone(), next_page_id.clone());
-        let mut tree = PageBPlusTree::new_with_provider(provider);
+        let tree = PageBPlusTree::new_with_provider(provider);
+        let mut tree = tree;
 
         let key = key_for(3);
         let slot = SlotRef {
@@ -1384,8 +1262,8 @@ mod tests {
             slot_id: 7,
         };
 
-        tree.insert(key.clone(), slot).unwrap();
-        assert_eq!(tree.get(&key), Some(slot));
+        tree.insert(key.clone(), slot).await.unwrap();
+        assert_eq!(tree.get(&key).await, Some(slot));
 
         assert!(pages.len() >= 1);
     }

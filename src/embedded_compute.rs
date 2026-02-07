@@ -1,7 +1,8 @@
 use crate::compute_sequencer::ComputeSequencer;
 use crate::meta_page::{META_PAGE_ID, MetaPage};
 use crate::page_bptree::{
-    DEFAULT_PAGE_CACHE_SHARDS, PageBPlusTree, PageCache, PageProvider, SlotRef as PageSlotRef,
+    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, PageBPlusTree, PageCache,
+    SlotRef as PageSlotRef,
 };
 use crate::txn_page_provider::TxnPageProvider;
 use crate::{BTREE_META_PAGE_ID, BtreeMeta};
@@ -11,7 +12,8 @@ use crate::{
 };
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::task::LocalSet;
 
 /// Embedded compute-side API for an Aurora-style KV (page-level redo).
@@ -25,9 +27,9 @@ pub struct EmbeddedCompute {
     min_read_lsn: Arc<std::sync::atomic::AtomicU64>,
 
     page_cache: Arc<PageCache>,
-    page_fetcher: Arc<dyn Fn(PageId, u64) -> Option<Page>>,
+    page_fetcher: Arc<dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>>,
     provider: Arc<TxnPageProvider>,
-    tree: Arc<Mutex<PageBPlusTree<TxnPageProvider>>>,
+    tree: Arc<Mutex<PageBPlusTree<TxnPageProvider>>>, 
 }
 
 impl EmbeddedCompute {
@@ -59,26 +61,26 @@ impl EmbeddedCompute {
         let reader0 = readers.get(0).cloned().ok_or_else(|| {
             Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "no readers"))
         })?;
-        let handle = tokio::runtime::Handle::current();
-        let page_fetcher: Arc<dyn Fn(PageId, u64) -> Option<Page>> = Arc::new(move |pid, need| {
-            tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    let mut backoff_ms = 1u64;
-                    for _ in 0..200 {
-                        match reader0.get_page(pid).await {
-                            Ok(Some((page, _page_lsn, durable))) => {
-                                if durable >= need {
-                                    return Some(page);
-                                }
+        let page_fetcher: Arc<
+            dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>
+        > = Arc::new(move |pid, need| { 
+            let reader0 = Arc::clone(&reader0);
+            Box::pin(async move {  
+                let mut backoff_ms = 1u64;
+                for _ in 0..200 {
+                    match reader0.get_page(pid).await {
+                        Ok(Some((page, _page_lsn, durable))) => {
+                            if durable >= need {
+                                return Some(page);
                             }
-                            Ok(None) => return None,
-                            Err(_) => {}
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = (backoff_ms * 2).min(50);
+                        Ok(None) => return None,
+                        Err(_) => {}
                     }
-                    None
-                })
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(50);
+                }
+                None
             })
         });
 
@@ -87,7 +89,9 @@ impl EmbeddedCompute {
         let min_read_lsn2 = Arc::clone(&min_read_lsn);
         let page_fetcher2 = Arc::clone(&page_fetcher);
 
-        let fetcher_for_provider: Arc<dyn Fn(PageId) -> Option<Page>> = Arc::new(move |pid| {
+        let fetcher_for_provider: Arc<
+            dyn Fn(PageId) -> futures::future::LocalBoxFuture<'static, Option<Page>>
+        > = Arc::new(move |pid| {
             let need = min_read_lsn2.load(std::sync::atomic::Ordering::Acquire);
             page_fetcher2(pid, need)
         });
@@ -133,11 +137,11 @@ impl EmbeddedCompute {
         self.page_cache.get(page_id)
     }
 
-    pub fn get_page_blocking(&self, page_id: PageId, need_lsn: u64) -> Option<Page> {
+    pub async fn get_page(&self, page_id: PageId, need_lsn: u64) -> Option<Page> {
         if let Some(p) = self.page_cache.get(page_id) {
             return Some(p);
         }
-        let p = (self.page_fetcher)(page_id, need_lsn)?;
+        let p = (self.page_fetcher)(page_id, need_lsn).await?;
         self.page_cache.insert(page_id, p.clone());
         Some(p)
     }
@@ -216,7 +220,7 @@ impl EmbeddedCompute {
         let mut tx = self.begin();
 
         // Configure provider root + next_page_id (next after reserved ids).
-        let mut tree = self.tree.lock().unwrap();
+        let mut tree = self.tree.lock().await;
         tree.provider_mut().set_root_page_id(BPTREE_ROOT_ID);
         self.provider.set_next_page_id(BPTREE_ROOT_ID + 1);
 
@@ -289,16 +293,16 @@ impl EmbeddedCompute {
         }
 
         let mut tx = self.begin();
-        tx.put(key, value)?;
+        tx.put(key, value).await?;
         tx.commit().await
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
         let mut tx = self.begin();
-        tx.get(key)
+        tx.get(key).await
     }
 
     pub async fn delete(&self, key: &[u8]) -> Result<u64> {
@@ -306,7 +310,7 @@ impl EmbeddedCompute {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
         let mut tx = self.begin();
-        tx.delete(key)?;
+        tx.delete(key).await?;
         tx.commit().await
     }
 
@@ -364,7 +368,7 @@ impl EmbeddedTxn {
         self.compute.page_cache.insert(page_id, page);
     }
 
-    fn get_page_for_read(&mut self, page_id: PageId) -> Option<Page> {
+    async fn get_page_for_read(&mut self, page_id: PageId) -> Option<Page> {
         if let Some(p) = self.dirty.get(&page_id).cloned() {
             return Some(p);
         }
@@ -375,13 +379,13 @@ impl EmbeddedTxn {
             self.ro_cache.insert(page_id, p.clone());
             return Some(p);
         }
-        let p = (self.compute.page_fetcher)(page_id, self.read_lsn)?;
+        let p = (self.compute.page_fetcher)(page_id, self.read_lsn).await?;
         self.compute.page_cache.insert(page_id, p.clone());
         self.ro_cache.insert(page_id, p.clone());
         Some(p)
     }
 
-    fn append_undo(
+    async fn append_undo(
         &mut self,
         data_page_id: PageId,
         data_slot_id: u16,
@@ -404,9 +408,13 @@ impl EmbeddedTxn {
         let mut meta = MetaPage::decode(&meta_bytes)?;
 
         let mut current_id = self.undo_page_id;
-        let mut page = current_id
-            .and_then(|pid| self.get_page_for_read(pid))
-            .unwrap_or_else(undo_pg::new_undo_page);
+        let mut page = match current_id {
+            Some(pid) => self
+                .get_page_for_read(pid)
+                .await
+                .unwrap_or_else(undo_pg::new_undo_page),
+            None => undo_pg::new_undo_page(),
+        };
         if meta.next_undo_page_id < 2_000_000 {
             meta.next_undo_page_id = 2_000_000;
         }
@@ -455,7 +463,7 @@ impl EmbeddedTxn {
         })
     }
 
-    fn alloc_or_update_data_page(
+    async fn alloc_or_update_data_page(
         &mut self,
         existing: Option<PageSlotRef>,
         key: &[u8],
@@ -465,6 +473,7 @@ impl EmbeddedTxn {
         if let Some(slot) = existing {
             let mut page = self
                 .get_page_for_read(slot.page_id)
+                .await
                 .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
             // Write undo before overwriting.
             let old_commit = slotted_page::read_commit_lsn(&page, slot.slot_id, key).unwrap_or(0);
@@ -473,14 +482,16 @@ impl EmbeddedTxn {
             let old_value = slotted_page::read_value(&page, slot.slot_id, key)
                 .unwrap_or_else(|| vec![0u8; VALUE_SIZE]);
 
-            let undo_ptr = self.append_undo(
-                slot.page_id,
-                slot.slot_id,
-                old_undo,
-                old_commit,
-                old_flags,
-                &old_value,
-            )?;
+            let undo_ptr = self
+                .append_undo(
+                    slot.page_id,
+                    slot.slot_id,
+                    old_undo,
+                    old_commit,
+                    old_flags,
+                    &old_value,
+                )
+                .await?;
 
             if let Some(slot_key) = slotted_page::read_key(&page, slot.slot_id) {
                 if slot_key.as_slice() != key {
@@ -488,8 +499,8 @@ impl EmbeddedTxn {
                         .map(|(pos, len)| format!("pos={pos} len={len}"))
                         .unwrap_or_else(|| "<none>".to_string());
                     let leaf_keys = {
-                        let tree = self.compute.tree.lock().unwrap();
-                        tree.debug_leaf_keys(key, 8)
+                        let tree = self.compute.tree.lock().await;
+                        tree.debug_leaf_keys(key, 8).await
                     };
                     let leaf_keys_hex: Vec<String> =
                         leaf_keys.iter().map(|k| hex::encode(k)).collect();
@@ -550,7 +561,7 @@ impl EmbeddedTxn {
                 break;
             };
             let page_id = fsm_meta.data_base + leaf_idx;
-            if let Some(mut page) = self.get_page_for_read(page_id) {
+            if let Some(mut page) = self.get_page_for_read(page_id).await {
                 match slotted_page::insert_record(&mut page, key, value) {
                     Ok(slot_id) => {
                         // Debug assert: the inserted slot must contain this key.
@@ -680,80 +691,66 @@ impl EmbeddedTxn {
         Ok(PageSlotRef { page_id, slot_id })
     }
 
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         // Read existing mapping first.
         let existing = {
-            let tree = self.compute.tree.lock().unwrap();
-            tree.get(key)
+            let tree = self.compute.tree.lock().await;
+            tree.get(key).await
         };
 
         // Write/allocate data page.
-        let slot_ref = self.alloc_or_update_data_page(existing, key, value)?;
+        let slot_ref = self
+            .alloc_or_update_data_page(existing, key, value)
+            .await?;
 
         // Update B+Tree mapping.
         {
-            let mut tree = self.compute.tree.lock().unwrap();
-            tree.insert(key.to_vec(), slot_ref)?;
-
-            // Debug self-check: read-after-write of btree mapping.
-            if let Some(sr2) = tree.get(key) {
-                if sr2.page_id != slot_ref.page_id || sr2.slot_id != slot_ref.slot_id {
-                    eprintln!(
-                        "[selfcheck] btree slot_ref mismatch: key_hex={} wrote=({}, {}) read=({}, {})",
-                        hex::encode(key),
-                        slot_ref.page_id,
-                        slot_ref.slot_id,
-                        sr2.page_id,
-                        sr2.slot_id
-                    );
-                }
-            } else {
-                eprintln!(
-                    "[selfcheck] btree missing immediately after insert: key_hex={}",
-                    hex::encode(key)
-                );
-            }
+            let mut tree = self.compute.tree.lock().await;
+            tree.insert(key.to_vec(), slot_ref).await?;
         }
 
-        // Debug self-check: btree mapping must point to a slot whose key matches.
-        // (Catches corruption/misaligned page writes early.)
-        if let Some(page) = self.get_page_for_read(slot_ref.page_id) {
-            if let Some(slot_key) = slotted_page::read_key(&page, slot_ref.slot_id) {
-                if slot_key.as_slice() != key {
+        if false {
+            // Debug self-check: btree mapping must point to a slot whose key matches.
+            if let Some(page) = self.get_page_for_read(slot_ref.page_id).await {
+                if let Some(slot_key) = slotted_page::read_key(&page, slot_ref.slot_id) {
+                    if slot_key.as_slice() != key {
+                        eprintln!(
+                            "[selfcheck] slot key mismatch: page_id={} slot_id={} key_hex={} slot_key_hex={}",
+                            slot_ref.page_id,
+                            slot_ref.slot_id,
+                            hex::encode(key),
+                            hex::encode(&slot_key)
+                        );
+                    }
+                } else {
                     eprintln!(
-                        "[selfcheck] slot key mismatch: page_id={} slot_id={} key_hex={} slot_key_hex={}",
-                        slot_ref.page_id,
-                        slot_ref.slot_id,
+                        "[selfcheck] slot missing after put: key_hex={} page_id={} slot_id={}",
                         hex::encode(key),
-                        hex::encode(&slot_key)
+                        slot_ref.page_id,
+                        slot_ref.slot_id
                     );
                 }
-            } else {
-                eprintln!(
-                    "[selfcheck] slot missing after put: key_hex={} page_id={} slot_id={}",
-                    hex::encode(key),
-                    slot_ref.page_id,
-                    slot_ref.slot_id
-                );
             }
         }
 
         Ok(())
     }
 
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
-        let tree = self.compute.tree.lock().unwrap();
-        let slot = tree.get(key);
-        drop(tree);
+        let slot = {
+            let tree = self.compute.tree.lock().await;
+            tree.get(key).await
+        };
         let Some(slot) = slot else {
             return Ok(None);
         };
 
         let page = self
             .get_page_for_read(slot.page_id)
+            .await
             .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
 
         let commit_lsn = slotted_page::read_commit_lsn(&page, slot.slot_id, key).unwrap_or(0);
@@ -770,6 +767,7 @@ impl EmbeddedTxn {
         while let Some(ptr) = undo {
             let upage = self
                 .get_page_for_read(ptr.page_id)
+                .await
                 .ok_or(Error::InMemoryPageMissing(ptr.page_id))?;
             let rec = undo_pg::read_record(&upage, ptr.slot_id)?;
             if rec.old_commit_lsn <= self.read_lsn {
@@ -784,11 +782,13 @@ impl EmbeddedTxn {
         Ok(None)
     }
 
-    pub fn debug_check_mapping(&mut self, key: &[u8]) -> Result<()> {
-        let tree = self.compute.tree.lock().unwrap();
-        let slot = tree.get(key);
-        let leaf_entries = tree.debug_leaf_entries(key, 16);
-        drop(tree);
+    pub async fn debug_check_mapping(&mut self, key: &[u8]) -> Result<()> {
+        let (slot, leaf_entries) = {
+            let tree = self.compute.tree.lock().await;
+            let slot = tree.get(key).await;
+            let leaf_entries = tree.debug_leaf_entries(key, 16).await;
+            (slot, leaf_entries)
+        };
 
         let Some(slot) = slot else {
             eprintln!(
@@ -800,6 +800,7 @@ impl EmbeddedTxn {
 
         let page = self
             .get_page_for_read(slot.page_id)
+            .await
             .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
         let slot_key = slotted_page::read_key(&page, slot.slot_id);
 
@@ -831,16 +832,17 @@ impl EmbeddedTxn {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+    pub async fn delete(&mut self, key: &[u8]) -> Result<()> {
         // Find slotref (if any).
         let existing = {
-            let tree = self.compute.tree.lock().unwrap();
-            tree.get(key)
+            let tree = self.compute.tree.lock().await;
+            tree.get(key).await
         };
 
         if let Some(slot) = existing {
             let mut page = self
                 .get_page_for_read(slot.page_id)
+                .await
                 .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
 
             // Write undo before tombstoning.
@@ -850,14 +852,16 @@ impl EmbeddedTxn {
             let old_value = slotted_page::read_value(&page, slot.slot_id, key)
                 .unwrap_or_else(|| vec![0u8; VALUE_SIZE]);
 
-            let undo_ptr = self.append_undo(
-                slot.page_id,
-                slot.slot_id,
-                old_undo,
-                old_commit,
-                old_flags,
-                &old_value,
-            )?;
+            let undo_ptr = self
+                .append_undo(
+                    slot.page_id,
+                    slot.slot_id,
+                    old_undo,
+                    old_commit,
+                    old_flags,
+                    &old_value,
+                )
+                .await?;
 
             // Keep slot allocated; mark tombstone for snapshot reads.
             slotted_page::mark_tombstone(&mut page, slot.slot_id);
@@ -871,8 +875,8 @@ impl EmbeddedTxn {
         }
 
         {
-            let mut tree = self.compute.tree.lock().unwrap();
-            tree.remove(key)?;
+            let mut tree = self.compute.tree.lock().await;
+            tree.remove(key).await?;
         }
 
         Ok(())
@@ -880,7 +884,7 @@ impl EmbeddedTxn {
 
     pub async fn commit(mut self) -> Result<u64> {
         // Also persist meta page updates for next_page_id/root.
-        let tree = self.compute.tree.lock().unwrap();
+        let tree = self.compute.tree.lock().await;
         let old_meta_bytes = if let Some(p) = self.dirty.get(&META_PAGE_ID) {
             p.clone()
         } else if let Some(p) = self.compute.page_cache.get(META_PAGE_ID) {

@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
                 while n < 256 && (i as usize) < records {
                     let k = key_for(i);
                     let v = val_for(i);
-                    tx.put(&k, &v).unwrap();
+                    tx.put(&k, &v).await.unwrap();
                     n += 1;
                     i += 1;
                 }
@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut tx = compute.begin();
                 for j in 0..(records as u64).min(10_000) {
                     let k = key_for(j);
-                    tx.debug_check_mapping(&k).unwrap();
+                    tx.debug_check_mapping(&k).await.unwrap();
                 }
             }
 
@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
             for _ in 0..ops {
                 let id = (rng.next_u32() as u64) % (records as u64);
                 let k = key_for(id);
-                if compute.get(&k).unwrap().is_some() {
+                if compute.get(&k).await.unwrap().is_some() {
                     get_ok += 1;
                 }
             }
@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
                     let id = (rng.next_u32() as u64) % (records as u64);
                     let k = key_for(id);
                     let v = val_for(seq);
-                    tx.put(&k, &v).unwrap();
+                    tx.put(&k, &v).await.unwrap();
                     n += 1;
                     done += 1;
                     seq += 1;

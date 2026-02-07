@@ -1,5 +1,6 @@
-use crate::page_bptree::{PageCache, PageProvider};
+use crate::page_bptree::{AsyncPageProvider, PageCache};
 use crate::{Page, PageId};
+use futures::future::LocalBoxFuture;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,7 +14,7 @@ pub struct TxnPageProvider {
     next_page_id: Arc<AtomicU64>,
     root: Arc<AtomicU64>,
     btree_meta_page_id: PageId,
-    fetcher: Arc<dyn Fn(PageId) -> Option<Page>>,
+    fetcher: Arc<dyn Fn(PageId) -> LocalBoxFuture<'static, Option<Page>>>,
 
     dirty: Arc<Mutex<BTreeMap<PageId, Page>>>,
 }
@@ -23,7 +24,7 @@ impl TxnPageProvider {
         pages: Arc<PageCache>,
         next_page_id: Arc<AtomicU64>,
         btree_meta_page_id: PageId,
-        fetcher: Arc<dyn Fn(PageId) -> Option<Page>>,
+        fetcher: Arc<dyn Fn(PageId) -> LocalBoxFuture<'static, Option<Page>>>,
     ) -> Self {
         Self {
             pages,
@@ -55,8 +56,8 @@ impl TxnPageProvider {
     }
 }
 
-impl PageProvider for TxnPageProvider {
-    fn read_page(&self, page_id: PageId) -> Option<Page> {
+impl AsyncPageProvider for TxnPageProvider {
+    async fn read_page(&self, page_id: PageId) -> Option<Page> {
         // Prefer in-txn dirty version.
         if let Some(p) = self.dirty.lock().unwrap().get(&page_id).cloned() {
             return Some(p);
@@ -65,12 +66,12 @@ impl PageProvider for TxnPageProvider {
             return Some(p);
         }
         // Demand paging on miss.
-        let p = (self.fetcher)(page_id)?;
+        let p = (self.fetcher)(page_id).await?;
         self.pages.insert(page_id, p.clone());
         Some(p)
     }
 
-    fn write_page(&self, page_id: PageId, page: Page) {
+    async fn write_page(&self, page_id: PageId, page: Page) {
         self.pages.insert(page_id, page.clone());
         self.record_dirty(page_id, &page);
     }
