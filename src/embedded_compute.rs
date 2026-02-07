@@ -5,6 +5,7 @@ use crate::page_bptree::{
     SlotRef as PageSlotRef,
 };
 use crate::txn_page_provider::TxnPageProvider;
+use crate::{ActiveReads, ReadGuard};
 use crate::{BTREE_META_PAGE_ID, BtreeMeta};
 use crate::{
     Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, StorageClient, VALUE_SIZE, slotted_page,
@@ -25,6 +26,7 @@ pub struct EmbeddedCompute {
     readers: Arc<Vec<Arc<StorageClient>>>,
 
     min_read_lsn: Arc<std::sync::atomic::AtomicU64>,
+    active_reads: Arc<ActiveReads>,
 
     page_cache: Arc<PageCache>,
     page_fetcher: Arc<dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>>,
@@ -110,6 +112,7 @@ impl EmbeddedCompute {
             sequencer,
             readers: Arc::new(readers),
             min_read_lsn,
+            active_reads: Arc::new(ActiveReads::new()),
             page_cache,
             page_fetcher,
             provider,
@@ -123,6 +126,20 @@ impl EmbeddedCompute {
 
     pub fn begin_ro(&self) -> u64 {
         self.sequencer.begin_ro()
+    }
+
+    /// Begin a read snapshot and keep it active (for GC watermarking) until the guard is dropped.
+    pub fn begin_ro_guard(&self) -> (u64, ReadGuard) {
+        let read_lsn = self.begin_ro();
+        let guard = self.active_reads.register(read_lsn);
+        (read_lsn, guard)
+    }
+
+    /// Safe GC watermark: minimum active read_lsn if any, otherwise durable_lsn.
+    pub fn gc_lsn(&self) -> u64 {
+        self.active_reads
+            .min_read_lsn()
+            .unwrap_or_else(|| self.durable_lsn())
     }
 
     pub fn durable_lsn(&self) -> u64 {
@@ -266,9 +283,12 @@ impl EmbeddedCompute {
         self.min_read_lsn
             .fetch_max(read_lsn, std::sync::atomic::Ordering::AcqRel);
 
+        let read_guard = Some(self.active_reads.register(read_lsn));
+
         EmbeddedTxn {
             compute: self.clone(),
             read_lsn,
+            read_guard,
             dirty: BTreeMap::new(),
             ro_cache: BTreeMap::new(),
             modified: Vec::new(),
@@ -349,12 +369,22 @@ impl EmbeddedCompute {
 pub struct EmbeddedTxn {
     compute: EmbeddedCompute,
     read_lsn: u64,
+    // Keeps this txn's snapshot active for GC watermarking.
+    read_guard: Option<ReadGuard>,
+
     dirty: BTreeMap<PageId, Page>,
     ro_cache: BTreeMap<PageId, Page>,
     modified: Vec<(PageId, u16, [u8; KEY_SIZE])>,
 
     // undo page writer (single page buffered)
     undo_page_id: Option<PageId>,
+}
+
+impl Drop for EmbeddedTxn {
+    fn drop(&mut self) {
+        // Ensure we never leak active read snapshots if a txn is dropped early.
+        let _ = self.read_guard.take();
+    }
 }
 
 impl EmbeddedTxn {
@@ -915,7 +945,7 @@ impl EmbeddedTxn {
         }
 
         // Reserve LSN range first so we can stamp commit_lsn into modified records.
-        let pages_vec: Vec<(PageId, Page)> = self.dirty.into_iter().collect();
+        let pages_vec: Vec<(PageId, Page)> = std::mem::take(&mut self.dirty).into_iter().collect();
 
         // Dedup count is computed inside commit_pages; here we pessimistically reserve on raw count.
         // This is OK (may waste a few LSNs) and keeps logic simple.
@@ -936,8 +966,14 @@ impl EmbeddedTxn {
 
         let pages: Vec<(PageId, Page)> = map.into_iter().collect();
         // Commit with reserved range.
-        self.compute
+        let out = self
+            .compute
             .commit_pages_reserved(request_id, start_lsn, end_lsn, pages)
-            .await
+            .await;
+
+        // Mark snapshot inactive before returning.
+        let _ = self.read_guard.take();
+
+        out
     }
 }

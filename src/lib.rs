@@ -12,6 +12,9 @@ pub use page_bptree::{
     SharedPageProvider, SlotRef as PageSlotRef,
 };
 
+pub mod active_reads;
+pub use active_reads::{ActiveReads, ReadGuard};
+
 pub mod page_store;
 pub use page_store::{BufferPoolConfig, BufferStats, CheckpointConfig, PageStore};
 
