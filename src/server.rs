@@ -1,6 +1,6 @@
 // (no legacy WAL/TXN op constants needed for page-level redo)
 use crate::storage_capnp::storage;
-use crate::{Result, StorageNode};
+use crate::{Result, StorageMaintenanceConfig, StorageNode};
 use capnp::capability::Promise;
 use capnp_rpc::RpcSystem;
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -133,6 +133,7 @@ impl storage::Server for StorageService {
             Ok(())
         })
     }
+
 }
 
 impl StorageServer {
@@ -164,9 +165,17 @@ impl StorageServer {
     }
 
     pub async fn start_with_dir(addr: SocketAddr, dir: PathBuf) -> Result<Self> {
+        Self::start_with_dir_and_maintenance(addr, dir, StorageMaintenanceConfig::default()).await
+    }
+
+    pub async fn start_with_dir_and_maintenance(
+        addr: SocketAddr,
+        dir: PathBuf,
+        maintenance: StorageMaintenanceConfig,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
-        let data = Arc::new(StorageNode::open(dir).await?);
+        let data = Arc::new(StorageNode::open_with_maintenance(dir, maintenance).await?);
 
         let data_clone = data.clone();
         tokio::task::spawn(async move {

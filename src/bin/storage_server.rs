@@ -16,12 +16,30 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use scale_kv::server::StorageServer;
+use scale_kv::StorageMaintenanceConfig;
 
 fn parse_arg(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|a| a == key)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+fn parse_u64(args: &[String], key: &str) -> Option<u64> {
+    parse_arg(args, key)?.parse::<u64>().ok()
+}
+
+fn parse_usize(args: &[String], key: &str) -> Option<usize> {
+    parse_arg(args, key)?.parse::<usize>().ok()
+}
+
+fn parse_bool(args: &[String], key: &str) -> Option<bool> {
+    let v = parse_arg(args, key)?;
+    match v.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 #[tokio::main]
@@ -40,7 +58,31 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let server = StorageServer::start_with_dir(addr, dir.clone()).await?;
+    let mut maintenance = StorageMaintenanceConfig::default();
+    if let Some(v) = parse_u64(&args, "--checkpoint-interval-secs") {
+        maintenance.checkpoint.interval = std::time::Duration::from_secs(v.max(1));
+    }
+    if let Some(v) = parse_usize(&args, "--checkpoint-max-dirty-pages") {
+        maintenance.checkpoint.max_dirty_pages = v.max(1);
+    }
+    if let Some(v) = parse_usize(&args, "--checkpoint-max-dirty-bytes") {
+        maintenance.checkpoint.max_dirty_bytes = v.max(1);
+    }
+    if let Some(v) = parse_bool(&args, "--wal-truncate") {
+        maintenance.truncate_wal = v;
+    }
+    if let Some(v) = parse_u64(&args, "--wal-max-bytes") {
+        maintenance.max_wal_bytes = v.max(1);
+    }
+    if let Some(v) = parse_usize(&args, "--wal-max-segments") {
+        maintenance.max_wal_segments = v.max(1);
+    }
+    if let Some(v) = parse_usize(&args, "--mvcc-gc-every-wal-batches") {
+        maintenance.mvcc_gc_every_wal_batches = v.max(1);
+    }
+
+    let server =
+        StorageServer::start_with_dir_and_maintenance(addr, dir.clone(), maintenance).await?;
     eprintln!(
         "storage_server listening on {} (dir={})",
         server.addr(),

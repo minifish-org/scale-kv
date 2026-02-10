@@ -13,7 +13,7 @@ pub use page_bptree::{
 };
 
 pub mod active_reads;
-pub use active_reads::{ActiveReads, ReadGuard};
+pub use active_reads::{ActiveReadInfo, ActiveReads, ReadGuard};
 
 pub mod page_store;
 pub use page_store::{BufferPoolConfig, BufferStats, CheckpointConfig, PageStore};
@@ -35,7 +35,7 @@ pub mod txn_page_provider;
 pub use txn_page_provider::TxnPageProvider;
 
 pub mod node;
-pub use node::StorageNode;
+pub use node::{MvccReadHandle, StorageMaintenanceConfig, StorageNode};
 
 pub mod client;
 pub use client::StorageClient;

@@ -14,6 +14,11 @@ pub struct ActiveReads {
     map: Mutex<BTreeMap<u64, u64>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveReadInfo {
+    pub id: u64,
+}
+
 impl ActiveReads {
     pub fn new() -> Self {
         Self {
@@ -35,6 +40,24 @@ impl ActiveReads {
         self.map.lock().unwrap().remove(&id);
     }
 
+    pub fn contains(&self, id: u64) -> bool {
+        self.map.lock().unwrap().contains_key(&id)
+    }
+
+    pub fn abort(&self, id: u64) -> bool {
+        self.map.lock().unwrap().remove(&id).is_some()
+    }
+
+    pub fn list(&self) -> Vec<ActiveReadInfo> {
+        self.map
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .map(|id| ActiveReadInfo { id })
+            .collect()
+    }
+
     pub fn min_read_lsn(&self) -> Option<u64> {
         self.map.lock().unwrap().values().copied().min()
     }
@@ -53,6 +76,10 @@ pub struct ReadGuard {
 impl ReadGuard {
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.inner.contains(self.id)
     }
 }
 
@@ -80,5 +107,19 @@ mod tests {
         drop(g3);
         assert_eq!(ar.min_read_lsn(), None);
         assert_eq!(ar.len(), 0);
+    }
+
+    #[test]
+    fn test_active_reads_abort_and_list() {
+        let ar = Arc::new(ActiveReads::new());
+        let g1 = ar.register(5);
+        let g2 = ar.register(8);
+        let listed = ar.list();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|r| r.id == g1.id()));
+        assert!(listed.iter().any(|r| r.id == g2.id()));
+        assert!(ar.abort(g1.id()));
+        assert!(!g1.is_active());
+        assert!(g2.is_active());
     }
 }

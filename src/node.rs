@@ -1,9 +1,10 @@
-use crate::page_store::PageStore;
-use crate::{KEY_SIZE, PAGE_SIZE, Page, PageId, Result, VALUE_SIZE, Value};
+use crate::page_store::{CheckpointConfig, PageStore};
+use crate::{ActiveReadInfo, ActiveReads, PAGE_SIZE, Page, PageId, ReadGuard, Result, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -17,6 +18,73 @@ const MAX_SEGMENT_SIZE: u64 = 8 * 1024;
 const MAX_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
 const WAL_STATE_FILE: &str = "wal_state";
 const WAL_STATE_TMP_FILE: &str = "wal_state.tmp";
+
+#[derive(Clone, Debug)]
+pub struct StorageMaintenanceConfig {
+    pub checkpoint: CheckpointConfig,
+    pub truncate_wal: bool,
+    pub max_wal_bytes: u64,
+    pub max_wal_segments: usize,
+    pub mvcc_gc_every_wal_batches: usize,
+}
+
+impl Default for StorageMaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            checkpoint: CheckpointConfig::default(),
+            truncate_wal: true,
+            max_wal_bytes: 512 * 1024 * 1024, // 512MB
+            max_wal_segments: 64,
+            mvcc_gc_every_wal_batches: 128,
+        }
+    }
+}
+
+impl StorageMaintenanceConfig {
+    pub fn from_env() -> Self {
+        let mut cfg = Self::default();
+
+        if let Some(v) = env_u64("SCALE_KV_CHECKPOINT_INTERVAL_SECS") {
+            cfg.checkpoint.interval = Duration::from_secs(v.max(1));
+        }
+        if let Some(v) = env_usize("SCALE_KV_CHECKPOINT_MAX_DIRTY_PAGES") {
+            cfg.checkpoint.max_dirty_pages = v.max(1);
+        }
+        if let Some(v) = env_usize("SCALE_KV_CHECKPOINT_MAX_DIRTY_BYTES") {
+            cfg.checkpoint.max_dirty_bytes = v.max(1);
+        }
+        if let Some(v) = env_bool("SCALE_KV_WAL_TRUNCATE") {
+            cfg.truncate_wal = v;
+        }
+        if let Some(v) = env_u64("SCALE_KV_WAL_MAX_BYTES") {
+            cfg.max_wal_bytes = v.max(1);
+        }
+        if let Some(v) = env_usize("SCALE_KV_WAL_MAX_SEGMENTS") {
+            cfg.max_wal_segments = v.max(1);
+        }
+        if let Some(v) = env_usize("SCALE_KV_MVCC_GC_EVERY_WAL_BATCHES") {
+            cfg.mvcc_gc_every_wal_batches = v.max(1);
+        }
+        cfg
+    }
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok()?.parse::<u64>().ok()
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok()?.parse::<usize>().ok()
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    let s = std::env::var(key).ok()?;
+    match s.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
 
 /// Storage node - PostgreSQL style page storage with WAL.
 pub struct StorageNode {
@@ -36,6 +104,39 @@ pub struct StorageNode {
     mvcc: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
     // requestId -> commitLsn (end_lsn) for idempotent retry
     request_index: Arc<std::sync::Mutex<HashMap<u64, u64>>>,
+    // Active read snapshots for MVCC GC watermark.
+    active_reads: Arc<ActiveReads>,
+    maintenance: StorageMaintenanceConfig,
+    wal_limit_guard: Mutex<()>,
+}
+
+#[derive(Debug)]
+pub struct MvccReadHandle {
+    read_lsn: u64,
+    started_at: Instant,
+    timeout: Option<Duration>,
+    guard: Option<ReadGuard>,
+}
+
+impl MvccReadHandle {
+    pub fn id(&self) -> Option<u64> {
+        self.guard.as_ref().map(|g| g.id())
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.guard.as_ref().is_some_and(|g| g.is_active())
+    }
+
+    pub fn close(&mut self) {
+        let _ = self.guard.take();
+    }
+
+    pub fn is_timed_out(&self) -> bool {
+        match self.timeout {
+            Some(t) => self.started_at.elapsed() > t,
+            None => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +348,31 @@ async fn list_wal_segments(dir: &Path) -> Result<Vec<u64>> {
     Ok(segments)
 }
 
+async fn wal_usage(dir: &Path) -> Result<(usize, u64)> {
+    let segments = list_wal_segments(dir).await?;
+    let mut bytes = 0u64;
+    for id in &segments {
+        let meta = fs::metadata(wal_segment_path(dir, *id)).await?;
+        bytes = bytes.saturating_add(meta.len());
+    }
+    Ok((segments.len(), bytes))
+}
+
+async fn wal_usage_exceeds_limits(
+    dir: &Path,
+    config: &StorageMaintenanceConfig,
+    incoming_bytes: u64,
+) -> Result<Option<(usize, u64)>> {
+    let (segments, bytes) = wal_usage(dir).await?;
+    let bytes_over = bytes.saturating_add(incoming_bytes) > config.max_wal_bytes;
+    let segments_over = segments > config.max_wal_segments;
+    if bytes_over || segments_over {
+        Ok(Some((segments, bytes)))
+    } else {
+        Ok(None)
+    }
+}
+
 async fn get_wal_segment_max_lsn(dir: &Path, file_id: u64) -> Result<u64> {
     let path = wal_segment_path(dir, file_id);
     let mut file = File::open(&path).await?;
@@ -343,6 +469,16 @@ fn encode_wal_batch(batch: &WalBatch, out: &mut Vec<u8>) -> Result<()> {
     out.extend_from_slice(&total_len.to_le_bytes());
     out.extend_from_slice(&buf);
     Ok(())
+}
+
+fn wal_batch_encoded_len(batch: &WalBatch) -> u64 {
+    // 4 bytes frame length + fixed header + per-record fixed fields + key/value payload.
+    let mut len = 4u64 + 8 + 8 + 8 + 4;
+    for r in &batch.records {
+        len += 8 + 1 + 8 + 2 + 4 + 4;
+        len += r.key.len() as u64 + r.value.len() as u64;
+    }
+    len
 }
 
 async fn start_wal_writer(
@@ -480,6 +616,53 @@ fn mvcc_get_at(
         .map(|v| v.value.clone())
 }
 
+fn gc_mvcc_versions(
+    store: &mut BTreeMap<Vec<u8>, Vec<MvccVersion>>,
+    watermark: u64,
+) -> (usize, usize) {
+    let mut keys_touched = 0usize;
+    let mut versions_removed = 0usize;
+
+    for versions in store.values_mut() {
+        if versions.len() <= 1 {
+            continue;
+        }
+        let mut last_visible: Option<usize> = None;
+        for (idx, version) in versions.iter().enumerate() {
+            if version.commit_lsn <= watermark {
+                last_visible = Some(idx);
+            } else {
+                break;
+            }
+        }
+
+        if let Some(idx) = last_visible {
+            if idx > 0 {
+                versions.drain(..idx);
+                keys_touched += 1;
+                versions_removed += idx;
+            }
+        }
+    }
+
+    (keys_touched, versions_removed)
+}
+
+async fn maybe_checkpoint_by_pressure(
+    page_store: &Arc<PageStore>,
+    maintenance: &StorageMaintenanceConfig,
+) -> Result<bool> {
+    let stats = page_store.buffer_stats();
+    let over_pages = stats.dirty_count > maintenance.checkpoint.max_dirty_pages;
+    let over_bytes = stats.dirty_bytes > maintenance.checkpoint.max_dirty_bytes;
+    if over_pages || over_bytes {
+        page_store.checkpoint().await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 fn read_u64_from(buf: &[u8], cursor: &mut usize) -> Result<u64> {
     if *cursor + 8 > buf.len() {
         return Err(Error::new(ErrorKind::UnexpectedEof, "wal batch truncated").into());
@@ -524,8 +707,12 @@ async fn wal_replay_loop(
     mut rx: Receiver<WalBatch>,
     mvcc: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
     request_index: Arc<std::sync::Mutex<HashMap<u64, u64>>>,
+    active_reads: Arc<ActiveReads>,
+    durable_lsn: Arc<std::sync::atomic::AtomicU64>,
+    maintenance: StorageMaintenanceConfig,
 ) {
     let mut buffers: HashMap<PageId, ReplayBuffer> = HashMap::new();
+    let mut gc_batch_counter = 0usize;
     while let Some(batch) = rx.recv().await {
         // Build requestId -> commitLsn mapping for idempotent retry.
         if batch.request_id != 0 {
@@ -562,6 +749,40 @@ async fn wal_replay_loop(
             if buffer.should_flush() {
                 let records = buffer.take();
                 let _ = replay_page_records(&replay, page_id, records).await;
+            }
+        }
+
+        let _ = maybe_checkpoint_by_pressure(&replay.page_store, &maintenance).await;
+        if maintenance.truncate_wal {
+            let checkpoint_lsn = replay.page_store.checkpoint_lsn();
+            let _ = truncate_wal_segments(&replay.dir, checkpoint_lsn).await;
+        }
+
+        if let Ok(Some((segments, bytes))) = wal_usage_exceeds_limits(&replay.dir, &maintenance, 0).await
+        {
+            eprintln!(
+                "[wal-limit-replay] over threshold after replay: segments={} bytes={} limits=(segments:{} bytes:{})",
+                segments,
+                bytes,
+                maintenance.max_wal_segments,
+                maintenance.max_wal_bytes
+            );
+        }
+
+        gc_batch_counter += 1;
+        if gc_batch_counter >= maintenance.mvcc_gc_every_wal_batches {
+            gc_batch_counter = 0;
+            let durable = durable_lsn.load(std::sync::atomic::Ordering::Acquire);
+            let watermark = active_reads.min_read_lsn().unwrap_or(durable).min(durable);
+            let (keys_touched, versions_removed) = {
+                let mut store = mvcc.lock().unwrap();
+                gc_mvcc_versions(&mut store, watermark)
+            };
+            if versions_removed > 0 {
+                eprintln!(
+                    "[mvcc-gc] watermark={} keys_touched={} versions_removed={}",
+                    watermark, keys_touched, versions_removed
+                );
             }
         }
     }
@@ -687,6 +908,17 @@ impl StorageNode {
     }
 
     pub async fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
+        Self::open_with_maintenance(dir, StorageMaintenanceConfig::default()).await
+    }
+
+    pub async fn open_with_env<P: AsRef<Path>>(dir: P) -> Result<Self> {
+        Self::open_with_maintenance(dir, StorageMaintenanceConfig::from_env()).await
+    }
+
+    pub async fn open_with_maintenance<P: AsRef<Path>>(
+        dir: P,
+        maintenance: StorageMaintenanceConfig,
+    ) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).await?;
 
@@ -702,6 +934,7 @@ impl StorageNode {
         let page_index = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let mvcc = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let request_index = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let active_reads = Arc::new(ActiveReads::new());
         replay_wal_segments_to_store(
             &dir,
             Arc::clone(&page_store),
@@ -739,6 +972,9 @@ impl StorageNode {
             applied_notify,
             mvcc,
             request_index,
+            active_reads,
+            maintenance: maintenance.clone(),
+            wal_limit_guard: Mutex::new(()),
         };
 
         node.start_wal_replay(last_applied_lsn).await;
@@ -747,6 +983,7 @@ impl StorageNode {
 
     pub async fn append_wal_batch(&self, batch: WalBatch) -> Result<()> {
         self.validate_incoming_wal_batch(&batch)?;
+        self.enforce_wal_limits(wal_batch_encoded_len(&batch)).await?;
         let sender = self.wal_sender.lock().await;
         match sender.as_ref() {
             Some(sender) => Ok(sender
@@ -764,6 +1001,116 @@ impl StorageNode {
 
     pub fn durable_lsn(&self) -> u64 {
         self.durable_lsn.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn begin_mvcc_ro_guard(&self) -> (u64, ReadGuard) {
+        let read_lsn = self.durable_lsn();
+        let guard = self.active_reads.register(read_lsn);
+        (read_lsn, guard)
+    }
+
+    pub fn begin_mvcc_ro(&self) -> MvccReadHandle {
+        self.begin_mvcc_ro_with_timeout(None)
+    }
+
+    pub fn begin_mvcc_ro_timeout(&self, timeout: Duration) -> MvccReadHandle {
+        self.begin_mvcc_ro_with_timeout(Some(timeout))
+    }
+
+    pub fn begin_mvcc_ro_with_timeout(&self, timeout: Option<Duration>) -> MvccReadHandle {
+        let (read_lsn, guard) = self.begin_mvcc_ro_guard();
+        MvccReadHandle {
+            read_lsn,
+            started_at: Instant::now(),
+            timeout,
+            guard: Some(guard),
+        }
+    }
+
+    pub fn with_mvcc_ro<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut MvccReadHandle) -> Result<T>,
+    {
+        self.with_mvcc_ro_timeout(None, f)
+    }
+
+    pub fn with_mvcc_ro_timeout<T, F>(&self, timeout: Option<Duration>, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut MvccReadHandle) -> Result<T>,
+    {
+        let mut handle = self.begin_mvcc_ro_with_timeout(timeout);
+        f(&mut handle)
+    }
+
+    pub fn list_active_reads(&self) -> Vec<ActiveReadInfo> {
+        self.active_reads.list()
+    }
+
+    pub fn abort_active_read(&self, id: u64) -> bool {
+        self.active_reads.abort(id)
+    }
+
+    pub fn mvcc_get(&self, handle: &mut MvccReadHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if handle.is_timed_out() {
+            handle.close();
+            return Err(crate::Error::TxnTimeout);
+        }
+        if !handle.is_active() {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::Interrupted,
+                "mvcc read handle aborted or closed",
+            )));
+        }
+        Ok(mvcc_get_at(&self.mvcc, key, handle.read_lsn).unwrap_or(None))
+    }
+
+    async fn wal_usage_exceeds(&self, incoming_bytes: u64) -> Result<Option<(usize, u64)>> {
+        wal_usage_exceeds_limits(&self.dir, &self.maintenance, incoming_bytes).await
+    }
+
+    async fn enforce_wal_limits(&self, incoming_bytes: u64) -> Result<()> {
+        if self
+            .wal_usage_exceeds(incoming_bytes)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+
+        let _guard = self.wal_limit_guard.lock().await;
+
+        let before = self.wal_usage_exceeds(incoming_bytes).await?;
+        if before.is_none() {
+            return Ok(());
+        }
+        let (before_segments, before_bytes) = before.unwrap();
+        eprintln!(
+            "[wal-limit] over threshold before write: segments={} bytes={} limits=(segments:{} bytes:{})",
+            before_segments,
+            before_bytes,
+            self.maintenance.max_wal_segments,
+            self.maintenance.max_wal_bytes
+        );
+
+        self.page_store.checkpoint().await?;
+        if self.maintenance.truncate_wal {
+            let _ = self.truncate_wal().await?;
+        }
+
+        if let Some((segments, bytes)) = self.wal_usage_exceeds(incoming_bytes).await? {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::WouldBlock,
+                format!(
+                    "wal backpressure: segments={} bytes={} limits=(segments:{} bytes:{})",
+                    segments,
+                    bytes,
+                    self.maintenance.max_wal_segments,
+                    self.maintenance.max_wal_bytes
+                ),
+            )));
+        }
+
+        Ok(())
     }
 
     fn validate_incoming_wal_batch(&self, batch: &WalBatch) -> Result<()> {
@@ -915,6 +1262,7 @@ impl StorageNode {
 
     pub async fn append_wal_batch_sync(&self, batch: WalBatch) -> Result<u64> {
         self.validate_incoming_wal_batch(&batch)?;
+        self.enforce_wal_limits(wal_batch_encoded_len(&batch)).await?;
         let sender = self.wal_sender.lock().await;
         let sender = sender.as_ref().ok_or_else(|| {
             crate::Error::Io(Error::new(
@@ -960,8 +1308,20 @@ impl StorageNode {
         );
         let mvcc = self.mvcc.clone();
         let req_index = self.request_index.clone();
+        let active_reads = Arc::clone(&self.active_reads);
+        let durable_lsn = Arc::clone(&self.durable_lsn);
+        let maintenance = self.maintenance.clone();
         tokio::spawn(async move {
-            wal_replay_loop(replay, rx, mvcc, req_index).await;
+            wal_replay_loop(
+                replay,
+                rx,
+                mvcc,
+                req_index,
+                active_reads,
+                durable_lsn,
+                maintenance,
+            )
+            .await;
         });
     }
 
@@ -1112,6 +1472,7 @@ async fn write_wal_state(dir: &Path, last_applied_lsn: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{KEY_SIZE, VALUE_SIZE};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1388,6 +1749,89 @@ mod tests {
         .unwrap_err();
         // slotted_page helper may return a generic key-mismatch error; just assert it is rejected.
         assert!(format!("{err}").contains("mismatch") || format!("{err}").contains("key"));
+    }
+
+    #[test]
+    fn test_mvcc_gc_keeps_last_visible_base_version() {
+        let mut store: BTreeMap<Vec<u8>, Vec<MvccVersion>> = BTreeMap::new();
+        store.insert(
+            b"k".to_vec(),
+            vec![
+                MvccVersion {
+                    commit_lsn: 10,
+                    value: Some(b"v1".to_vec()),
+                },
+                MvccVersion {
+                    commit_lsn: 20,
+                    value: Some(b"v2".to_vec()),
+                },
+                MvccVersion {
+                    commit_lsn: 30,
+                    value: None,
+                },
+            ],
+        );
+
+        let (_keys_touched, removed) = gc_mvcc_versions(&mut store, 20);
+        assert_eq!(removed, 1);
+        let versions = store.get(b"k".as_ref()).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].commit_lsn, 20);
+        assert_eq!(versions[1].commit_lsn, 30);
+    }
+
+    #[tokio::test]
+    async fn test_mvcc_read_handle_admin_abort() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
+
+        {
+            let mut mvcc = node.mvcc.lock().unwrap();
+            mvcc.insert(
+                b"k".to_vec(),
+                vec![MvccVersion {
+                    commit_lsn: node.durable_lsn(),
+                    value: Some(b"v".to_vec()),
+                }],
+            );
+        }
+
+        let mut handle = node.begin_mvcc_ro();
+        let id = handle.id().unwrap();
+        assert!(node.list_active_reads().iter().any(|r| r.id == id));
+        assert_eq!(node.mvcc_get(&mut handle, b"k").unwrap(), Some(b"v".to_vec()));
+
+        assert!(node.abort_active_read(id));
+        let err = node.mvcc_get(&mut handle, b"k").unwrap_err();
+        assert!(format!("{err}").contains("aborted"));
+
+        drop(handle);
+        cleanup_dir(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_mvcc_read_handle_timeout() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
+
+        {
+            let mut mvcc = node.mvcc.lock().unwrap();
+            mvcc.insert(
+                b"k".to_vec(),
+                vec![MvccVersion {
+                    commit_lsn: node.durable_lsn(),
+                    value: Some(b"v".to_vec()),
+                }],
+            );
+        }
+
+        let mut handle = node.begin_mvcc_ro_with_timeout(Some(Duration::from_millis(1)));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let err = node.mvcc_get(&mut handle, b"k").unwrap_err();
+        assert!(matches!(err, crate::Error::TxnTimeout));
+        assert!(!handle.is_active());
+
+        cleanup_dir(&dir).await;
     }
 
     #[tokio::test]

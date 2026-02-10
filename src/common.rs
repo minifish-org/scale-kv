@@ -22,6 +22,8 @@ pub enum Error {
     InvalidKeySize(usize, usize),
     #[error("in-memory page missing for page_id {0}")]
     InMemoryPageMissing(u64),
+    #[error("transaction timed out")]
+    TxnTimeout,
 }
 
 impl From<capnp::Error> for Error {

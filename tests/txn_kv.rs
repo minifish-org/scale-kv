@@ -23,16 +23,16 @@ fn test_snapshot_reads() {
     let path = dir.path().join("wal.log");
     let manager = TxnManager::open(&path).unwrap();
 
-    let mut tx1 = manager.begin_rw();
+    let mut tx1 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx1.put(&key(1), &value(1)).unwrap();
 
-    let tx_ro = manager.begin_ro();
+    let tx_ro = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx_ro.get(&key(1)).unwrap(), None);
 
     tx1.commit().unwrap();
 
     assert_eq!(tx_ro.get(&key(1)).unwrap(), None);
-    let tx_ro2 = manager.begin_ro();
+    let tx_ro2 = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx_ro2.get(&key(1)).unwrap(), Some(value(1)));
 }
 
@@ -42,8 +42,8 @@ fn test_write_write_conflict() {
     let path = dir.path().join("wal.log");
     let manager = TxnManager::open(&path).unwrap();
 
-    let mut tx1 = manager.begin_rw();
-    let mut tx2 = manager.begin_rw();
+    let mut tx1 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
+    let mut tx2 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
 
     tx1.put(&key(2), &value(2)).unwrap();
     tx2.put(&key(2), &value(3)).unwrap();
@@ -59,19 +59,19 @@ fn test_delete_visibility() {
     let path = dir.path().join("wal.log");
     let manager = TxnManager::open(&path).unwrap();
 
-    let mut tx1 = manager.begin_rw();
+    let mut tx1 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx1.put(&key(3), &value(3)).unwrap();
     tx1.commit().unwrap();
 
-    let tx_ro = manager.begin_ro();
+    let tx_ro = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx_ro.get(&key(3)).unwrap(), Some(value(3)));
 
-    let mut tx2 = manager.begin_rw();
+    let mut tx2 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx2.delete(&key(3)).unwrap();
     tx2.commit().unwrap();
 
     assert_eq!(tx_ro.get(&key(3)).unwrap(), Some(value(3)));
-    let tx_ro2 = manager.begin_ro();
+    let tx_ro2 = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx_ro2.get(&key(3)).unwrap(), None);
 }
 
@@ -81,17 +81,17 @@ fn test_multi_key_atomicity() {
     let path = dir.path().join("wal.log");
     let manager = TxnManager::open(&path).unwrap();
 
-    let mut tx = manager.begin_rw();
+    let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(4), &value(4)).unwrap();
     tx.put(&key(5), &value(5)).unwrap();
 
-    let tx_ro = manager.begin_ro();
+    let tx_ro = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx_ro.get(&key(4)).unwrap(), None);
     assert_eq!(tx_ro.get(&key(5)).unwrap(), None);
 
     tx.commit().unwrap();
 
-    let tx_ro2 = manager.begin_ro();
+    let tx_ro2 = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx_ro2.get(&key(4)).unwrap(), Some(value(4)));
     assert_eq!(tx_ro2.get(&key(5)).unwrap(), Some(value(5)));
 }
@@ -102,14 +102,14 @@ fn test_recovery_from_wal() {
     let path = dir.path().join("wal.log");
     {
         let manager = TxnManager::open(&path).unwrap();
-        let mut tx = manager.begin_rw();
+        let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
         tx.put(&key(6), &value(6)).unwrap();
         tx.put(&key(7), &value(7)).unwrap();
         tx.commit().unwrap();
     }
 
     let manager = TxnManager::open(&path).unwrap();
-    let tx = manager.begin_ro();
+    let tx = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx.get(&key(6)).unwrap(), Some(value(6)));
     assert_eq!(tx.get(&key(7)).unwrap(), Some(value(7)));
 }
@@ -120,7 +120,7 @@ fn test_checkpoint_and_recovery() {
     let path = dir.path().join("wal.log");
     {
         let manager = TxnManager::open(&path).unwrap();
-        let mut tx = manager.begin_rw();
+        let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
         tx.put(&key(10), &value(10)).unwrap();
         tx.put(&key(11), &value(11)).unwrap();
         tx.commit().unwrap();
@@ -128,7 +128,7 @@ fn test_checkpoint_and_recovery() {
     }
 
     let manager = TxnManager::open(&path).unwrap();
-    let tx = manager.begin_ro();
+    let tx = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx.get(&key(10)).unwrap(), Some(value(10)));
     assert_eq!(tx.get(&key(11)).unwrap(), Some(value(11)));
 }
@@ -139,7 +139,7 @@ fn test_wal_truncation_reduces_size() {
     let path = dir.path().join("wal.log");
     let manager = TxnManager::open(&path).unwrap();
 
-    let mut tx = manager.begin_rw();
+    let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(20), &value(20)).unwrap();
     tx.put(&key(21), &value(21)).unwrap();
     tx.commit().unwrap();
@@ -159,13 +159,13 @@ fn test_scan_basic_ordering() {
     let path = dir.path().join("wal.log");
     let manager = TxnManager::open(&path).unwrap();
 
-    let mut tx = manager.begin_rw();
+    let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(3), &value(3)).unwrap();
     tx.put(&key(1), &value(1)).unwrap();
     tx.put(&key(2), &value(2)).unwrap();
     tx.commit().unwrap();
 
-    let tx_ro = manager.begin_ro();
+    let tx_ro = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     let rows = tx_ro.scan(&key(1), &key(4), 10).unwrap();
     let keys: Vec<u8> = rows.iter().map(|(k, _)| k[0]).collect();
     assert_eq!(keys, vec![1, 2, 3]);
@@ -177,13 +177,13 @@ fn test_scan_respects_snapshot() {
     let path = dir.path().join("wal.log");
     let manager = TxnManager::open(&path).unwrap();
 
-    let mut tx = manager.begin_rw();
+    let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(1), &value(1)).unwrap();
     tx.commit().unwrap();
 
-    let tx_ro = manager.begin_ro();
+    let tx_ro = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
 
-    let mut tx2 = manager.begin_rw();
+    let mut tx2 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx2.put(&key(1), &value(2)).unwrap();
     tx2.put(&key(2), &value(2)).unwrap();
     tx2.commit().unwrap();
@@ -200,13 +200,13 @@ fn test_scan_overlays_writes_and_deletes() {
     let path = dir.path().join("wal.log");
     let manager = TxnManager::open(&path).unwrap();
 
-    let mut tx = manager.begin_rw();
+    let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(1), &value(1)).unwrap();
     tx.put(&key(2), &value(2)).unwrap();
     tx.put(&key(3), &value(3)).unwrap();
     tx.commit().unwrap();
 
-    let mut tx = manager.begin_rw();
+    let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.delete(&key(1)).unwrap();
     tx.put(&key(2), &value(9)).unwrap();
 
@@ -229,7 +229,7 @@ fn test_quorum_commit_survives_one_replica_down() {
     }
 
     let manager = TxnManager::open_quorum(replica_dirs.clone(), 2).unwrap();
-    let mut tx = manager.begin_rw();
+    let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(42), &value(42)).unwrap();
     tx.commit().unwrap();
     drop(manager);
@@ -237,7 +237,7 @@ fn test_quorum_commit_survives_one_replica_down() {
     std::fs::remove_dir_all(&replica_dirs[0]).unwrap();
 
     let manager = TxnManager::open_quorum(replica_dirs, 2).unwrap();
-    let tx = manager.begin_ro();
+    let tx = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx.get(&key(42)).unwrap(), Some(value(42)));
 }
 
@@ -260,7 +260,7 @@ fn test_quorum_commit_fails_if_not_enough_replicas() {
     std::fs::set_permissions(bad_dir, perms).unwrap();
 
     let manager = TxnManager::open_quorum(replica_dirs.clone(), 3).unwrap();
-    let mut tx = manager.begin_rw();
+    let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(9), &value(9)).unwrap();
     assert!(tx.commit().is_err());
 
@@ -288,13 +288,13 @@ fn test_quorum_commit_succeeds_with_one_replica_error() {
     std::fs::set_permissions(bad_dir, perms).unwrap();
 
     let manager = TxnManager::open_quorum(replica_dirs.clone(), 2).unwrap();
-    let mut tx = manager.begin_rw();
+    let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(7), &value(7)).unwrap();
     tx.commit().unwrap();
     drop(manager);
 
     let manager = TxnManager::open_quorum(replica_dirs.clone(), 2).unwrap();
-    let tx = manager.begin_ro();
+    let tx = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx.get(&key(7)).unwrap(), Some(value(7)));
 
     let mut perms = std::fs::metadata(bad_dir).unwrap().permissions();

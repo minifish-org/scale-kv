@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{KEY_SIZE, VALUE_SIZE, Value};
 
@@ -32,6 +32,8 @@ pub enum TxnError {
     QuorumNotMet { required: usize, succeeded: usize },
     #[error("invalid quorum {quorum} for {replicas} replicas")]
     InvalidQuorum { quorum: usize, replicas: usize },
+    #[error("transaction timed out")]
+    TxnTimeout,
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;
@@ -376,6 +378,8 @@ pub struct TxnManager {
 pub struct Txn {
     inner: Arc<TxnManagerInner>,
     read_ts: u64,
+    started_at: Instant,
+    timeout: Option<Duration>,
     write_set: HashMap<Key, Option<Value>>,
     read_only: bool,
 }
@@ -414,31 +418,42 @@ impl TxnManager {
         Ok(())
     }
 
-    pub fn begin_ro(&self) -> Txn {
-        Txn {
-            inner: Arc::clone(&self.inner),
-            read_ts: self.inner.commit_ts.load(Ordering::SeqCst),
-            write_set: HashMap::new(),
-            read_only: true,
-        }
+    pub fn begin_ro_timeout(&self, timeout: Duration) -> Txn {
+        self.begin_tx(true, Some(timeout))
     }
 
-    pub fn begin_rw(&self) -> Txn {
+    pub fn begin_rw_timeout(&self, timeout: Duration) -> Txn {
+        self.begin_tx(false, Some(timeout))
+    }
+
+    fn begin_tx(&self, read_only: bool, timeout: Option<Duration>) -> Txn {
         Txn {
             inner: Arc::clone(&self.inner),
             read_ts: self.inner.commit_ts.load(Ordering::SeqCst),
+            started_at: Instant::now(),
+            timeout,
             write_set: HashMap::new(),
-            read_only: false,
+            read_only,
         }
     }
 }
 
 impl Txn {
+    fn ensure_not_timed_out(&self) -> Result<()> {
+        if let Some(timeout) = self.timeout {
+            if self.started_at.elapsed() > timeout {
+                return Err(TxnError::TxnTimeout);
+            }
+        }
+        Ok(())
+    }
+
     pub fn read_ts(&self) -> u64 {
         self.read_ts
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+        self.ensure_not_timed_out()?;
         let key = parse_key(key)?;
         if let Some(entry) = self.write_set.get(&key) {
             return Ok(entry.clone());
@@ -448,6 +463,7 @@ impl Txn {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.ensure_not_timed_out()?;
         let key = parse_key(key)?;
         if value.len() > VALUE_SIZE {
             return Err(TxnError::InvalidValueSize(value.len(), VALUE_SIZE));
@@ -457,6 +473,7 @@ impl Txn {
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.ensure_not_timed_out()?;
         let key = parse_key(key)?;
         self.write_set.insert(key, None);
         Ok(())
@@ -468,6 +485,7 @@ impl Txn {
         end_exclusive: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_not_timed_out()?;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -512,6 +530,7 @@ impl Txn {
     }
 
     pub fn commit(self) -> Result<u64> {
+        self.ensure_not_timed_out()?;
         if self.read_only || self.write_set.is_empty() {
             return Ok(self.read_ts);
         }
@@ -824,6 +843,8 @@ fn decode_payload(payload: &[u8]) -> Result<(u64, Vec<(Key, Option<Value>)>)> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use std::thread;
+    use std::time::Duration;
 
     fn key(byte: u8) -> [u8; KEY_SIZE] {
         let mut k = [0u8; KEY_SIZE];
@@ -836,7 +857,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wal.log");
         let manager = TxnManager::open(&path).unwrap();
-        let mut tx = manager.begin_rw();
+        let mut tx = manager.begin_rw_timeout(Duration::from_secs(30));
         tx.put(&key(1), b"v1").unwrap();
         tx.delete(&key(2)).unwrap();
         let ts = tx.commit().unwrap();
@@ -844,8 +865,19 @@ mod tests {
         drop(manager);
 
         let manager = TxnManager::open(&path).unwrap();
-        let tx = manager.begin_ro();
+        let tx = manager.begin_ro_timeout(Duration::from_secs(30));
         assert_eq!(tx.get(&key(1)).unwrap(), Some(b"v1".to_vec()));
         assert_eq!(tx.get(&key(2)).unwrap(), None);
+    }
+
+    #[test]
+    fn test_txn_timeout() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let manager = TxnManager::open(&path).unwrap();
+        let mut tx = manager.begin_rw_timeout(Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(5));
+        let err = tx.put(&key(1), b"v1").unwrap_err();
+        assert!(matches!(err, TxnError::TxnTimeout));
     }
 }

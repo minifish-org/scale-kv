@@ -136,7 +136,7 @@ impl EmbeddedCompute {
     }
 
     /// Safe GC watermark: minimum active read_lsn if any, otherwise durable_lsn.
-    pub fn gc_lsn(&self) -> u64 {
+    fn gc_lsn(&self) -> u64 {
         self.active_reads
             .min_read_lsn()
             .unwrap_or_else(|| self.durable_lsn())
@@ -150,10 +150,12 @@ impl EmbeddedCompute {
         self.page_cache.len()
     }
 
+    #[doc(hidden)]
     pub fn cached_page(&self, page_id: PageId) -> Option<Page> {
         self.page_cache.get(page_id)
     }
 
+    #[doc(hidden)]
     pub async fn get_page(&self, page_id: PageId, need_lsn: u64) -> Option<Page> {
         if let Some(p) = self.page_cache.get(page_id) {
             return Some(p);
@@ -276,7 +278,7 @@ impl EmbeddedCompute {
         Ok(())
     }
 
-    pub fn begin(&self) -> EmbeddedTxn {
+    fn begin_tx(&self) -> EmbeddedTxn {
         // Clear dirty pages collected by provider from any previous operations.
         let _ = self.provider.take_dirty();
         let read_lsn = self.begin_ro();
@@ -297,9 +299,20 @@ impl EmbeddedCompute {
         }
     }
 
+    /// Begin a read-write transaction.
+    pub fn begin_rw(&self) -> EmbeddedTxn {
+        self.begin_tx()
+    }
+
+    /// Backward-compatible alias for `begin_rw()`.
+    pub fn begin(&self) -> EmbeddedTxn {
+        self.begin_rw()
+    }
+
     /// Convenience: write a single page after-image in its own txn.
+    #[doc(hidden)]
     pub async fn write_page(&self, page_id: PageId, page: Page) -> Result<u64> {
-        let mut tx = self.begin();
+        let mut tx = self.begin_rw();
         tx.write_page(page_id, page);
         tx.commit().await
     }
@@ -313,7 +326,7 @@ impl EmbeddedCompute {
             return Err(Error::InvalidValueSize(value.len(), VALUE_SIZE));
         }
 
-        let mut tx = self.begin();
+        let mut tx = self.begin_rw();
         tx.put(key, value).await?;
         tx.commit().await
     }
@@ -322,7 +335,7 @@ impl EmbeddedCompute {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
-        let mut tx = self.begin();
+        let mut tx = self.begin_rw();
         tx.get(key).await
     }
 
@@ -330,7 +343,7 @@ impl EmbeddedCompute {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
-        let mut tx = self.begin();
+        let mut tx = self.begin_rw();
         tx.delete(key).await?;
         tx.commit().await
     }
