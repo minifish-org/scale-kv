@@ -842,9 +842,9 @@ fn decode_payload(payload: &[u8]) -> Result<(u64, Vec<(Key, Option<Value>)>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::thread;
     use std::time::Duration;
+    use tempfile::tempdir;
 
     fn key(byte: u8) -> [u8; KEY_SIZE] {
         let mut k = [0u8; KEY_SIZE];

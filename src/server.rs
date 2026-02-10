@@ -133,7 +133,6 @@ impl storage::Server for StorageService {
             Ok(())
         })
     }
-
 }
 
 impl StorageServer {

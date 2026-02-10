@@ -15,8 +15,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use scale_kv::server::StorageServer;
 use scale_kv::StorageMaintenanceConfig;
+use scale_kv::server::StorageServer;
 
 fn parse_arg(args: &[String], key: &str) -> Option<String> {
     args.iter()

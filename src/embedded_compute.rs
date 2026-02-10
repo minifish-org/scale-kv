@@ -1,8 +1,7 @@
 use crate::compute_sequencer::ComputeSequencer;
 use crate::meta_page::{META_PAGE_ID, MetaPage};
 use crate::page_bptree::{
-    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, PageBPlusTree, PageCache,
-    SlotRef as PageSlotRef,
+    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, PageBPlusTree, PageCache, SlotRef as PageSlotRef,
 };
 use crate::txn_page_provider::TxnPageProvider;
 use crate::{ActiveReads, ReadGuard};
@@ -12,8 +11,8 @@ use crate::{
     undo_pg::{self, UndoPtr, UndoRecord},
 };
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::Mutex;
 use tokio::task::LocalSet;
 
@@ -29,9 +28,10 @@ pub struct EmbeddedCompute {
     active_reads: Arc<ActiveReads>,
 
     page_cache: Arc<PageCache>,
-    page_fetcher: Arc<dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>>,
+    page_fetcher:
+        Arc<dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>>,
     provider: Arc<TxnPageProvider>,
-    tree: Arc<Mutex<PageBPlusTree<TxnPageProvider>>>, 
+    tree: Arc<Mutex<PageBPlusTree<TxnPageProvider>>>,
 }
 
 impl EmbeddedCompute {
@@ -64,10 +64,10 @@ impl EmbeddedCompute {
             Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "no readers"))
         })?;
         let page_fetcher: Arc<
-            dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>
-        > = Arc::new(move |pid, need| { 
+            dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>,
+        > = Arc::new(move |pid, need| {
             let reader0 = Arc::clone(&reader0);
-            Box::pin(async move {  
+            Box::pin(async move {
                 let mut backoff_ms = 1u64;
                 for _ in 0..200 {
                     match reader0.get_page(pid).await {
@@ -92,7 +92,7 @@ impl EmbeddedCompute {
         let page_fetcher2 = Arc::clone(&page_fetcher);
 
         let fetcher_for_provider: Arc<
-            dyn Fn(PageId) -> futures::future::LocalBoxFuture<'static, Option<Page>>
+            dyn Fn(PageId) -> futures::future::LocalBoxFuture<'static, Option<Page>>,
         > = Arc::new(move |pid| {
             let need = min_read_lsn2.load(std::sync::atomic::Ordering::Acquire);
             page_fetcher2(pid, need)
@@ -230,7 +230,6 @@ impl EmbeddedCompute {
         const BPTREE_ROOT_ID: PageId = 10;
         const DATA_BASE: PageId = 1_000_000;
         const UNDO_BASE: PageId = 2_000_000;
-        const UNDO_BASE_DEFAULT: PageId = UNDO_BASE;
         const FSM_LEVEL0_BASE: PageId = 2;
         const INIT_DATA_LEAVES: u64 = 1024; // tracks first 1024 data pages initially
 
@@ -442,7 +441,9 @@ impl EmbeddedCompute {
                                     .or_else(|| tx.compute.page_cache.get(pid))
                             };
 
-                            if let Ok(writes) = crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, class) {
+                            if let Ok(writes) =
+                                crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, class)
+                            {
                                 for (pid, p) in writes {
                                     tx.write_page(pid, p);
                                 }
@@ -499,7 +500,9 @@ impl EmbeddedCompute {
                     }
                     // read undo record to follow prev
                     let upage = self.get_page(p.page_id, gc_lsn).await;
-                    let Some(upage) = upage else { break; };
+                    let Some(upage) = upage else {
+                        break;
+                    };
                     let rec = undo_pg::read_record(&upage, p.slot_id)?;
                     ptr = rec.prev;
                 }
@@ -921,9 +924,7 @@ impl EmbeddedTxn {
         };
 
         // Write/allocate data page.
-        let slot_ref = self
-            .alloc_or_update_data_page(existing, key, value)
-            .await?;
+        let slot_ref = self.alloc_or_update_data_page(existing, key, value).await?;
 
         // Update B+Tree mapping.
         {

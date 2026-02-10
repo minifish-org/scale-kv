@@ -27,7 +27,6 @@ fn cleanup_dir(dir: &PathBuf) {
     let _ = fs::remove_dir_all(dir);
 }
 
-
 #[tokio::test(flavor = "current_thread")]
 async fn test_page_redo_commit_and_recover_by_scan() {
     if !tcp_bind_allowed() {

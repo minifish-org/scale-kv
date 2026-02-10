@@ -5,7 +5,7 @@
 //!   cargo run --release --bin simple_bench -- --addr 127.0.0.1:50051 --records 100000 --ops 200000
 
 use rand::SeedableRng;
-use scale_kv::{EmbeddedCompute, KEY_SIZE, VALUE_SIZE};
+use scale_kv::{EmbeddedCompute, VALUE_SIZE};
 use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::task::LocalSet;

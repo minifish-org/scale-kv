@@ -10,8 +10,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{Mutex, oneshot};
 
-const PAGE_HEADER_SIZE: usize = 6;
-const SLOT_ENTRY_SIZE: usize = 4;
 #[cfg(test)]
 const MAX_SEGMENT_SIZE: u64 = 8 * 1024;
 #[cfg(not(test))]
@@ -433,9 +431,9 @@ pub const WAL_OP_PAGE_PUT: u8 = 11;
 pub const WAL_OP_PAGE_DEL: u8 = 12;
 
 // WAL ops for txn MVCC records
-pub const WAL_OP_TXN_PUT: u8 = 11;
-pub const WAL_OP_TXN_DEL: u8 = 12;
-pub const WAL_OP_TXN_COMMIT: u8 = 13;
+pub const WAL_OP_TXN_PUT: u8 = 21;
+pub const WAL_OP_TXN_DEL: u8 = 22;
+pub const WAL_OP_TXN_COMMIT: u8 = 23;
 
 #[derive(Clone, Debug)]
 pub struct WalBatch {
@@ -758,14 +756,12 @@ async fn wal_replay_loop(
             let _ = truncate_wal_segments(&replay.dir, checkpoint_lsn).await;
         }
 
-        if let Ok(Some((segments, bytes))) = wal_usage_exceeds_limits(&replay.dir, &maintenance, 0).await
+        if let Ok(Some((segments, bytes))) =
+            wal_usage_exceeds_limits(&replay.dir, &maintenance, 0).await
         {
             eprintln!(
                 "[wal-limit-replay] over threshold after replay: segments={} bytes={} limits=(segments:{} bytes:{})",
-                segments,
-                bytes,
-                maintenance.max_wal_segments,
-                maintenance.max_wal_bytes
+                segments, bytes, maintenance.max_wal_segments, maintenance.max_wal_bytes
             );
         }
 
@@ -983,7 +979,8 @@ impl StorageNode {
 
     pub async fn append_wal_batch(&self, batch: WalBatch) -> Result<()> {
         self.validate_incoming_wal_batch(&batch)?;
-        self.enforce_wal_limits(wal_batch_encoded_len(&batch)).await?;
+        self.enforce_wal_limits(wal_batch_encoded_len(&batch))
+            .await?;
         let sender = self.wal_sender.lock().await;
         match sender.as_ref() {
             Some(sender) => Ok(sender
@@ -1069,11 +1066,7 @@ impl StorageNode {
     }
 
     async fn enforce_wal_limits(&self, incoming_bytes: u64) -> Result<()> {
-        if self
-            .wal_usage_exceeds(incoming_bytes)
-            .await?
-            .is_none()
-        {
+        if self.wal_usage_exceeds(incoming_bytes).await?.is_none() {
             return Ok(());
         }
 
@@ -1262,7 +1255,8 @@ impl StorageNode {
 
     pub async fn append_wal_batch_sync(&self, batch: WalBatch) -> Result<u64> {
         self.validate_incoming_wal_batch(&batch)?;
-        self.enforce_wal_limits(wal_batch_encoded_len(&batch)).await?;
+        self.enforce_wal_limits(wal_batch_encoded_len(&batch))
+            .await?;
         let sender = self.wal_sender.lock().await;
         let sender = sender.as_ref().ok_or_else(|| {
             crate::Error::Io(Error::new(
@@ -1799,7 +1793,10 @@ mod tests {
         let mut handle = node.begin_mvcc_ro();
         let id = handle.id().unwrap();
         assert!(node.list_active_reads().iter().any(|r| r.id == id));
-        assert_eq!(node.mvcc_get(&mut handle, b"k").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(
+            node.mvcc_get(&mut handle, b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
 
         assert!(node.abort_active_read(id));
         let err = node.mvcc_get(&mut handle, b"k").unwrap_err();

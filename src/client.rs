@@ -69,7 +69,7 @@ impl StorageClient {
     ) -> Result<(u64, u64)> {
         let mut request = self.client.append_txn_batch_request();
         {
-            let mut p = request.get();
+            let p = request.get();
             let mut b = p.init_batch();
             b.set_request_id(request_id);
             b.set_start_lsn(start_lsn);

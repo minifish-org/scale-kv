@@ -35,6 +35,7 @@ pub struct SlotRef {
 /// B+Tree uses this trait to read/write pages, allowing different backends:
 /// - InMemoryPageProvider: HashMap-based, for testing
 /// - SharedPageProvider: Wraps Arc<RwLock<HashMap>> for shared cache
+#[allow(async_fn_in_trait)]
 pub trait AsyncPageProvider {
     /// Read a page by ID. Returns None if page doesn't exist.
     async fn read_page(&self, page_id: PageId) -> Option<Page>;
@@ -517,7 +518,12 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         out
     }
 
-    pub async fn range_visit(&self, start: &[u8], end: &[u8], mut f: impl FnMut(&[u8], SlotRef) -> bool) {
+    pub async fn range_visit(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        mut f: impl FnMut(&[u8], SlotRef) -> bool,
+    ) {
         let (mut leaf_id, _) = self.find_leaf(start).await;
 
         // Same high-key correction as point lookup.
@@ -633,7 +639,11 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
             let header = page_header(&parent);
 
             // Find insertion position for (separator -> right_id), immediately after left_id.
-            let mut pos = if header.left_child == left_id { 0 } else { usize::MAX };
+            let mut pos = if header.left_child == left_id {
+                0
+            } else {
+                usize::MAX
+            };
             if pos == usize::MAX {
                 let key_count = header.key_count as usize;
                 for idx in 0..key_count {
@@ -794,6 +804,7 @@ fn write_u16(page: &mut [u8], offset: usize, value: u16) {
     page[offset..offset + 2].copy_from_slice(&bytes);
 }
 
+#[allow(dead_code)]
 fn decode_entries(page: &Page) -> Vec<(Vec<u8>, Vec<u8>)> {
     let header = page_header(page);
     let mut entries = Vec::with_capacity(header.key_count as usize);
@@ -815,6 +826,7 @@ fn decode_entries(page: &Page) -> Vec<(Vec<u8>, Vec<u8>)> {
     entries
 }
 
+#[allow(dead_code)]
 fn for_each_entry<'a>(page: &'a Page, mut f: impl FnMut(&'a [u8], &'a [u8]) -> bool) {
     let header = page_header(page);
     let value_size = entry_value_size(header.page_type);
@@ -1069,6 +1081,7 @@ fn encode_entries(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn fits_in_page(entries: &[(Vec<u8>, Vec<u8>)]) -> bool {
     if entries.is_empty() {
         return HEADER_SIZE <= PAGE_SIZE;
