@@ -87,6 +87,11 @@ async fn main() -> anyhow::Result<()> {
     let metrics_interval_secs = parse_u64_or_default(&args, "--metrics-interval-secs", 0);
     let metrics_format = parse_arg(&args, "--metrics-format").unwrap_or_else(|| "json".to_string());
 
+    eprintln!(
+        "storage_server effective_config: {}",
+        maintenance.render_json()
+    );
+
     let server =
         StorageServer::start_with_dir_and_maintenance(addr, dir.clone(), maintenance).await?;
     eprintln!(

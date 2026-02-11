@@ -145,48 +145,57 @@ impl Default for StorageMaintenanceConfig {
 }
 
 impl StorageMaintenanceConfig {
-    pub fn from_env() -> Self {
-        let mut cfg = Self::default();
-
-        if let Some(v) = env_u64("SCALE_KV_CHECKPOINT_INTERVAL_SECS") {
-            cfg.checkpoint.interval = Duration::from_secs(v.max(1));
+    pub fn validate(&self) -> Result<()> {
+        if self.checkpoint.interval.is_zero() {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "checkpoint.interval must be > 0",
+            )));
         }
-        if let Some(v) = env_usize("SCALE_KV_CHECKPOINT_MAX_DIRTY_PAGES") {
-            cfg.checkpoint.max_dirty_pages = v.max(1);
+        if self.checkpoint.max_dirty_pages == 0 {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "checkpoint.max_dirty_pages must be > 0",
+            )));
         }
-        if let Some(v) = env_usize("SCALE_KV_CHECKPOINT_MAX_DIRTY_BYTES") {
-            cfg.checkpoint.max_dirty_bytes = v.max(1);
+        if self.checkpoint.max_dirty_bytes == 0 {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "checkpoint.max_dirty_bytes must be > 0",
+            )));
         }
-        if let Some(v) = env_bool("SCALE_KV_WAL_TRUNCATE") {
-            cfg.truncate_wal = v;
+        if self.max_wal_bytes == 0 {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "max_wal_bytes must be > 0",
+            )));
         }
-        if let Some(v) = env_u64("SCALE_KV_WAL_MAX_BYTES") {
-            cfg.max_wal_bytes = v.max(1);
+        if self.max_wal_segments == 0 {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "max_wal_segments must be > 0",
+            )));
         }
-        if let Some(v) = env_usize("SCALE_KV_WAL_MAX_SEGMENTS") {
-            cfg.max_wal_segments = v.max(1);
+        if self.mvcc_gc_every_wal_batches == 0 {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "mvcc_gc_every_wal_batches must be > 0",
+            )));
         }
-        if let Some(v) = env_usize("SCALE_KV_MVCC_GC_EVERY_WAL_BATCHES") {
-            cfg.mvcc_gc_every_wal_batches = v.max(1);
-        }
-        cfg
+        Ok(())
     }
-}
 
-fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key).ok()?.parse::<u64>().ok()
-}
-
-fn env_usize(key: &str) -> Option<usize> {
-    std::env::var(key).ok()?.parse::<usize>().ok()
-}
-
-fn env_bool(key: &str) -> Option<bool> {
-    let s = std::env::var(key).ok()?;
-    match s.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
+    pub fn render_json(&self) -> String {
+        format!(
+            "{{\"checkpoint\":{{\"interval_secs\":{},\"max_dirty_pages\":{},\"max_dirty_bytes\":{}}},\"truncate_wal\":{},\"max_wal_bytes\":{},\"max_wal_segments\":{},\"mvcc_gc_every_wal_batches\":{}}}",
+            self.checkpoint.interval.as_secs_f64(),
+            self.checkpoint.max_dirty_pages,
+            self.checkpoint.max_dirty_bytes,
+            self.truncate_wal,
+            self.max_wal_bytes,
+            self.max_wal_segments,
+            self.mvcc_gc_every_wal_batches
+        )
     }
 }
 
@@ -1052,22 +1061,18 @@ fn apply_wal_record(page: &mut [u8], record: &WalRecord) -> Result<()> {
 
 impl StorageNode {
     pub async fn new() -> Self {
-        let dir = std::env::var("SCALE_KV_DATA_DIR").unwrap_or_else(|_| "data".to_string());
-        Self::open(dir).await.expect("failed to open storage")
+        Self::open("data").await.expect("failed to open storage")
     }
 
     pub async fn open<P: AsRef<Path>>(dir: P) -> Result<Self> {
         Self::open_with_maintenance(dir, StorageMaintenanceConfig::default()).await
     }
 
-    pub async fn open_with_env<P: AsRef<Path>>(dir: P) -> Result<Self> {
-        Self::open_with_maintenance(dir, StorageMaintenanceConfig::from_env()).await
-    }
-
     pub async fn open_with_maintenance<P: AsRef<Path>>(
         dir: P,
         maintenance: StorageMaintenanceConfig,
     ) -> Result<Self> {
+        maintenance.validate()?;
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).await?;
 
@@ -2275,6 +2280,19 @@ mod tests {
         assert!(!metrics.render_prometheus().is_empty());
 
         drop(node);
+        cleanup_dir(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_invalid_maintenance_config_fails_fast() {
+        let dir = temp_dir().await;
+        let mut cfg = StorageMaintenanceConfig::default();
+        cfg.max_wal_segments = 0;
+        let err = match StorageNode::open_with_maintenance(&dir, cfg).await {
+            Ok(_) => panic!("expected invalid config failure"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, crate::Error::Io(ref ioe) if ioe.kind() == ErrorKind::InvalidInput));
         cleanup_dir(&dir).await;
     }
 
