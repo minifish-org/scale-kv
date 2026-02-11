@@ -25,9 +25,14 @@ Path: `/Users/yusp/work/scale-kv/tests/quorum_commit_e2e.rs`
 - `test_quorum_commit_with_one_ahead_node`
   - Exercises partial storage inconsistency where one node is ahead.
   - Verifies commit can still succeed with quorum and healthy nodes advance.
+- `test_quorum_commit_succeeds_with_one_backpressured_node`
+  - One node is configured with aggressive WAL backpressure.
+  - Verifies quorum=2 commit still succeeds and completes within timeout.
+- `test_quorum_commit_fails_when_quorum_requires_backpressured_node`
+  - Same fault model, but quorum=3.
+  - Verifies commit fails with quorum-not-reached.
 
 ## Next drills to add
 
 - Disk full during checkpoint file sync.
-- Replica unavailability at connect-time (degraded membership strategy).
 - Restart ordering matrix (staggered restart of multiple replicas).

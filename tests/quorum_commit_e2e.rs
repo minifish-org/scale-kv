@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, process};
 
-use scale_kv::{ComputeSequencer, EmbeddedCompute, PAGE_SIZE, StorageServer};
+use scale_kv::{
+    ComputeSequencer, EmbeddedCompute, PAGE_SIZE, StorageMaintenanceConfig, StorageServer,
+};
+use std::time::Duration;
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -89,6 +92,118 @@ async fn test_quorum_commit_with_one_ahead_node() {
             let d2 = c2.get_durable_lsn().await.unwrap();
             assert!(d1 >= commit_lsn);
             assert!(d2 >= commit_lsn);
+        })
+        .await;
+
+    cleanup_dir(&dir1);
+    cleanup_dir(&dir2);
+    cleanup_dir(&dir3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_quorum_commit_succeeds_with_one_backpressured_node() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir1 = temp_dir("bp-s1");
+    let dir2 = temp_dir("bp-s2");
+    let dir3 = temp_dir("bp-s3");
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let s1 = StorageServer::start_with_dir(addr, dir1.clone())
+                .await
+                .unwrap();
+            let s2 = StorageServer::start_with_dir(addr, dir2.clone())
+                .await
+                .unwrap();
+
+            let mut bad_cfg = StorageMaintenanceConfig::default();
+            bad_cfg.max_wal_bytes = 1;
+            bad_cfg.truncate_wal = false;
+            let s3 = StorageServer::start_with_dir_and_maintenance(addr, dir3.clone(), bad_cfg)
+                .await
+                .unwrap();
+
+            let addrs = vec![
+                s1.addr().to_string(),
+                s2.addr().to_string(),
+                s3.addr().to_string(),
+            ];
+            let seq = ComputeSequencer::connect(&addrs, 2, &local).await.unwrap();
+
+            let mut page = vec![0u8; PAGE_SIZE];
+            page[0] = 9;
+            let writes = vec![(77u64, page)];
+
+            let commit_lsn =
+                tokio::time::timeout(Duration::from_secs(5), seq.commit_txn_batch(writes))
+                    .await
+                    .expect("commit timed out under partial failure")
+                    .unwrap();
+
+            let c1 = scale_kv::StorageClient::connect(&addrs[0], &local)
+                .await
+                .unwrap();
+            let c2 = scale_kv::StorageClient::connect(&addrs[1], &local)
+                .await
+                .unwrap();
+            let d1 = c1.get_durable_lsn().await.unwrap();
+            let d2 = c2.get_durable_lsn().await.unwrap();
+            assert!(d1 >= commit_lsn);
+            assert!(d2 >= commit_lsn);
+        })
+        .await;
+
+    cleanup_dir(&dir1);
+    cleanup_dir(&dir2);
+    cleanup_dir(&dir3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_quorum_commit_fails_when_quorum_requires_backpressured_node() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir1 = temp_dir("bp-fail-s1");
+    let dir2 = temp_dir("bp-fail-s2");
+    let dir3 = temp_dir("bp-fail-s3");
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let s1 = StorageServer::start_with_dir(addr, dir1.clone())
+                .await
+                .unwrap();
+            let s2 = StorageServer::start_with_dir(addr, dir2.clone())
+                .await
+                .unwrap();
+
+            let mut bad_cfg = StorageMaintenanceConfig::default();
+            bad_cfg.max_wal_bytes = 1;
+            bad_cfg.truncate_wal = false;
+            let s3 = StorageServer::start_with_dir_and_maintenance(addr, dir3.clone(), bad_cfg)
+                .await
+                .unwrap();
+
+            let addrs = vec![
+                s1.addr().to_string(),
+                s2.addr().to_string(),
+                s3.addr().to_string(),
+            ];
+            let seq = ComputeSequencer::connect(&addrs, 3, &local).await.unwrap();
+
+            let mut page = vec![0u8; PAGE_SIZE];
+            page[0] = 11;
+            let writes = vec![(88u64, page)];
+            let err = seq.commit_txn_batch(writes).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("quorum not reached"));
         })
         .await;
 
