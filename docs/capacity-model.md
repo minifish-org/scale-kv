@@ -49,6 +49,22 @@ Backpressure policy:
   - increase `wal_group_commit_max_batches` for throughput
   - increase `wal_group_commit_wait_us` modestly to improve fsync amortization (at latency cost)
 
+Practical starting points:
+
+- latency-sensitive:
+  - `wal_group_commit_max_batches=16`
+  - `wal_group_commit_wait_us=50`
+- throughput-sensitive:
+  - `wal_group_commit_max_batches=128`
+  - `wal_group_commit_wait_us=400`
+
+Tuning loop:
+
+1. Fix workload mix (`read_ratio`, `concurrency`).
+2. Sweep `wal_group_commit_wait_us` upward until p99 hits SLO bound.
+3. Sweep `wal_group_commit_max_batches` upward for extra throughput.
+4. Stop when throughput gain flattens or p99 exceeds SLO.
+
 ## Cache model
 
 Working set pages:

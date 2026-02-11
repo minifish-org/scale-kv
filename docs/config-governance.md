@@ -49,3 +49,32 @@ WAL group commit tuning knobs:
 
 - `wal_group_commit_max_batches`
 - `wal_group_commit_wait_us`
+
+Recommended presets:
+
+- low-latency profile:
+  - `wal_group_commit_max_batches = 16`
+  - `wal_group_commit_wait_us = 50`
+- high-throughput profile:
+  - `wal_group_commit_max_batches = 128`
+  - `wal_group_commit_wait_us = 400`
+
+Example (low latency):
+
+```bash
+cargo run --release --bin storage_server -- \
+  --addr 127.0.0.1:50051 \
+  --dir ./data/storage-50051 \
+  --wal-group-max-batches 16 \
+  --wal-group-wait-us 50
+```
+
+Example (high throughput):
+
+```bash
+cargo run --release --bin storage_server -- \
+  --addr 127.0.0.1:50051 \
+  --dir ./data/storage-50051 \
+  --wal-group-max-batches 128 \
+  --wal-group-wait-us 400
+```
