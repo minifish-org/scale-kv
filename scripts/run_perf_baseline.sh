@@ -12,6 +12,7 @@ out_dir="${OUT_DIR:-$repo_root/artifacts}"
 mkdir -p "$out_dir"
 ts="$(date +%Y%m%d-%H%M%S)"
 out_file="$out_dir/perf-baseline-$ts.jsonl"
+report_file="$out_dir/perf-baseline-$ts.md"
 
 cleanup() {
   if [[ -n "${server_pid:-}" ]]; then
@@ -51,3 +52,6 @@ for ratio in 100 80 50 20 0; do
 done
 
 echo "[perf] done: $out_file"
+echo "[perf] generating report: $report_file"
+cargo run --release --bin perf_report -- --in "$out_file" --out "$report_file"
+echo "[perf] report done: $report_file"
