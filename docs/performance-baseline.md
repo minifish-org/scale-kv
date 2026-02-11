@@ -40,6 +40,8 @@ Artifacts:
   - `artifacts/perf-baseline-<timestamp>.jsonl`
 - storage server log:
   - `artifacts/storage-server-<timestamp>.log`
+- optional markdown report:
+  - generated from JSONL by `scripts/build_perf_report.sh`
 
 ## How to run
 
@@ -60,3 +62,15 @@ Example:
 ```bash
 ADDR=127.0.0.1:50071 RECORDS=50000 OPS=100000 ./scripts/run_perf_baseline.sh
 ```
+
+## Build report from JSONL
+
+```bash
+./scripts/build_perf_report.sh artifacts/perf-baseline-<timestamp>.jsonl
+```
+
+This generates:
+
+- `artifacts/perf-baseline-<timestamp>.md`
+- matrix table (ratio/concurrency/throughput/latency)
+- best-throughput summary per read ratio

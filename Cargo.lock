@@ -855,6 +855,8 @@ dependencies = [
  "hex",
  "lru",
  "rand",
+ "serde",
+ "serde_json",
  "sled",
  "tempfile",
  "thiserror",
