@@ -411,6 +411,10 @@ impl WalWriter {
         encode_wal_batch(batch, &mut buf)?;
         self.file.write_all(&buf).await?;
         self.size += buf.len() as u64;
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<()> {
         self.file.sync_data().await?;
         Ok(())
     }
@@ -611,20 +615,64 @@ async fn wal_writer_loop(
     mut rx: Receiver<WalWriteRequest>,
     replay_tx: Sender<WalBatch>,
 ) {
+    const MAX_GROUP_COMMIT_BATCH: usize = 64;
     let mut writer = match WalWriter::open(dir).await {
         Ok(writer) => writer,
         Err(_) => return,
     };
     while let Some(req) = rx.recv().await {
-        let WalWriteRequest { batch, ack } = req;
-        let appended = writer.append_batch(&batch).await.map(|_| batch.end_lsn);
-        if let Ok(end_lsn) = appended {
-            durable_lsn.store(end_lsn, std::sync::atomic::Ordering::Release);
-            let _ = replay_tx.send(batch).await;
+        let mut pending = vec![req];
+        while pending.len() < MAX_GROUP_COMMIT_BATCH {
+            match rx.try_recv() {
+                Ok(next) => pending.push(next),
+                Err(_) => break,
+            }
         }
-        if let Some(ack) = ack {
-            // If WAL append failed, return the error to the caller.
-            let _ = ack.send(appended.map_err(|e| e));
+
+        let mut append_err: Option<String> = None;
+        let mut appended_count = 0usize;
+        let mut max_end_lsn = 0u64;
+        for req in &pending {
+            if let Err(err) = writer.append_batch(&req.batch).await {
+                append_err = Some(err.to_string());
+                break;
+            }
+            appended_count += 1;
+            max_end_lsn = max_end_lsn.max(req.batch.end_lsn);
+        }
+
+        if append_err.is_none()
+            && let Err(err) = writer.flush().await
+        {
+            append_err = Some(err.to_string());
+        }
+
+        if let Some(err_msg) = append_err {
+            for req in pending {
+                if let Some(ack) = req.ack {
+                    let _ = ack.send(Err(crate::Error::Io(std::io::Error::other(
+                        err_msg.clone(),
+                    ))));
+                }
+            }
+            continue;
+        }
+
+        durable_lsn.store(max_end_lsn, std::sync::atomic::Ordering::Release);
+        for (idx, req) in pending.into_iter().enumerate() {
+            if idx < appended_count {
+                let _ = replay_tx.send(req.batch.clone()).await;
+            }
+            if let Some(ack) = req.ack {
+                let result = if idx < appended_count {
+                    Ok(req.batch.end_lsn)
+                } else {
+                    Err(crate::Error::Io(std::io::Error::other(
+                        "wal append aborted before batch was written",
+                    )))
+                };
+                let _ = ack.send(result);
+            }
         }
     }
 }
