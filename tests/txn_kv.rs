@@ -301,3 +301,37 @@ fn test_quorum_commit_succeeds_with_one_replica_error() {
     perms.set_mode(0o700);
     std::fs::set_permissions(bad_dir, perms).unwrap();
 }
+
+#[test]
+fn test_quorum_staggered_restart_preserves_latest_value() {
+    let dir = tempdir().unwrap();
+    let mut replica_dirs = Vec::new();
+    for i in 0..3 {
+        let path = dir.path().join(format!("replica_{i}"));
+        std::fs::create_dir_all(&path).unwrap();
+        replica_dirs.push(path);
+    }
+
+    // Initial write with all replicas.
+    {
+        let manager = TxnManager::open_quorum(replica_dirs.clone(), 2).unwrap();
+        let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
+        tx.put(&key(60), &value(1)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Simulate a staged restart where one replica is offline:
+    // write with only two replicas reachable.
+    let partial = vec![replica_dirs[0].clone(), replica_dirs[1].clone()];
+    {
+        let manager = TxnManager::open_quorum(partial, 2).unwrap();
+        let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
+        tx.put(&key(60), &value(2)).unwrap();
+        tx.commit().unwrap();
+    }
+
+    // Rejoin full set and ensure latest value is still selected.
+    let manager = TxnManager::open_quorum(replica_dirs, 2).unwrap();
+    let tx = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
+    assert_eq!(tx.get(&key(60)).unwrap(), Some(value(2)));
+}

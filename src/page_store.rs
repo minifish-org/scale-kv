@@ -188,6 +188,8 @@ pub struct PageStore {
     max_page_id: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    #[cfg(test)]
+    fail_next_checkpoint_sync: AtomicBool,
     last_checkpoint: std::sync::Mutex<Instant>,
     shutdown: AtomicBool,
 }
@@ -215,9 +217,17 @@ impl PageStore {
             max_page_id: AtomicU64::new(max_page_id),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_next_checkpoint_sync: AtomicBool::new(false),
             last_checkpoint: std::sync::Mutex::new(Instant::now()),
             shutdown: AtomicBool::new(false),
         })
+    }
+
+    #[cfg(test)]
+    pub fn inject_fail_next_checkpoint_sync(&self) {
+        self.fail_next_checkpoint_sync
+            .store(true, Ordering::Release);
     }
 
     pub async fn get(&self, page_id: PageId) -> Option<Page> {
@@ -361,6 +371,10 @@ impl PageStore {
                 if *lsn > max_lsn {
                     max_lsn = *lsn;
                 }
+            }
+            #[cfg(test)]
+            if self.fail_next_checkpoint_sync.swap(false, Ordering::AcqRel) {
+                return Err(std::io::Error::other("injected checkpoint sync failure").into());
             }
             pf.sync().await?;
         }

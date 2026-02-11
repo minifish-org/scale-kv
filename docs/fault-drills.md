@@ -17,6 +17,9 @@ Path: `/Users/yusp/work/scale-kv/src/node.rs`
   - Verifies:
     - data is recoverable after restart
     - `durable_lsn` is monotonic across restart.
+- `test_checkpoint_sync_failure_is_reported_and_recovers`
+  - Injects checkpoint sync failure (disk-write-failure class drill).
+  - Verifies error is surfaced and a subsequent checkpoint succeeds.
 
 ## Existing quorum/failure coverage
 
@@ -37,7 +40,13 @@ Path: `/Users/yusp/work/scale-kv/tests/quorum_commit_e2e.rs`
 - `test_connect_fails_if_reachable_nodes_below_quorum`
   - Verifies startup fails fast when reachable replicas are below quorum.
 
+Path: `/Users/yusp/work/scale-kv/tests/txn_kv.rs`
+
+- `test_quorum_staggered_restart_preserves_latest_value`
+  - Simulates staged restart where one replica is temporarily out of the write path.
+  - Verifies rejoining full set still serves the latest quorum-committed value.
+
 ## Next drills to add
 
 - Disk full during checkpoint file sync.
-- Restart ordering matrix (staggered restart of multiple replicas).
+- Multi-step restart ordering with explicit stop/start control for RPC servers.

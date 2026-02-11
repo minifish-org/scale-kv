@@ -2297,6 +2297,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_checkpoint_sync_failure_is_reported_and_recovers() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
+
+        let page = make_page(4);
+        node.put(4, &page);
+
+        node.page_store().inject_fail_next_checkpoint_sync();
+        let err = node.checkpoint().await.unwrap_err();
+        assert!(format!("{err}").contains("injected checkpoint sync failure"));
+
+        // Next checkpoint should recover and persist normally.
+        node.checkpoint().await.unwrap();
+        drop(node);
+
+        let reopened = StorageNode::open(&dir).await.unwrap();
+        let got = reopened.get(4).await.unwrap();
+        assert_eq!(got[0], 4);
+        drop(reopened);
+        cleanup_dir(&dir).await;
+    }
+
+    #[tokio::test]
     async fn test_wal_backpressure_under_tight_byte_limit() {
         let dir = temp_dir().await;
         let mut maintenance = StorageMaintenanceConfig::default();
