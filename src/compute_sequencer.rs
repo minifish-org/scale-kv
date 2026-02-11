@@ -1,4 +1,4 @@
-use crate::{Error, Result, StorageClient, StorageQuorumClient};
+use crate::{Error, Result, StorageClient};
 use futures::future::join_all;
 use rand;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,14 +22,32 @@ impl ComputeSequencer {
             return Err(Error::InvalidKeySize(0, 1));
         }
         let quorum = quorum.max(1).min(addrs.len());
-
-        let qc = StorageQuorumClient::connect(addrs, quorum, local).await?;
-        let durable = qc.quorum_durable_lsn().await?;
-
         let mut clients = Vec::with_capacity(addrs.len());
+        let mut errs = Vec::new();
         for addr in addrs {
-            clients.push(StorageClient::connect(addr, local).await?);
+            match StorageClient::connect(addr, local).await {
+                Ok(c) => clients.push(c),
+                Err(e) => errs.push(format!("{addr}: {e}")),
+            }
         }
+        if clients.len() < quorum {
+            let msg = format!(
+                "not enough reachable storage nodes: reachable={} required={} (errors: {})",
+                clients.len(),
+                quorum,
+                errs.join(" | ")
+            );
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                msg,
+            )));
+        }
+        let mut lsns = Vec::with_capacity(clients.len());
+        for c in &clients {
+            lsns.push(c.get_durable_lsn().await?);
+        }
+        lsns.sort_unstable_by(|a, b| b.cmp(a));
+        let durable = *lsns.get(quorum - 1).unwrap_or(&0);
 
         let seed = {
             // Avoid request_id collisions across compute restarts.

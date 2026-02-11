@@ -14,6 +14,14 @@ fn tcp_bind_allowed() -> bool {
     std::net::TcpListener::bind("127.0.0.1:0").is_ok()
 }
 
+fn unreachable_addr() -> String {
+    // Reserve a port then drop the listener; address should be unreachable for immediate connect.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe port");
+    let addr = listener.local_addr().expect("probe addr");
+    drop(listener);
+    addr.to_string()
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -210,4 +218,71 @@ async fn test_quorum_commit_fails_when_quorum_requires_backpressured_node() {
     cleanup_dir(&dir1);
     cleanup_dir(&dir2);
     cleanup_dir(&dir3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_connect_allows_unreachable_nodes_if_quorum_reachable() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir1 = temp_dir("connect-ok-s1");
+    let dir2 = temp_dir("connect-ok-s2");
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let s1 = StorageServer::start_with_dir(addr, dir1.clone())
+                .await
+                .unwrap();
+            let s2 = StorageServer::start_with_dir(addr, dir2.clone())
+                .await
+                .unwrap();
+            let dead = unreachable_addr();
+
+            let addrs = vec![s1.addr().to_string(), s2.addr().to_string(), dead];
+            let seq = ComputeSequencer::connect(&addrs, 2, &local).await.unwrap();
+            let mut page = vec![0u8; PAGE_SIZE];
+            page[0] = 33;
+            let commit = seq.commit_txn_batch(vec![(333, page)]).await.unwrap();
+            assert!(commit > 0);
+        })
+        .await;
+
+    cleanup_dir(&dir1);
+    cleanup_dir(&dir2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_connect_fails_if_reachable_nodes_below_quorum() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir1 = temp_dir("connect-fail-s1");
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let s1 = StorageServer::start_with_dir(addr, dir1.clone())
+                .await
+                .unwrap();
+            let dead1 = unreachable_addr();
+            let dead2 = unreachable_addr();
+
+            let addrs = vec![s1.addr().to_string(), dead1, dead2];
+            let err = match ComputeSequencer::connect(&addrs, 2, &local).await {
+                Ok(_) => panic!("expected connect failure"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("not enough reachable storage nodes")
+            );
+        })
+        .await;
+
+    cleanup_dir(&dir1);
 }

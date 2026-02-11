@@ -31,6 +31,11 @@ Path: `/Users/yusp/work/scale-kv/tests/quorum_commit_e2e.rs`
 - `test_quorum_commit_fails_when_quorum_requires_backpressured_node`
   - Same fault model, but quorum=3.
   - Verifies commit fails with quorum-not-reached.
+- `test_connect_allows_unreachable_nodes_if_quorum_reachable`
+  - Start with one unreachable address in replica list.
+  - Verifies sequencer can still start and commit when reachable replicas meet quorum.
+- `test_connect_fails_if_reachable_nodes_below_quorum`
+  - Verifies startup fails fast when reachable replicas are below quorum.
 
 ## Next drills to add
 

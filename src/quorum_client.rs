@@ -16,8 +16,24 @@ impl StorageQuorumClient {
         }
         let quorum = quorum.max(1).min(addrs.len());
         let mut clients = Vec::with_capacity(addrs.len());
+        let mut errs = Vec::new();
         for addr in addrs {
-            clients.push(StorageClient::connect(addr, local).await?);
+            match StorageClient::connect(addr, local).await {
+                Ok(c) => clients.push(c),
+                Err(e) => errs.push(format!("{addr}: {e}")),
+            }
+        }
+        if clients.len() < quorum {
+            let msg = format!(
+                "not enough reachable storage nodes: reachable={} required={} (errors: {})",
+                clients.len(),
+                quorum,
+                errs.join(" | ")
+            );
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                msg,
+            )));
         }
         Ok(Self { clients, quorum })
     }
