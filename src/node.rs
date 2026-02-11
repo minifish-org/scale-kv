@@ -26,6 +26,112 @@ pub struct StorageMaintenanceConfig {
     pub mvcc_gc_every_wal_batches: usize,
 }
 
+#[derive(Debug, Default)]
+struct StorageMetricsInner {
+    wal_backpressure_count: std::sync::atomic::AtomicU64,
+    checkpoint_runs: std::sync::atomic::AtomicU64,
+    checkpoint_total_duration_ms: std::sync::atomic::AtomicU64,
+    checkpoint_last_duration_ms: std::sync::atomic::AtomicU64,
+    gc_runs: std::sync::atomic::AtomicU64,
+    gc_versions_removed_total: std::sync::atomic::AtomicU64,
+    gc_last_duration_ms: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone, Debug)]
+pub struct StorageMetricsSnapshot {
+    pub wal_segments: usize,
+    pub wal_bytes: u64,
+    pub wal_backpressure_count: u64,
+    pub checkpoint_runs: u64,
+    pub checkpoint_total_duration_ms: u64,
+    pub checkpoint_last_duration_ms: u64,
+    pub gc_runs: u64,
+    pub gc_versions_removed_total: u64,
+    pub gc_last_duration_ms: u64,
+    pub mvcc_keys: usize,
+    pub mvcc_versions: usize,
+    pub mvcc_avg_versions_per_key: f64,
+    pub active_reads: usize,
+    pub page_cache_resident_pages: usize,
+    pub page_cache_hits: u64,
+    pub page_cache_misses: u64,
+}
+
+impl StorageMetricsSnapshot {
+    pub fn render_prometheus(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("scale_kv_wal_segments {}\n", self.wal_segments));
+        out.push_str(&format!("scale_kv_wal_bytes {}\n", self.wal_bytes));
+        out.push_str(&format!(
+            "scale_kv_wal_backpressure_count {}\n",
+            self.wal_backpressure_count
+        ));
+        out.push_str(&format!(
+            "scale_kv_checkpoint_runs_total {}\n",
+            self.checkpoint_runs
+        ));
+        out.push_str(&format!(
+            "scale_kv_checkpoint_duration_ms_total {}\n",
+            self.checkpoint_total_duration_ms
+        ));
+        out.push_str(&format!(
+            "scale_kv_checkpoint_duration_ms_last {}\n",
+            self.checkpoint_last_duration_ms
+        ));
+        out.push_str(&format!("scale_kv_gc_runs_total {}\n", self.gc_runs));
+        out.push_str(&format!(
+            "scale_kv_gc_versions_removed_total {}\n",
+            self.gc_versions_removed_total
+        ));
+        out.push_str(&format!(
+            "scale_kv_gc_duration_ms_last {}\n",
+            self.gc_last_duration_ms
+        ));
+        out.push_str(&format!("scale_kv_mvcc_keys {}\n", self.mvcc_keys));
+        out.push_str(&format!("scale_kv_mvcc_versions {}\n", self.mvcc_versions));
+        out.push_str(&format!(
+            "scale_kv_mvcc_versions_per_key {}\n",
+            self.mvcc_avg_versions_per_key
+        ));
+        out.push_str(&format!("scale_kv_active_reads {}\n", self.active_reads));
+        out.push_str(&format!(
+            "scale_kv_page_cache_resident_pages {}\n",
+            self.page_cache_resident_pages
+        ));
+        out.push_str(&format!(
+            "scale_kv_page_cache_hits {}\n",
+            self.page_cache_hits
+        ));
+        out.push_str(&format!(
+            "scale_kv_page_cache_misses {}\n",
+            self.page_cache_misses
+        ));
+        out
+    }
+
+    pub fn render_json(&self) -> String {
+        format!(
+            "{{\"wal\":{{\"segments\":{},\"bytes\":{},\"backpressure_count\":{}}},\"checkpoint\":{{\"runs\":{},\"duration_ms_total\":{},\"duration_ms_last\":{}}},\"gc\":{{\"runs\":{},\"versions_removed_total\":{},\"duration_ms_last\":{}}},\"mvcc\":{{\"keys\":{},\"versions\":{},\"avg_versions_per_key\":{:.3},\"active_reads\":{}}},\"cache\":{{\"resident_pages\":{},\"hits\":{},\"misses\":{}}}}}",
+            self.wal_segments,
+            self.wal_bytes,
+            self.wal_backpressure_count,
+            self.checkpoint_runs,
+            self.checkpoint_total_duration_ms,
+            self.checkpoint_last_duration_ms,
+            self.gc_runs,
+            self.gc_versions_removed_total,
+            self.gc_last_duration_ms,
+            self.mvcc_keys,
+            self.mvcc_versions,
+            self.mvcc_avg_versions_per_key,
+            self.active_reads,
+            self.page_cache_resident_pages,
+            self.page_cache_hits,
+            self.page_cache_misses
+        )
+    }
+}
+
 impl Default for StorageMaintenanceConfig {
     fn default() -> Self {
         Self {
@@ -106,6 +212,7 @@ pub struct StorageNode {
     active_reads: Arc<ActiveReads>,
     maintenance: StorageMaintenanceConfig,
     wal_limit_guard: Mutex<()>,
+    metrics: Arc<StorageMetricsInner>,
 }
 
 #[derive(Debug)]
@@ -649,12 +756,45 @@ fn gc_mvcc_versions(
 async fn maybe_checkpoint_by_pressure(
     page_store: &Arc<PageStore>,
     maintenance: &StorageMaintenanceConfig,
+    metrics: &Arc<StorageMetricsInner>,
 ) -> Result<bool> {
     let stats = page_store.buffer_stats();
     let over_pages = stats.dirty_count > maintenance.checkpoint.max_dirty_pages;
     let over_bytes = stats.dirty_bytes > maintenance.checkpoint.max_dirty_bytes;
     if over_pages || over_bytes {
-        page_store.checkpoint().await?;
+        checkpoint_with_metrics(page_store, metrics).await?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+async fn checkpoint_with_metrics(
+    page_store: &Arc<PageStore>,
+    metrics: &Arc<StorageMetricsInner>,
+) -> Result<()> {
+    let started = Instant::now();
+    page_store.checkpoint().await?;
+    let ms = started.elapsed().as_millis() as u64;
+    metrics
+        .checkpoint_runs
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .checkpoint_total_duration_ms
+        .fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+    metrics
+        .checkpoint_last_duration_ms
+        .store(ms, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+async fn maybe_checkpoint_with_config(
+    page_store: &Arc<PageStore>,
+    config: &CheckpointConfig,
+    metrics: &Arc<StorageMetricsInner>,
+) -> Result<bool> {
+    if page_store.should_checkpoint(config) {
+        checkpoint_with_metrics(page_store, metrics).await?;
         Ok(true)
     } else {
         Ok(false)
@@ -708,6 +848,7 @@ async fn wal_replay_loop(
     active_reads: Arc<ActiveReads>,
     durable_lsn: Arc<std::sync::atomic::AtomicU64>,
     maintenance: StorageMaintenanceConfig,
+    metrics: Arc<StorageMetricsInner>,
 ) {
     let mut buffers: HashMap<PageId, ReplayBuffer> = HashMap::new();
     let mut gc_batch_counter = 0usize;
@@ -750,7 +891,7 @@ async fn wal_replay_loop(
             }
         }
 
-        let _ = maybe_checkpoint_by_pressure(&replay.page_store, &maintenance).await;
+        let _ = maybe_checkpoint_by_pressure(&replay.page_store, &maintenance, &metrics).await;
         if maintenance.truncate_wal {
             let checkpoint_lsn = replay.page_store.checkpoint_lsn();
             let _ = truncate_wal_segments(&replay.dir, checkpoint_lsn).await;
@@ -770,10 +911,22 @@ async fn wal_replay_loop(
             gc_batch_counter = 0;
             let durable = durable_lsn.load(std::sync::atomic::Ordering::Acquire);
             let watermark = active_reads.min_read_lsn().unwrap_or(durable).min(durable);
+            let started = Instant::now();
             let (keys_touched, versions_removed) = {
                 let mut store = mvcc.lock().unwrap();
                 gc_mvcc_versions(&mut store, watermark)
             };
+            let ms = started.elapsed().as_millis() as u64;
+            metrics
+                .gc_runs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics.gc_versions_removed_total.fetch_add(
+                versions_removed as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            metrics
+                .gc_last_duration_ms
+                .store(ms, std::sync::atomic::Ordering::Relaxed);
             if versions_removed > 0 {
                 eprintln!(
                     "[mvcc-gc] watermark={} keys_touched={} versions_removed={}",
@@ -931,6 +1084,7 @@ impl StorageNode {
         let mvcc = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let request_index = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let active_reads = Arc::new(ActiveReads::new());
+        let metrics = Arc::new(StorageMetricsInner::default());
         replay_wal_segments_to_store(
             &dir,
             Arc::clone(&page_store),
@@ -971,6 +1125,7 @@ impl StorageNode {
             active_reads,
             maintenance: maintenance.clone(),
             wal_limit_guard: Mutex::new(()),
+            metrics: Arc::clone(&metrics),
         };
 
         node.start_wal_replay(last_applied_lsn).await;
@@ -1047,6 +1202,63 @@ impl StorageNode {
         self.active_reads.abort(id)
     }
 
+    pub async fn metrics_snapshot(&self) -> StorageMetricsSnapshot {
+        let (wal_segments, wal_bytes) = wal_usage(&self.dir).await.unwrap_or((0, 0));
+        let (mvcc_keys, mvcc_versions) = {
+            let store = self.mvcc.lock().unwrap();
+            let keys = store.len();
+            let versions = store.values().map(std::vec::Vec::len).sum::<usize>();
+            (keys, versions)
+        };
+        let avg_versions = if mvcc_keys == 0 {
+            0.0
+        } else {
+            mvcc_versions as f64 / mvcc_keys as f64
+        };
+        let active_reads = self.active_reads.list().len();
+        let cache_stats = self.page_store.cache_stats();
+
+        StorageMetricsSnapshot {
+            wal_segments,
+            wal_bytes,
+            wal_backpressure_count: self
+                .metrics
+                .wal_backpressure_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            checkpoint_runs: self
+                .metrics
+                .checkpoint_runs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            checkpoint_total_duration_ms: self
+                .metrics
+                .checkpoint_total_duration_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            checkpoint_last_duration_ms: self
+                .metrics
+                .checkpoint_last_duration_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            gc_runs: self
+                .metrics
+                .gc_runs
+                .load(std::sync::atomic::Ordering::Relaxed),
+            gc_versions_removed_total: self
+                .metrics
+                .gc_versions_removed_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            gc_last_duration_ms: self
+                .metrics
+                .gc_last_duration_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+            mvcc_keys,
+            mvcc_versions,
+            mvcc_avg_versions_per_key: avg_versions,
+            active_reads,
+            page_cache_resident_pages: self.page_store.len(),
+            page_cache_hits: cache_stats.hits,
+            page_cache_misses: cache_stats.misses,
+        }
+    }
+
     pub fn mvcc_get(&self, handle: &mut MvccReadHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if handle.is_timed_out() {
             handle.close();
@@ -1085,12 +1297,15 @@ impl StorageNode {
             self.maintenance.max_wal_bytes
         );
 
-        self.page_store.checkpoint().await?;
+        checkpoint_with_metrics(&self.page_store, &self.metrics).await?;
         if self.maintenance.truncate_wal {
             let _ = self.truncate_wal().await?;
         }
 
         if let Some((segments, bytes)) = self.wal_usage_exceeds(incoming_bytes).await? {
+            self.metrics
+                .wal_backpressure_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(crate::Error::Io(Error::new(
                 ErrorKind::WouldBlock,
                 format!(
@@ -1305,6 +1520,7 @@ impl StorageNode {
         let active_reads = Arc::clone(&self.active_reads);
         let durable_lsn = Arc::clone(&self.durable_lsn);
         let maintenance = self.maintenance.clone();
+        let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
             wal_replay_loop(
                 replay,
@@ -1314,13 +1530,14 @@ impl StorageNode {
                 active_reads,
                 durable_lsn,
                 maintenance,
+                metrics,
             )
             .await;
         });
     }
 
     pub async fn checkpoint(&self) -> Result<()> {
-        self.page_store.checkpoint().await
+        checkpoint_with_metrics(&self.page_store, &self.metrics).await
     }
 
     pub fn len(&self) -> usize {
@@ -1361,7 +1578,7 @@ impl StorageNode {
     }
 
     pub async fn compact(&self) -> Result<()> {
-        self.page_store.checkpoint().await
+        checkpoint_with_metrics(&self.page_store, &self.metrics).await
     }
 
     pub async fn truncate_wal(&self) -> Result<usize> {
@@ -1370,7 +1587,7 @@ impl StorageNode {
     }
 
     pub async fn checkpoint_and_truncate(&self) -> Result<usize> {
-        self.page_store.checkpoint().await?;
+        checkpoint_with_metrics(&self.page_store, &self.metrics).await?;
         self.truncate_wal().await
     }
 
@@ -1388,6 +1605,7 @@ impl StorageNode {
     ) -> tokio::task::JoinHandle<()> {
         let page_store = Arc::clone(&self.page_store);
         let dir = self.dir.clone();
+        let metrics = Arc::clone(&self.metrics);
         let poll_interval = config.interval.min(std::time::Duration::from_secs(1));
 
         tokio::spawn(async move {
@@ -1396,12 +1614,16 @@ impl StorageNode {
                 if page_store.is_shutdown() {
                     break;
                 }
-                if page_store.maybe_checkpoint(&config).await.unwrap_or(false) && truncate_wal {
+                if maybe_checkpoint_with_config(&page_store, &config, &metrics)
+                    .await
+                    .unwrap_or(false)
+                    && truncate_wal
+                {
                     let checkpoint_lsn = page_store.checkpoint_lsn();
                     let _ = truncate_wal_segments(&dir, checkpoint_lsn).await;
                 }
             }
-            let _ = page_store.checkpoint().await;
+            let _ = checkpoint_with_metrics(&page_store, &metrics).await;
             if truncate_wal {
                 let checkpoint_lsn = page_store.checkpoint_lsn();
                 let _ = truncate_wal_segments(&dir, checkpoint_lsn).await;
@@ -2024,6 +2246,29 @@ mod tests {
         let segments = list_wal_segments(&dir).await.unwrap();
         assert!(segments.len() <= 2);
 
+        cleanup_dir(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_metrics_snapshot_exposes_core_fields() {
+        let dir = temp_dir().await;
+        let node = StorageNode::open(&dir).await.unwrap();
+
+        let page = make_page(7);
+        node.put(7, &page);
+        let _ = node.get(7).await;
+        let _ = node.get(9999).await;
+        let _ = node.checkpoint().await;
+
+        let metrics = node.metrics_snapshot().await;
+        assert!(metrics.page_cache_hits >= 1);
+        assert!(metrics.page_cache_misses >= 1);
+        assert!(metrics.checkpoint_runs >= 1);
+        assert!(metrics.page_cache_resident_pages >= 1);
+        assert!(!metrics.render_json().is_empty());
+        assert!(!metrics.render_prometheus().is_empty());
+
+        drop(node);
         cleanup_dir(&dir).await;
     }
 }

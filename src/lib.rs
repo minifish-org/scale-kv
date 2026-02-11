@@ -35,7 +35,7 @@ pub mod txn_page_provider;
 pub use txn_page_provider::TxnPageProvider;
 
 pub mod node;
-pub use node::{MvccReadHandle, StorageMaintenanceConfig, StorageNode};
+pub use node::{MvccReadHandle, StorageMaintenanceConfig, StorageMetricsSnapshot, StorageNode};
 
 pub mod client;
 pub use client::StorageClient;

@@ -174,12 +174,20 @@ pub struct BufferStats {
     pub max_lsn: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
 pub struct PageStore {
     dir: PathBuf,
     buffer_pool: RwLock<HashMap<PageId, BufferPage>>,
     page_file: Mutex<PageFile>,
     checkpoint_lsn: AtomicU64,
     max_page_id: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
     last_checkpoint: std::sync::Mutex<Instant>,
     shutdown: AtomicBool,
 }
@@ -205,6 +213,8 @@ impl PageStore {
             page_file: Mutex::new(page_file),
             checkpoint_lsn: AtomicU64::new(checkpoint_lsn),
             max_page_id: AtomicU64::new(max_page_id),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
             last_checkpoint: std::sync::Mutex::new(Instant::now()),
             shutdown: AtomicBool::new(false),
         })
@@ -223,15 +233,25 @@ impl PageStore {
             let mut pool = self.buffer_pool.write().unwrap();
             if let Some(bp) = pool.get_mut(&page_id) {
                 bp.touch();
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Some((bp.data.to_vec(), bp.lsn));
             }
         }
 
         let mut pf = self.page_file.lock().await;
         match pf.read_page(page_id).await {
-            Ok(Some(data)) => Some((data, 0)),
-            Ok(None) => None,
-            Err(_) => None,
+            Ok(Some(data)) => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                Some((data, 0))
+            }
+            Ok(None) => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            Err(_) => {
+                self.cache_misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
         }
     }
 
@@ -304,6 +324,13 @@ impl PageStore {
 
     pub fn checkpoint_lsn(&self) -> u64 {
         self.checkpoint_lsn.load(Ordering::Acquire)
+    }
+
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.cache_hits.load(Ordering::Relaxed),
+            misses: self.cache_misses.load(Ordering::Relaxed),
+        }
     }
 
     pub fn max_page_id(&self) -> PageId {
@@ -595,6 +622,25 @@ mod tests {
         let dir = temp_dir().await;
         let store = PageStore::open(&dir).await.unwrap();
         assert!(store.get(999).await.is_none());
+        let cache = store.cache_stats();
+        assert_eq!(cache.hits, 0);
+        assert_eq!(cache.misses, 1);
+        cleanup_dir(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_cache_hit_miss_stats() {
+        let dir = temp_dir().await;
+        let store = PageStore::open(&dir).await.unwrap();
+
+        let page = make_page(1);
+        store.put(7, &page, 100).unwrap();
+        assert!(store.get(7).await.is_some());
+        assert!(store.get(9999).await.is_none());
+
+        let cache = store.cache_stats();
+        assert!(cache.hits >= 1);
+        assert!(cache.misses >= 1);
         cleanup_dir(&dir).await;
     }
 

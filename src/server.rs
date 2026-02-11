@@ -205,6 +205,10 @@ impl StorageServer {
     pub fn data(&self) -> &StorageNode {
         &self.data
     }
+
+    pub fn data_arc(&self) -> Arc<StorageNode> {
+        Arc::clone(&self.data)
+    }
 }
 
 pub async fn handle_connection(stream: TcpStream, data: Arc<StorageNode>) -> Result<()> {

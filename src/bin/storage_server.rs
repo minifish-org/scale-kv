@@ -42,6 +42,10 @@ fn parse_bool(args: &[String], key: &str) -> Option<bool> {
     }
 }
 
+fn parse_u64_or_default(args: &[String], key: &str, default: u64) -> u64 {
+    parse_u64(args, key).unwrap_or(default)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -80,6 +84,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(v) = parse_usize(&args, "--mvcc-gc-every-wal-batches") {
         maintenance.mvcc_gc_every_wal_batches = v.max(1);
     }
+    let metrics_interval_secs = parse_u64_or_default(&args, "--metrics-interval-secs", 0);
+    let metrics_format = parse_arg(&args, "--metrics-format").unwrap_or_else(|| "json".to_string());
 
     let server =
         StorageServer::start_with_dir_and_maintenance(addr, dir.clone(), maintenance).await?;
@@ -88,6 +94,22 @@ async fn main() -> anyhow::Result<()> {
         server.addr(),
         dir.display()
     );
+    if metrics_interval_secs > 0 {
+        let node = server.data_arc();
+        let fmt = metrics_format.to_ascii_lowercase();
+        tokio::spawn(async move {
+            let interval_secs = metrics_interval_secs.max(1);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+                let snap = node.metrics_snapshot().await;
+                if fmt == "prom" || fmt == "prometheus" {
+                    eprintln!("[metrics]\n{}", snap.render_prometheus());
+                } else {
+                    eprintln!("[metrics] {}", snap.render_json());
+                }
+            }
+        });
+    }
 
     // park forever
     futures::future::pending::<()>().await;
