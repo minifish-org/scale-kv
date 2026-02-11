@@ -68,6 +68,31 @@ fn percentile_us(mut values: Vec<u64>, p: f64) -> u64 {
     values[rank.min(values.len() - 1)]
 }
 
+async fn put_with_retry(compute: &EmbeddedCompute, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
+    const MAX_ATTEMPTS: usize = 12;
+    let mut backoff = Duration::from_millis(1);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match compute.put(key, value).await {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                let msg = err.to_string();
+                let transient_by_text = msg.contains("quorum not reached")
+                    || msg.contains("out of order")
+                    || msg.contains("wal backpressure")
+                    || msg.contains("WouldBlock");
+                if attempt == MAX_ATTEMPTS || (!err.is_retryable() && !transient_by_text) {
+                    return Err(anyhow::anyhow!(
+                        "put failed after {attempt} attempts: {err}"
+                    ));
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_millis(25));
+            }
+        }
+    }
+    Err(anyhow::anyhow!("put failed unexpectedly"))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -135,10 +160,8 @@ async fn main() -> anyhow::Result<()> {
                         } else {
                             // deterministic-ish overwrite pattern to avoid growing key cardinality.
                             let value = value_for((worker_id as u64) << 32 | n as u64);
-                            // Storage currently enforces strict in-order WAL boundaries.
-                            // Serialize writes in the benchmark to keep runs deterministic.
                             let _guard = write_gate.lock().await;
-                            let _ = compute.put(&key, &value).await?;
+                            put_with_retry(&compute, &key, &value).await?;
                             local_writes += 1;
                         }
                         local_lat.push(t0.elapsed().as_micros() as u64);
