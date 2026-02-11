@@ -20,6 +20,8 @@ Type: `EmbeddedCompute` (`/Users/yusp/work/scale-kv/src/embedded_compute.rs`)
 ### Stable
 
 - `connect(addrs, quorum, local) -> Result<EmbeddedCompute>`
+- `begin_ro_timeout(Duration)`
+- `begin_rw_timeout(Duration)`
 - `begin_ro_guard() -> (u64, ReadGuard)`  
   Use for long read snapshots / GC watermark pinning.
 - `begin_rw() -> EmbeddedTxn`
@@ -29,20 +31,15 @@ Type: `EmbeddedCompute` (`/Users/yusp/work/scale-kv/src/embedded_compute.rs`)
 - `warmup_scan_all(limit_per_batch) -> Result<usize>`
 - `gc_once(budget_pages) -> Result<usize>`
 - `durable_lsn() -> u64`
-- `warmed_pages() -> usize`
 
 ### Internal
 
+- `warmed_pages() -> usize`
 - `gc_lsn()` (internal watermark computation)
 - `write_page(...)`
 - `get_page(...)`
 - `cached_page(...)`
 - `EmbeddedTxn::debug_check_mapping(...)`
-
-### Deprecated
-
-- `begin()` (alias of `begin_rw()`)  
-  Keep temporarily for transition; remove in v2.
 
 ## 3. Transaction KV API (Rust)
 
@@ -50,12 +47,15 @@ Type: `TxnManager` (`/Users/yusp/work/scale-kv/src/txn_kv.rs`)
 
 ### Stable
 
-- `open(path)`
 - `open_quorum(replica_paths, quorum)`
 - `open_with_storage(storage)`
 - `checkpoint()`
 - `begin_ro_timeout(Duration)`
 - `begin_rw_timeout(Duration)`
+
+Notes:
+
+- Single-replica mode is `open_quorum(vec![path], 1)`.
 
 Design rule:
 
@@ -120,4 +120,3 @@ Any `Stable` API change requires:
 1. Update this doc.
 2. Add migration note (if behavior changes).
 3. Add/adjust tests that lock contract behavior.
-

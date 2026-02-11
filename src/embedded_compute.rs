@@ -13,6 +13,7 @@ use crate::{
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::LocalSet;
 
@@ -124,7 +125,7 @@ impl EmbeddedCompute {
         Ok(this)
     }
 
-    pub fn begin_ro(&self) -> u64 {
+    pub(crate) fn begin_ro(&self) -> u64 {
         self.sequencer.begin_ro()
     }
 
@@ -146,7 +147,7 @@ impl EmbeddedCompute {
         self.sequencer.durable_lsn()
     }
 
-    pub fn warmed_pages(&self) -> usize {
+    pub(crate) fn warmed_pages(&self) -> usize {
         self.page_cache.len()
     }
 
@@ -190,7 +191,7 @@ impl EmbeddedCompute {
                 break;
             }
         }
-        Ok(self.page_cache.len())
+        Ok(self.warmed_pages())
     }
 
     async fn recover_or_init(&self) -> Result<()> {
@@ -235,7 +236,7 @@ impl EmbeddedCompute {
 
         // Stash these conventions into the page cache for later use (simple approach: store them in meta in next iteration).
 
-        let mut tx = self.begin();
+        let mut tx = self.begin_rw();
 
         // Configure provider root + next_page_id (next after reserved ids).
         let mut tree = self.tree.lock().await;
@@ -277,7 +278,7 @@ impl EmbeddedCompute {
         Ok(())
     }
 
-    fn begin_tx(&self) -> EmbeddedTxn {
+    fn begin_tx(&self, read_only: bool, timeout: Option<Duration>) -> EmbeddedTxn {
         // Clear dirty pages collected by provider from any previous operations.
         let _ = self.provider.take_dirty();
         let read_lsn = self.begin_ro();
@@ -291,6 +292,10 @@ impl EmbeddedCompute {
             compute: self.clone(),
             read_lsn,
             read_guard,
+            started_at: Instant::now(),
+            timeout,
+            read_only,
+            write_attempted: false,
             dirty: BTreeMap::new(),
             ro_cache: BTreeMap::new(),
             modified: Vec::new(),
@@ -300,12 +305,17 @@ impl EmbeddedCompute {
 
     /// Begin a read-write transaction.
     pub fn begin_rw(&self) -> EmbeddedTxn {
-        self.begin_tx()
+        self.begin_tx(false, None)
     }
 
-    /// Backward-compatible alias for `begin_rw()`.
-    pub fn begin(&self) -> EmbeddedTxn {
-        self.begin_rw()
+    /// Begin a read-only transaction with timeout.
+    pub fn begin_ro_timeout(&self, timeout: Duration) -> EmbeddedTxn {
+        self.begin_tx(true, Some(timeout))
+    }
+
+    /// Begin a read-write transaction with timeout.
+    pub fn begin_rw_timeout(&self, timeout: Duration) -> EmbeddedTxn {
+        self.begin_tx(false, Some(timeout))
     }
 
     /// Convenience: write a single page after-image in its own txn.
@@ -372,7 +382,7 @@ impl EmbeddedCompute {
         const DATA_BASE: PageId = 1_000_000;
         let end = meta.next_data_page_id;
 
-        let mut tx = self.begin();
+        let mut tx = self.begin_rw();
 
         // Load FSM meta (best-effort). If missing, we can still GC but won't update FSM hints.
         let fsm_meta = match tx.get_page_for_read(crate::fsm_pg::FSM_META_PAGE_ID).await {
@@ -559,6 +569,10 @@ pub struct EmbeddedTxn {
     read_lsn: u64,
     // Keeps this txn's snapshot active for GC watermarking.
     read_guard: Option<ReadGuard>,
+    started_at: Instant,
+    timeout: Option<Duration>,
+    read_only: bool,
+    write_attempted: bool,
 
     dirty: BTreeMap<PageId, Page>,
     ro_cache: BTreeMap<PageId, Page>,
@@ -576,7 +590,20 @@ impl Drop for EmbeddedTxn {
 }
 
 impl EmbeddedTxn {
+    fn ensure_not_timed_out(&self) -> Result<()> {
+        if let Some(timeout) = self.timeout
+            && self.started_at.elapsed() > timeout
+        {
+            return Err(Error::TxnTimeout);
+        }
+        Ok(())
+    }
+
     pub fn write_page(&mut self, page_id: PageId, page: Page) {
+        if self.read_only {
+            self.write_attempted = true;
+            return;
+        }
         // Stage into txn-local dirty map.
         self.dirty.insert(page_id, page.clone());
         // Also update shared page_cache so helper subsystems (e.g. FSM hint tree)
@@ -917,6 +944,13 @@ impl EmbeddedTxn {
     }
 
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.ensure_not_timed_out()?;
+        if self.read_only {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "read-only transaction",
+            )));
+        }
         // Read existing mapping first.
         let existing = {
             let tree = self.compute.tree.lock().await;
@@ -960,6 +994,7 @@ impl EmbeddedTxn {
     }
 
     pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.ensure_not_timed_out()?;
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
@@ -1056,6 +1091,13 @@ impl EmbeddedTxn {
     }
 
     pub async fn delete(&mut self, key: &[u8]) -> Result<()> {
+        self.ensure_not_timed_out()?;
+        if self.read_only {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "read-only transaction",
+            )));
+        }
         // Find slotref (if any).
         let existing = {
             let tree = self.compute.tree.lock().await;
@@ -1106,6 +1148,18 @@ impl EmbeddedTxn {
     }
 
     pub async fn commit(mut self) -> Result<u64> {
+        self.ensure_not_timed_out()?;
+        if self.read_only {
+            let wrote = self.write_attempted || !self.dirty.is_empty() || !self.modified.is_empty();
+            let _ = self.read_guard.take();
+            if wrote {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "read-only transaction",
+                )));
+            }
+            return Ok(self.read_lsn);
+        }
         // Also persist meta page updates for next_page_id/root.
         let tree = self.compute.tree.lock().await;
         let old_meta_bytes = if let Some(p) = self.dirty.get(&META_PAGE_ID) {

@@ -164,7 +164,11 @@ impl QuorumStorage {
         let replicas = paths
             .into_iter()
             .map(|path| QuorumReplica {
-                wal_path: path.join("wal.log"),
+                wal_path: if path.file_name().and_then(|name| name.to_str()) == Some("wal.log") {
+                    path
+                } else {
+                    path.join("wal.log")
+                },
                 storage: Mutex::new(None),
             })
             .collect::<Vec<_>>();
@@ -385,11 +389,6 @@ pub struct Txn {
 }
 
 impl TxnManager {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let storage = LocalFileStorage::open(path)?;
-        Self::open_with_storage(storage)
-    }
-
     pub fn open_quorum(replica_paths: Vec<PathBuf>, quorum: usize) -> Result<Self> {
         let storage = QuorumStorage::open(replica_paths, quorum)?;
         Self::open_with_storage(storage)
@@ -856,7 +855,7 @@ mod tests {
     fn test_wal_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wal.log");
-        let manager = TxnManager::open(&path).unwrap();
+        let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
         let mut tx = manager.begin_rw_timeout(Duration::from_secs(30));
         tx.put(&key(1), b"v1").unwrap();
         tx.delete(&key(2)).unwrap();
@@ -864,7 +863,7 @@ mod tests {
         assert!(ts > 0);
         drop(manager);
 
-        let manager = TxnManager::open(&path).unwrap();
+        let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
         let tx = manager.begin_ro_timeout(Duration::from_secs(30));
         assert_eq!(tx.get(&key(1)).unwrap(), Some(b"v1".to_vec()));
         assert_eq!(tx.get(&key(2)).unwrap(), None);
@@ -874,7 +873,7 @@ mod tests {
     fn test_txn_timeout() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wal.log");
-        let manager = TxnManager::open(&path).unwrap();
+        let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
         let mut tx = manager.begin_rw_timeout(Duration::from_millis(1));
         thread::sleep(Duration::from_millis(5));
         let err = tx.put(&key(1), b"v1").unwrap_err();

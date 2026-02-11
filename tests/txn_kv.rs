@@ -21,7 +21,7 @@ fn value(byte: u8) -> Vec<u8> {
 fn test_snapshot_reads() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open(&path).unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
 
     let mut tx1 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx1.put(&key(1), &value(1)).unwrap();
@@ -40,7 +40,7 @@ fn test_snapshot_reads() {
 fn test_write_write_conflict() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open(&path).unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
 
     let mut tx1 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     let mut tx2 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
@@ -57,7 +57,7 @@ fn test_write_write_conflict() {
 fn test_delete_visibility() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open(&path).unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
 
     let mut tx1 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx1.put(&key(3), &value(3)).unwrap();
@@ -79,7 +79,7 @@ fn test_delete_visibility() {
 fn test_multi_key_atomicity() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open(&path).unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
 
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(4), &value(4)).unwrap();
@@ -101,14 +101,14 @@ fn test_recovery_from_wal() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
     {
-        let manager = TxnManager::open(&path).unwrap();
+        let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
         let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
         tx.put(&key(6), &value(6)).unwrap();
         tx.put(&key(7), &value(7)).unwrap();
         tx.commit().unwrap();
     }
 
-    let manager = TxnManager::open(&path).unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
     let tx = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx.get(&key(6)).unwrap(), Some(value(6)));
     assert_eq!(tx.get(&key(7)).unwrap(), Some(value(7)));
@@ -119,7 +119,7 @@ fn test_checkpoint_and_recovery() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
     {
-        let manager = TxnManager::open(&path).unwrap();
+        let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
         let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
         tx.put(&key(10), &value(10)).unwrap();
         tx.put(&key(11), &value(11)).unwrap();
@@ -127,7 +127,7 @@ fn test_checkpoint_and_recovery() {
         manager.checkpoint().unwrap();
     }
 
-    let manager = TxnManager::open(&path).unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
     let tx = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx.get(&key(10)).unwrap(), Some(value(10)));
     assert_eq!(tx.get(&key(11)).unwrap(), Some(value(11)));
@@ -137,7 +137,7 @@ fn test_checkpoint_and_recovery() {
 fn test_wal_truncation_reduces_size() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open(&path).unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
 
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(20), &value(20)).unwrap();
@@ -157,7 +157,7 @@ fn test_wal_truncation_reduces_size() {
 fn test_scan_basic_ordering() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open(&path).unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
 
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(3), &value(3)).unwrap();
@@ -175,7 +175,7 @@ fn test_scan_basic_ordering() {
 fn test_scan_respects_snapshot() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open(&path).unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
 
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(1), &value(1)).unwrap();
@@ -198,7 +198,7 @@ fn test_scan_respects_snapshot() {
 fn test_scan_overlays_writes_and_deletes() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open(&path).unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
 
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(1), &value(1)).unwrap();
