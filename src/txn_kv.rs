@@ -16,6 +16,16 @@ const SNAPSHOT_VERSION: u32 = 1;
 
 pub type Key = [u8; KEY_SIZE];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnErrorCategory {
+    InvalidInput,
+    Conflict,
+    Timeout,
+    Backpressure,
+    Unavailable,
+    Internal,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TxnError {
     #[error("io error: {0}")]
@@ -37,6 +47,47 @@ pub enum TxnError {
 }
 
 pub type Result<T> = std::result::Result<T, TxnError>;
+
+impl TxnError {
+    pub fn category(&self) -> TxnErrorCategory {
+        match self {
+            TxnError::InvalidKeySize(_, _)
+            | TxnError::InvalidValueSize(_, _)
+            | TxnError::InvalidQuorum { .. } => TxnErrorCategory::InvalidInput,
+            TxnError::WriteWriteConflict => TxnErrorCategory::Conflict,
+            TxnError::TxnTimeout => TxnErrorCategory::Timeout,
+            TxnError::QuorumNotMet { .. } => TxnErrorCategory::Unavailable,
+            TxnError::CorruptWal(_) => TxnErrorCategory::Internal,
+            TxnError::Io(err) => match err.kind() {
+                std::io::ErrorKind::InvalidInput => TxnErrorCategory::InvalidInput,
+                std::io::ErrorKind::WouldBlock => TxnErrorCategory::Backpressure,
+                std::io::ErrorKind::TimedOut => TxnErrorCategory::Timeout,
+                std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::AddrInUse
+                | std::io::ErrorKind::AddrNotAvailable
+                | std::io::ErrorKind::NetworkDown
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::HostUnreachable => TxnErrorCategory::Unavailable,
+                _ => TxnErrorCategory::Internal,
+            },
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self.category(),
+            TxnErrorCategory::Timeout
+                | TxnErrorCategory::Backpressure
+                | TxnErrorCategory::Unavailable
+                | TxnErrorCategory::Conflict
+        )
+    }
+}
 
 pub trait TxnStorage: Send + Sync + std::fmt::Debug {
     fn load_snapshot(&self) -> Result<Option<(BTreeMap<Key, Vec<Version>>, u64)>>;
@@ -878,5 +929,16 @@ mod tests {
         thread::sleep(Duration::from_millis(5));
         let err = tx.put(&key(1), b"v1").unwrap_err();
         assert!(matches!(err, TxnError::TxnTimeout));
+    }
+
+    #[test]
+    fn test_txn_error_category_and_retryable() {
+        let err = TxnError::WriteWriteConflict;
+        assert_eq!(err.category(), TxnErrorCategory::Conflict);
+        assert!(err.is_retryable());
+
+        let err = TxnError::InvalidKeySize(1, KEY_SIZE);
+        assert_eq!(err.category(), TxnErrorCategory::InvalidInput);
+        assert!(!err.is_retryable());
     }
 }

@@ -55,4 +55,4 @@ pub mod embedded_compute;
 pub use embedded_compute::{EmbeddedCompute, EmbeddedTxn};
 
 pub mod txn_kv;
-pub use txn_kv::{Txn, TxnError, TxnManager};
+pub use txn_kv::{Txn, TxnError, TxnErrorCategory, TxnManager};

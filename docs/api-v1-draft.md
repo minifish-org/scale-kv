@@ -110,6 +110,15 @@ External callers should treat these as stable categories:
 - Conflict (`WriteWriteConflict`)
 - Timeout (`TxnTimeout`)
 - IO/backpressure (`WouldBlock` on WAL pressure)
+- Unavailable (quorum not met / network-level transient failures)
+- Internal (corruption or unexpected local state)
+
+Programmatic classification helpers:
+
+- `scale_kv::Error::category() -> ErrorCategory`
+- `scale_kv::Error::is_retryable() -> bool`
+- `scale_kv::TxnError::category() -> TxnErrorCategory`
+- `scale_kv::TxnError::is_retryable() -> bool`
 
 Error text is not a stable contract; error kind/category is.
 
