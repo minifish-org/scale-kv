@@ -45,6 +45,9 @@ Backpressure policy:
 
 - if WAL exceeds threshold, force checkpoint + truncate
 - if still above threshold, reject with `WouldBlock` until pressure drops
+- tune WAL group commit:
+  - increase `wal_group_commit_max_batches` for throughput
+  - increase `wal_group_commit_wait_us` modestly to improve fsync amortization (at latency cost)
 
 ## Cache model
 

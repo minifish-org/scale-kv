@@ -84,6 +84,12 @@ async fn main() -> anyhow::Result<()> {
     if let Some(v) = parse_usize(&args, "--mvcc-gc-every-wal-batches") {
         maintenance.mvcc_gc_every_wal_batches = v.max(1);
     }
+    if let Some(v) = parse_usize(&args, "--wal-group-max-batches") {
+        maintenance.wal_group_commit_max_batches = v.max(1);
+    }
+    if let Some(v) = parse_u64(&args, "--wal-group-wait-us") {
+        maintenance.wal_group_commit_wait_us = v;
+    }
     let metrics_interval_secs = parse_u64_or_default(&args, "--metrics-interval-secs", 0);
     let metrics_format = parse_arg(&args, "--metrics-format").unwrap_or_else(|| "json".to_string());
 

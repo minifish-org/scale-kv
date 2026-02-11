@@ -43,3 +43,9 @@ Path: `/Users/yusp/work/scale-kv/src/bin/storage_server.rs`
 - zero WAL max bytes
 - zero WAL max segments
 - zero MVCC GC batch interval
+- zero WAL group-commit max batches
+
+WAL group commit tuning knobs:
+
+- `wal_group_commit_max_batches`
+- `wal_group_commit_wait_us`

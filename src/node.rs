@@ -24,6 +24,8 @@ pub struct StorageMaintenanceConfig {
     pub max_wal_bytes: u64,
     pub max_wal_segments: usize,
     pub mvcc_gc_every_wal_batches: usize,
+    pub wal_group_commit_max_batches: usize,
+    pub wal_group_commit_wait_us: u64,
 }
 
 #[derive(Debug, Default)]
@@ -140,6 +142,8 @@ impl Default for StorageMaintenanceConfig {
             max_wal_bytes: 512 * 1024 * 1024, // 512MB
             max_wal_segments: 64,
             mvcc_gc_every_wal_batches: 128,
+            wal_group_commit_max_batches: 64,
+            wal_group_commit_wait_us: 200,
         }
     }
 }
@@ -182,19 +186,27 @@ impl StorageMaintenanceConfig {
                 "mvcc_gc_every_wal_batches must be > 0",
             )));
         }
+        if self.wal_group_commit_max_batches == 0 {
+            return Err(crate::Error::Io(Error::new(
+                ErrorKind::InvalidInput,
+                "wal_group_commit_max_batches must be > 0",
+            )));
+        }
         Ok(())
     }
 
     pub fn render_json(&self) -> String {
         format!(
-            "{{\"checkpoint\":{{\"interval_secs\":{},\"max_dirty_pages\":{},\"max_dirty_bytes\":{}}},\"truncate_wal\":{},\"max_wal_bytes\":{},\"max_wal_segments\":{},\"mvcc_gc_every_wal_batches\":{}}}",
+            "{{\"checkpoint\":{{\"interval_secs\":{},\"max_dirty_pages\":{},\"max_dirty_bytes\":{}}},\"truncate_wal\":{},\"max_wal_bytes\":{},\"max_wal_segments\":{},\"mvcc_gc_every_wal_batches\":{},\"wal_group_commit_max_batches\":{},\"wal_group_commit_wait_us\":{}}}",
             self.checkpoint.interval.as_secs_f64(),
             self.checkpoint.max_dirty_pages,
             self.checkpoint.max_dirty_bytes,
             self.truncate_wal,
             self.max_wal_bytes,
             self.max_wal_segments,
-            self.mvcc_gc_every_wal_batches
+            self.mvcc_gc_every_wal_batches,
+            self.wal_group_commit_max_batches,
+            self.wal_group_commit_wait_us
         )
     }
 }
@@ -427,6 +439,12 @@ struct WalWriter {
     size: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WalWriterConfig {
+    max_group_commit_batches: usize,
+    group_commit_wait_us: u64,
+}
+
 struct WalState {
     last_applied_lsn: u64,
 }
@@ -602,10 +620,11 @@ fn wal_batch_encoded_len(batch: &WalBatch) -> u64 {
 async fn start_wal_writer(
     dir: PathBuf,
     durable_lsn: Arc<std::sync::atomic::AtomicU64>,
+    cfg: WalWriterConfig,
 ) -> Result<(Sender<WalWriteRequest>, Receiver<WalBatch>)> {
     let (tx, rx) = mpsc::channel::<WalWriteRequest>(1024);
     let (replay_tx, replay_rx) = mpsc::channel::<WalBatch>(1024);
-    tokio::spawn(wal_writer_loop(dir, durable_lsn, rx, replay_tx));
+    tokio::spawn(wal_writer_loop(dir, durable_lsn, rx, replay_tx, cfg));
     Ok((tx, replay_rx))
 }
 
@@ -614,18 +633,34 @@ async fn wal_writer_loop(
     durable_lsn: Arc<std::sync::atomic::AtomicU64>,
     mut rx: Receiver<WalWriteRequest>,
     replay_tx: Sender<WalBatch>,
+    cfg: WalWriterConfig,
 ) {
-    const MAX_GROUP_COMMIT_BATCH: usize = 64;
     let mut writer = match WalWriter::open(dir).await {
         Ok(writer) => writer,
         Err(_) => return,
     };
     while let Some(req) = rx.recv().await {
         let mut pending = vec![req];
-        while pending.len() < MAX_GROUP_COMMIT_BATCH {
-            match rx.try_recv() {
-                Ok(next) => pending.push(next),
-                Err(_) => break,
+        if cfg.group_commit_wait_us == 0 {
+            while pending.len() < cfg.max_group_commit_batches {
+                match rx.try_recv() {
+                    Ok(next) => pending.push(next),
+                    Err(_) => break,
+                }
+            }
+        } else {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_micros(cfg.group_commit_wait_us);
+            while pending.len() < cfg.max_group_commit_batches {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                match tokio::time::timeout(remaining, rx.recv()).await {
+                    Ok(Some(next)) => pending.push(next),
+                    _ => break,
+                }
             }
         }
 
@@ -1163,8 +1198,12 @@ impl StorageNode {
         let durable_lsn = Arc::new(std::sync::atomic::AtomicU64::new(durable_init));
         let next_lsn = Arc::new(std::sync::atomic::AtomicU64::new(durable_init));
 
+        let wal_cfg = WalWriterConfig {
+            max_group_commit_batches: maintenance.wal_group_commit_max_batches,
+            group_commit_wait_us: maintenance.wal_group_commit_wait_us,
+        };
         let (wal_sender, wal_replay_rx) =
-            start_wal_writer(dir.clone(), durable_lsn.clone()).await?;
+            start_wal_writer(dir.clone(), durable_lsn.clone(), wal_cfg).await?;
 
         let applied_lsn = Arc::new(std::sync::atomic::AtomicU64::new(recovered_last_applied));
         let applied_notify = Arc::new(tokio::sync::Notify::new());
