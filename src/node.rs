@@ -1094,20 +1094,26 @@ impl StorageNode {
             &request_index,
         )
         .await?;
+        let wal_state_after_replay = read_wal_state(&dir)
+            .await
+            .unwrap_or(WalState { last_applied_lsn });
+        let recovered_last_applied = wal_state_after_replay
+            .last_applied_lsn
+            .max(last_applied_lsn);
         let rebuilt_index = build_page_index(&page_store).await;
         *page_index.lock().unwrap() = rebuilt_index;
 
         // Initialize durable_lsn and next_lsn from the last applied point.
         // We treat `durable_lsn` as the right boundary (exclusive): all records with lsn < durable_lsn are durable.
         // NOTE: in the quorum design, durable_lsn should reflect quorum-durable; for now it's local.
-        let durable_init = last_applied_lsn.saturating_add(1);
+        let durable_init = recovered_last_applied.saturating_add(1);
         let durable_lsn = Arc::new(std::sync::atomic::AtomicU64::new(durable_init));
         let next_lsn = Arc::new(std::sync::atomic::AtomicU64::new(durable_init));
 
         let (wal_sender, wal_replay_rx) =
             start_wal_writer(dir.clone(), durable_lsn.clone()).await?;
 
-        let applied_lsn = Arc::new(std::sync::atomic::AtomicU64::new(last_applied_lsn));
+        let applied_lsn = Arc::new(std::sync::atomic::AtomicU64::new(recovered_last_applied));
         let applied_notify = Arc::new(tokio::sync::Notify::new());
 
         let node = Self {
@@ -1128,7 +1134,7 @@ impl StorageNode {
             metrics: Arc::clone(&metrics),
         };
 
-        node.start_wal_replay(last_applied_lsn).await;
+        node.start_wal_replay(recovered_last_applied).await;
         Ok(node)
     }
 
@@ -2267,6 +2273,59 @@ mod tests {
         assert!(metrics.page_cache_resident_pages >= 1);
         assert!(!metrics.render_json().is_empty());
         assert!(!metrics.render_prometheus().is_empty());
+
+        drop(node);
+        cleanup_dir(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_wal_backpressure_under_tight_byte_limit() {
+        let dir = temp_dir().await;
+        let mut maintenance = StorageMaintenanceConfig::default();
+        maintenance.max_wal_bytes = 1;
+        maintenance.max_wal_segments = usize::MAX;
+        maintenance.truncate_wal = false;
+
+        let node = StorageNode::open_with_maintenance(&dir, maintenance)
+            .await
+            .unwrap();
+        let start = node.durable_lsn();
+        let page = make_page(9);
+        let err = node
+            .append_txn_batch_with_lsn_sync(1, start, start + 1, vec![(99, page)])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::Io(ref ioe) if ioe.kind() == ErrorKind::WouldBlock));
+
+        let metrics = node.metrics_snapshot().await;
+        assert!(metrics.wal_backpressure_count >= 1);
+
+        drop(node);
+        cleanup_dir(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn test_restart_preserves_data_and_durable_lsn_monotonic() {
+        let dir = temp_dir().await;
+
+        let commit_lsn = {
+            let node = StorageNode::open(&dir).await.unwrap();
+            let start = node.durable_lsn();
+            let page = make_page(5);
+            let commit = node
+                .append_txn_batch_with_lsn_sync(10, start, start + 1, vec![(55, page)])
+                .await
+                .unwrap();
+            assert_eq!(commit, start + 1);
+            drop(node);
+            commit
+        };
+
+        let node = StorageNode::open(&dir).await.unwrap();
+        let durable_after_restart = node.durable_lsn();
+        assert!(durable_after_restart >= commit_lsn);
+        let got = node.get(55).await.unwrap();
+        assert_eq!(got[0], 5);
 
         drop(node);
         cleanup_dir(&dir).await;
