@@ -131,7 +131,6 @@ async fn main() -> anyhow::Result<()> {
             let load_s = load_start.elapsed().as_secs_f64();
 
             let stats = Arc::new(Mutex::new(RunStats::default()));
-            let write_gate = Arc::new(Mutex::new(()));
             let bench_start = Instant::now();
 
             let mut handles = Vec::with_capacity(cfg.concurrency);
@@ -140,7 +139,6 @@ async fn main() -> anyhow::Result<()> {
             for worker_id in 0..cfg.concurrency {
                 let compute = compute.clone();
                 let stats = Arc::clone(&stats);
-                let write_gate = Arc::clone(&write_gate);
                 let worker_ops = if worker_id < rem { base + 1 } else { base };
                 let records = cfg.records as u64;
                 let read_ratio = cfg.read_ratio;
@@ -160,7 +158,6 @@ async fn main() -> anyhow::Result<()> {
                         } else {
                             // deterministic-ish overwrite pattern to avoid growing key cardinality.
                             let value = value_for((worker_id as u64) << 32 | n as u64);
-                            let _guard = write_gate.lock().await;
                             put_with_retry(&compute, &key, &value).await?;
                             local_writes += 1;
                         }

@@ -1,7 +1,9 @@
 use crate::{Error, Result, StorageClient};
 use futures::future::join_all;
 use rand;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Notify;
 use tokio::task::LocalSet;
 
 /// Compute-side sequencer.
@@ -11,9 +13,11 @@ use tokio::task::LocalSet;
 pub struct ComputeSequencer {
     clients: Vec<StorageClient>,
     quorum: usize,
-    next_lsn: AtomicU64,    // exclusive right boundary
-    request_id: AtomicU64,  // per-sequencer request id generator
-    durable_lsn: AtomicU64, // quorum-durable right boundary cache
+    next_lsn: AtomicU64,     // exclusive right boundary
+    request_id: AtomicU64,   // per-sequencer request id generator
+    durable_lsn: AtomicU64,  // quorum-durable right boundary cache
+    dispatch_lsn: AtomicU64, // next start_lsn allowed to dispatch
+    dispatch_notify: Arc<Notify>,
 }
 
 impl ComputeSequencer {
@@ -62,6 +66,8 @@ impl ComputeSequencer {
             next_lsn: AtomicU64::new(durable),
             request_id: AtomicU64::new(seed),
             durable_lsn: AtomicU64::new(durable),
+            dispatch_lsn: AtomicU64::new(durable),
+            dispatch_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -122,6 +128,24 @@ impl ComputeSequencer {
         end_lsn: u64,
         writes: Vec<(u64, Vec<u8>)>,
     ) -> Result<u64> {
+        // Enforce global dispatch order by reserved LSN range.
+        loop {
+            let cur = self.dispatch_lsn.load(Ordering::Acquire);
+            if cur == start_lsn {
+                break;
+            }
+            if start_lsn < cur {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "stale reserved range: start_lsn={} dispatch_lsn={}",
+                        start_lsn, cur
+                    ),
+                )));
+            }
+            self.dispatch_notify.notified().await;
+        }
+
         // Fan-out to all storage nodes.
         let futs = self
             .clients
@@ -153,6 +177,8 @@ impl ComputeSequencer {
         }
 
         if acks.len() < self.quorum {
+            self.dispatch_lsn.store(end_lsn, Ordering::Release);
+            self.dispatch_notify.notify_waiters();
             let mut msg = format!(
                 "quorum not reached: acks={} quorum={}",
                 acks.len(),
@@ -181,6 +207,8 @@ impl ComputeSequencer {
         acks.sort_unstable_by(|a, b| b.cmp(a));
         let quorum_durable = acks[self.quorum - 1];
         self.durable_lsn.fetch_max(quorum_durable, Ordering::AcqRel);
+        self.dispatch_lsn.store(end_lsn, Ordering::Release);
+        self.dispatch_notify.notify_waiters();
 
         Ok(end_lsn)
     }

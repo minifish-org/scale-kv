@@ -286,3 +286,52 @@ async fn test_connect_fails_if_reachable_nodes_below_quorum() {
 
     cleanup_dir(&dir1);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_concurrent_commits_preserve_lsn_order() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir1 = temp_dir("order-s1");
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let s1 = StorageServer::start_with_dir(addr, dir1.clone())
+                .await
+                .unwrap();
+            let addrs = vec![s1.addr().to_string()];
+            let seq =
+                std::sync::Arc::new(ComputeSequencer::connect(&addrs, 1, &local).await.unwrap());
+
+            let mut p1 = vec![0u8; PAGE_SIZE];
+            p1[0] = 1;
+            let mut p2 = vec![0u8; PAGE_SIZE];
+            p2[0] = 2;
+
+            let s1 = std::sync::Arc::clone(&seq);
+            let t1 =
+                tokio::task::spawn_local(
+                    async move { s1.commit_txn_batch(vec![(1001, p1)]).await },
+                );
+            let s2 = std::sync::Arc::clone(&seq);
+            let t2 =
+                tokio::task::spawn_local(
+                    async move { s2.commit_txn_batch(vec![(1002, p2)]).await },
+                );
+
+            let r1 = t1.await.unwrap().unwrap();
+            let r2 = t2.await.unwrap().unwrap();
+            assert!(r1 > 0 && r2 > 0);
+
+            let c = scale_kv::StorageClient::connect(&addrs[0], &local)
+                .await
+                .unwrap();
+            let d = c.get_durable_lsn().await.unwrap();
+            assert!(d >= r1.max(r2));
+        })
+        .await;
+
+    cleanup_dir(&dir1);
+}
