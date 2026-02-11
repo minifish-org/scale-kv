@@ -74,3 +74,7 @@ This generates:
 - `artifacts/perf-baseline-<timestamp>.md`
 - matrix table (ratio/concurrency/throughput/latency)
 - best-throughput summary per read ratio
+
+Latest committed snapshot:
+
+- `/Users/yusp/work/scale-kv/docs/performance-baseline-snapshot-2026-02-12.md`
