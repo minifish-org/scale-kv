@@ -29,8 +29,6 @@ pub mod slotted_page;
 pub mod undo_pg;
 pub use undo_pg::{UNDO_RECORD_SIZE, UndoPtr};
 
-pub mod fsm_pg;
-
 pub mod txn_page_provider;
 pub use txn_page_provider::TxnPageProvider;
 
