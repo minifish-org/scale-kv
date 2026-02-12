@@ -1,4 +1,4 @@
-use crate::page_bptree::{AsyncPageProvider, PageCache};
+use crate::page_bptree::{AsyncPageProvider, PageCache, PageLatchTable};
 use crate::{Page, PageId};
 use futures::future::LocalBoxFuture;
 use std::collections::BTreeMap;
@@ -94,5 +94,9 @@ impl AsyncPageProvider for TxnPageProvider {
         let page = meta.encode();
         self.pages.insert(self.btree_meta_page_id, page.clone());
         self.record_dirty(self.btree_meta_page_id, &page);
+    }
+
+    fn page_latch_table(&self) -> Arc<PageLatchTable> {
+        self.pages.latch_table()
     }
 }

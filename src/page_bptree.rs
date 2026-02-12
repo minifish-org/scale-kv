@@ -1,13 +1,15 @@
 use crate::{Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, VALUE_SIZE, undo_pg::UndoPtr};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use hex;
 
 const PAGE_TYPE_INTERNAL: u8 = 1;
 const PAGE_TYPE_LEAF: u8 = 2;
+const ROOT_LATCH_PAGE_ID: PageId = 0;
 
 const HIGH_KEY_SIZE: usize = KEY_SIZE;
 const HEADER_SIZE: usize = 48; // padded header
@@ -24,6 +26,48 @@ const HEADER_SIZE: usize = 48; // padded header
 const OFFSET_ENTRY_SIZE: usize = 2;
 pub const LEAF_VALUE_SIZE: usize = VALUE_SIZE + 8 + 8 + 2 + 2 + 8 + 8;
 const CHILD_ID_SIZE: usize = 8;
+const DEFAULT_LATCH_SHARDS: usize = 256;
+
+pub type PageReadLatchGuard = OwnedRwLockReadGuard<()>;
+pub type PageWriteLatchGuard = OwnedRwLockWriteGuard<()>;
+
+#[derive(Debug)]
+pub struct PageLatchTable {
+    shards: Vec<std::sync::Mutex<HashMap<PageId, Arc<RwLock<()>>>>>,
+}
+
+impl PageLatchTable {
+    pub fn new(shards: usize) -> Self {
+        let count = shards.max(1);
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(std::sync::Mutex::new(HashMap::new()));
+        }
+        Self { shards: out }
+    }
+
+    fn shard(&self, page_id: PageId) -> usize {
+        (page_id as usize) % self.shards.len()
+    }
+
+    fn latch_for(&self, page_id: PageId) -> Arc<RwLock<()>> {
+        let idx = self.shard(page_id);
+        let mut shard = self.shards[idx].lock().unwrap();
+        Arc::clone(
+            shard
+                .entry(page_id)
+                .or_insert_with(|| Arc::new(RwLock::new(()))),
+        )
+    }
+
+    pub async fn acquire_read(&self, page_id: PageId) -> PageReadLatchGuard {
+        self.latch_for(page_id).read_owned().await
+    }
+
+    pub async fn acquire_write(&self, page_id: PageId) -> PageWriteLatchGuard {
+        self.latch_for(page_id).write_owned().await
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeafValue {
@@ -55,6 +99,19 @@ pub trait AsyncPageProvider {
 
     /// Set the root page ID.
     fn set_root_page_id(&self, page_id: PageId);
+
+    fn page_latch_table(&self) -> Arc<PageLatchTable> {
+        static FALLBACK: OnceLock<Arc<PageLatchTable>> = OnceLock::new();
+        Arc::clone(FALLBACK.get_or_init(|| Arc::new(PageLatchTable::new(DEFAULT_LATCH_SHARDS))))
+    }
+
+    async fn acquire_read_latch(&self, page_id: PageId) -> PageReadLatchGuard {
+        self.page_latch_table().acquire_read(page_id).await
+    }
+
+    async fn acquire_write_latch(&self, page_id: PageId) -> PageWriteLatchGuard {
+        self.page_latch_table().acquire_write(page_id).await
+    }
 }
 
 /// In-memory page provider using HashMap with RefCell for interior mutability.
@@ -63,6 +120,7 @@ pub struct InMemoryPageProvider {
     pages: RefCell<HashMap<PageId, Page>>,
     next_page_id: AtomicU64,
     root: AtomicU64,
+    latch_table: Arc<PageLatchTable>,
 }
 
 impl InMemoryPageProvider {
@@ -71,6 +129,7 @@ impl InMemoryPageProvider {
             pages: RefCell::new(HashMap::new()),
             next_page_id: AtomicU64::new(1),
             root: AtomicU64::new(0),
+            latch_table: Arc::new(PageLatchTable::new(DEFAULT_LATCH_SHARDS)),
         }
     }
 
@@ -105,12 +164,17 @@ impl AsyncPageProvider for InMemoryPageProvider {
     fn set_root_page_id(&self, page_id: PageId) {
         self.root.store(page_id, Ordering::Relaxed);
     }
+
+    fn page_latch_table(&self) -> Arc<PageLatchTable> {
+        Arc::clone(&self.latch_table)
+    }
 }
 
 pub const DEFAULT_PAGE_CACHE_SHARDS: usize = 64;
 
 pub struct PageCache {
     shards: Vec<std::sync::Mutex<lru::LruCache<PageId, Page>>>,
+    latches: Arc<PageLatchTable>,
 }
 
 impl PageCache {
@@ -131,7 +195,10 @@ impl PageCache {
         for _ in 0..count {
             out.push(std::sync::Mutex::new(lru::LruCache::new(per)));
         }
-        Self { shards: out }
+        Self {
+            shards: out,
+            latches: Arc::new(PageLatchTable::new(count)),
+        }
     }
 
     fn shard(&self, page_id: PageId) -> usize {
@@ -164,14 +231,27 @@ impl PageCache {
             .map(|shard| shard.lock().unwrap().len())
             .sum()
     }
+
+    pub fn latch_table(&self) -> Arc<PageLatchTable> {
+        Arc::clone(&self.latches)
+    }
+
+    pub async fn acquire_read_latch(&self, page_id: PageId) -> PageReadLatchGuard {
+        self.latches.acquire_read(page_id).await
+    }
+
+    pub async fn acquire_write_latch(&self, page_id: PageId) -> PageWriteLatchGuard {
+        self.latches.acquire_write(page_id).await
+    }
 }
 
 /// Shared page provider that wraps Arc<RwLock<HashMap>>.
 /// Used by ComputeNode to share page_cache between B+Tree and data pages.
+#[derive(Clone)]
 pub struct SharedPageProvider {
     pages: Arc<PageCache>,
     next_page_id: Arc<AtomicU64>,
-    root: AtomicU64,
+    root: Arc<AtomicU64>,
 }
 
 impl SharedPageProvider {
@@ -179,7 +259,7 @@ impl SharedPageProvider {
         Self {
             pages,
             next_page_id,
-            root: AtomicU64::new(0),
+            root: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -207,6 +287,10 @@ impl AsyncPageProvider for SharedPageProvider {
 
     fn set_root_page_id(&self, page_id: PageId) {
         self.root.store(page_id, Ordering::Relaxed);
+    }
+
+    fn page_latch_table(&self) -> Arc<PageLatchTable> {
+        self.pages.latch_table()
     }
 }
 
@@ -279,192 +363,142 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     }
 
     pub async fn get(&self, key: &[u8]) -> Option<LeafValue> {
-        let (mut leaf_id, _) = self.find_leaf(key).await;
-
-        // High-key correction: if key is above this leaf's range, follow next_leaf.
-        loop {
-            let page = self.provider.read_page(leaf_id).await?;
-            if page_header(&page).page_type != PAGE_TYPE_LEAF {
-                break;
-            }
-            if let Some(hk) = page_header(&page).high_key {
-                if key > hk.as_slice() {
-                    if let Some(next) = page_header(&page).next_leaf {
-                        leaf_id = next;
-                        continue;
+        for _ in 0..8 {
+            let mut leaf_id = self.find_leaf_for_read(key).await?;
+            loop {
+                let _leaf_guard = self.provider.acquire_read_latch(leaf_id).await;
+                let page = self.provider.read_page(leaf_id).await?;
+                let header = page_header(&page);
+                if header.page_type != PAGE_TYPE_LEAF {
+                    break;
+                }
+                if let Some(hk) = header.high_key {
+                    if key > hk.as_slice() {
+                        if let Some(next) = header.next_leaf {
+                            leaf_id = next;
+                            continue;
+                        }
+                        break;
                     }
                 }
+                return find_in_leaf(&page, key);
             }
-            return find_in_leaf(&page, key);
         }
-
         None
     }
 
+    /// Locking protocol:
+    /// - Writers use top-down split-before-descend with write-latch coupling.
+    /// - The parent is always write-latched while splitting a full child.
+    /// - We never upgrade a child lock to parent, avoiding upgrade deadlocks.
+    /// Not handled yet: merge/rebalance on delete, range/key gap locks, and full phantom protection.
     pub async fn insert(&mut self, key: Vec<u8>, leaf_value: LeafValue) -> Result<()> {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
-        let (leaf_id, stack) = self.find_leaf(&key).await;
-        let mut leaf = self.provider.read_page(leaf_id).await.unwrap();
-        let header = leaf_page_header(&leaf);
-        let (found, pos) = match find_key_pos(&leaf, &key) {
-            Some(result) => result,
-            None => (false, 0),
-        };
         let encoded = encode_leaf_value(&leaf_value);
+        let root_guard = self.provider.acquire_write_latch(ROOT_LATCH_PAGE_ID).await;
+        self.ensure_root_not_full().await?;
+        let mut current_id = self.provider.root_page_id();
+        let mut current_guard = self.provider.acquire_write_latch(current_id).await;
+        drop(root_guard);
 
-        if found {
-            let offset = entry_offset_at(&leaf, pos)
-                .ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
-            let value_offset = offset + KEY_SIZE;
-            leaf[value_offset..value_offset + LEAF_VALUE_SIZE].copy_from_slice(&encoded);
-            self.provider.write_page(leaf_id, leaf).await;
+        loop {
+            let mut current_page = self
+                .provider
+                .read_page(current_id)
+                .await
+                .ok_or_else(|| Error::InvalidPageSize(current_id as usize, PAGE_SIZE))?;
+            let current_header = page_header(&current_page);
 
-            return Ok(());
-        }
+            if current_header.page_type == PAGE_TYPE_LEAF {
+                let (found, pos) = find_key_pos(&current_page, &key).unwrap_or((false, 0));
+                if found {
+                    let offset = entry_offset_at(&current_page, pos)
+                        .ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
+                    let value_offset = offset + KEY_SIZE;
+                    current_page[value_offset..value_offset + LEAF_VALUE_SIZE]
+                        .copy_from_slice(&encoded);
+                    self.provider.write_page(current_id, current_page).await;
+                    drop(current_guard);
+                    return Ok(());
+                }
 
-        let total = header.key_count as usize + 1;
-        let size = HEADER_SIZE + total * OFFSET_ENTRY_SIZE + total * entry_size(PAGE_TYPE_LEAF);
-        if size <= PAGE_SIZE {
-            let rebuilt = rebuild_page_with_insert(&leaf, header, pos, &key, &encoded)?;
-            self.provider.write_page(leaf_id, rebuilt).await;
-            self.len += 1;
-
-            return Ok(());
-        }
-
-        let mut entries = collect_entries(&leaf);
-        entries.insert(pos, (key, encoded));
-        let (separator, pages) = split_leaf(&leaf, &entries)?;
-        let right_id = self.provider.alloc_page_id();
-        let mut left_page = pages.0;
-        let mut right_page = pages.1;
-
-        // Wire sibling links.
-        let old_header = leaf_page_header(&leaf);
-
-        {
-            let mut left_header = leaf_page_header(&left_page);
-            left_header.next_leaf = Some(right_id);
-            left_header.prev_leaf = old_header.prev_leaf;
-            write_header(&mut left_page, left_header);
-        }
-        {
-            let mut right_header = leaf_page_header(&right_page);
-            right_header.prev_leaf = Some(leaf_id);
-            right_header.next_leaf = old_header.next_leaf;
-            write_header(&mut right_page, right_header);
-        }
-
-        // Fix successor's prev pointer if there was an old next.
-        if let Some(next_id) = old_header.next_leaf {
-            if let Some(mut next_page) = self.provider.read_page(next_id).await {
-                let mut nh = leaf_page_header(&next_page);
-                nh.prev_leaf = Some(right_id);
-                write_header(&mut next_page, nh);
-                self.provider.write_page(next_id, next_page).await;
+                let rebuilt =
+                    rebuild_page_with_insert(&current_page, current_header, pos, &key, &encoded)?;
+                self.provider.write_page(current_id, rebuilt).await;
+                self.len += 1;
+                drop(current_guard);
+                return Ok(());
             }
+
+            let child_pos = child_insert_pos_for_key(&current_page, current_header, &key);
+            let child_id = child_id_at_pos(&current_page, current_header, child_pos);
+            let child_guard = self.provider.acquire_write_latch(child_id).await;
+            let child_page = self
+                .provider
+                .read_page(child_id)
+                .await
+                .ok_or_else(|| Error::InvalidPageSize(child_id as usize, PAGE_SIZE))?;
+            let child_header = page_header(&child_page);
+
+            if page_is_full_for_insert(child_header) {
+                if !page_has_room_for_one_more(current_header) {
+                    return Err(Error::InvalidPageSize(current_id as usize, PAGE_SIZE));
+                }
+
+                let (separator, right_id) = self
+                    .split_child_and_update_parent(
+                        current_id,
+                        current_page,
+                        current_header,
+                        child_id,
+                        child_page,
+                        child_header,
+                        child_pos,
+                    )
+                    .await?;
+
+                if key >= separator {
+                    let right_guard = self.provider.acquire_write_latch(right_id).await;
+                    drop(child_guard);
+                    drop(current_guard);
+                    current_id = right_id;
+                    current_guard = right_guard;
+                } else {
+                    drop(current_guard);
+                    current_id = child_id;
+                    current_guard = child_guard;
+                }
+                continue;
+            }
+
+            drop(current_guard);
+            current_id = child_id;
+            current_guard = child_guard;
         }
-
-        self.provider.write_page(leaf_id, left_page).await;
-        self.provider.write_page(right_id, right_page).await;
-        self.len += 1;
-        let r = self
-            .insert_into_parent(leaf_id, right_id, separator, stack)
-            .await;
-
-        r
     }
 
     pub async fn remove(&mut self, key: &[u8]) -> Result<()> {
-        let (leaf_id, mut stack) = self.find_leaf(key).await;
-        let leaf = self.provider.read_page(leaf_id).await.unwrap();
-        let (found, pos) = match find_key_pos(&leaf, key) {
-            Some(result) => result,
-            None => (false, 0),
+        // Merge/rebalance is intentionally deferred. Deletes only remove the key from the leaf.
+        let leaf_id = match self.find_leaf_for_read(key).await {
+            Some(id) => id,
+            None => return Ok(()),
         };
+        let _leaf_guard = self.provider.acquire_write_latch(leaf_id).await;
+        let leaf = match self.provider.read_page(leaf_id).await {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let (found, pos) = find_key_pos(&leaf, key).unwrap_or((false, 0));
         if !found {
             return Ok(());
         }
 
         let header = leaf_page_header(&leaf);
-        let mut rebuilt = rebuild_page_with_remove(&leaf, header, pos)?;
-        self.len = self.len.saturating_sub(1);
-
-        // If this leaf becomes empty and is not the root, delete it from the parent
-        // (no page id reuse) and unlink it from the leaf chain.
-        let mut new_header = leaf_page_header(&rebuilt);
-        if new_header.key_count == 0 && leaf_id != self.provider.root_page_id() {
-            // 1) unlink from leaf chain
-            if let Some(prev_id) = new_header.prev_leaf {
-                if let Some(mut prev_page) = self.provider.read_page(prev_id).await {
-                    let mut ph = leaf_page_header(&prev_page);
-                    ph.next_leaf = new_header.next_leaf;
-                    write_header(&mut prev_page, ph);
-                    self.provider.write_page(prev_id, prev_page).await;
-                }
-            }
-            if let Some(next_id) = new_header.next_leaf {
-                if let Some(mut next_page) = self.provider.read_page(next_id).await {
-                    let mut nh = leaf_page_header(&next_page);
-                    nh.prev_leaf = new_header.prev_leaf;
-                    write_header(&mut next_page, nh);
-                    self.provider.write_page(next_id, next_page).await;
-                }
-            }
-            new_header.prev_leaf = None;
-            write_header(&mut rebuilt, new_header);
-
-            // 2) delete reference from parent (no rebalancing; parent may become sparse)
-            if let Some(parent_id) = stack.pop() {
-                if let Some(mut parent) = self.provider.read_page(parent_id).await {
-                    let ph = page_header(&parent);
-                    if ph.page_type == PAGE_TYPE_INTERNAL {
-                        let mut child_index = None;
-                        if ph.left_child == leaf_id {
-                            child_index = Some(0usize);
-                        } else {
-                            for idx in 0..ph.key_count as usize {
-                                let v = entry_value_at(&parent, idx).unwrap();
-                                if decode_child_id(v) == leaf_id {
-                                    child_index = Some(idx + 1);
-                                    break;
-                                }
-                            }
-                        }
-
-                        if let Some(j) = child_index {
-                            let mut entries = collect_entries(&parent);
-                            let mut new_ph = ph;
-                            if j == 0 {
-                                // remove left_child: promote child1 to left_child, drop entry0
-                                if !entries.is_empty() {
-                                    new_ph.left_child = decode_child_id(&entries[0].1);
-                                    entries.remove(0);
-                                }
-                            } else {
-                                // remove entry(j-1), which points to child j
-                                if j - 1 < entries.len() {
-                                    entries.remove(j - 1);
-                                }
-                            }
-
-                            // If this was the root and now has 0 keys, collapse root to its only child.
-                            if parent_id == self.provider.root_page_id() && entries.is_empty() {
-                                let new_root = new_ph.left_child;
-                                self.provider.set_root_page_id(new_root);
-                            } else {
-                                encode_entries(&mut parent, &entries, new_ph)?;
-                                self.provider.write_page(parent_id, parent).await;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        let rebuilt = rebuild_page_with_remove(&leaf, header, pos)?;
         self.provider.write_page(leaf_id, rebuilt).await;
+        self.len = self.len.saturating_sub(1);
         Ok(())
     }
 
@@ -479,7 +513,9 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     }
 
     pub async fn debug_leaf_keys(&self, key: &[u8], limit: usize) -> Vec<Vec<u8>> {
-        let (leaf_id, _) = self.find_leaf(key).await;
+        let Some(leaf_id) = self.find_leaf_for_read(key).await else {
+            return Vec::new();
+        };
         let page = match self.provider.read_page(leaf_id).await {
             Some(p) => p,
             None => return Vec::new(),
@@ -499,7 +535,9 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     }
 
     pub async fn debug_leaf_entries(&self, key: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let (leaf_id, _) = self.find_leaf(key).await;
+        let Some(leaf_id) = self.find_leaf_for_read(key).await else {
+            return Vec::new();
+        };
         let page = match self.provider.read_page(leaf_id).await {
             Some(p) => p,
             None => return Vec::new(),
@@ -528,10 +566,13 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         end: &[u8],
         mut f: impl FnMut(&[u8], LeafValue) -> bool,
     ) {
-        let (mut leaf_id, _) = self.find_leaf(start).await;
+        let Some(mut leaf_id) = self.find_leaf_for_read(start).await else {
+            return;
+        };
 
         // Same high-key correction as point lookup.
         loop {
+            let _leaf_guard = self.provider.acquire_read_latch(leaf_id).await;
             let page = match self.provider.read_page(leaf_id).await {
                 Some(page) => page,
                 None => break,
@@ -550,6 +591,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
 
         let mut current = Some(leaf_id);
         while let Some(page_id) = current {
+            let _page_guard = self.provider.acquire_read_latch(page_id).await;
             let page = match self.provider.read_page(page_id).await {
                 Some(page) => page,
                 None => break,
@@ -582,108 +624,119 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         }
     }
 
-    async fn find_leaf(&self, key: &[u8]) -> (PageId, Vec<PageId>) {
+    async fn find_leaf_for_read(&self, key: &[u8]) -> Option<PageId> {
         let mut current = self.provider.root_page_id();
-        let mut stack = Vec::new();
+        let mut current_guard = self.provider.acquire_read_latch(current).await;
         loop {
-            let page = self.provider.read_page(current).await.unwrap();
+            let page = self.provider.read_page(current).await?;
             let header = page_header(&page);
             if header.page_type == PAGE_TYPE_LEAF {
-                return (current, stack);
+                drop(current_guard);
+                return Some(current);
             }
-            stack.push(current);
-            let mut lo = 0usize;
-            let mut hi = header.key_count as usize;
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                let mid_key = entry_key_at(&page, mid).unwrap();
-                if key < mid_key {
-                    hi = mid;
-                } else {
-                    lo = mid + 1;
-                }
-            }
-            let child = if lo == 0 {
-                header.left_child
-            } else {
-                let value = entry_value_at(&page, lo - 1).unwrap();
-                decode_child_id(value)
-            };
+            let child =
+                child_id_at_pos(&page, header, child_insert_pos_for_key(&page, header, key));
+            let child_guard = self.provider.acquire_read_latch(child).await;
+            drop(current_guard);
             current = child;
+            current_guard = child_guard;
         }
     }
 
-    async fn insert_into_parent(
-        &mut self,
-        left_id: PageId,
-        right_id: PageId,
-        separator: Vec<u8>,
-        mut stack: Vec<PageId>,
-    ) -> Result<()> {
-        // Iterative climb to avoid async recursion.
-        let mut left_id = left_id;
-        let mut right_id = right_id;
-        let mut separator = separator;
-
-        loop {
-            if stack.is_empty() {
-                let mut root = new_page(PAGE_TYPE_INTERNAL, 1);
-                let mut header = page_header(&root);
-                header.left_child = left_id;
-                let entries = vec![(separator, encode_child_id(right_id))];
-                encode_entries(&mut root, &entries, header)?;
-                let root_id = self.provider.alloc_page_id();
-                self.provider.write_page(root_id, root).await;
-                self.provider.set_root_page_id(root_id);
-                return Ok(());
-            }
-
-            let parent_id = stack.pop().unwrap();
-            let parent = self.provider.read_page(parent_id).await.unwrap();
-            let header = page_header(&parent);
-
-            // Find insertion position for (separator -> right_id), immediately after left_id.
-            let mut pos = if header.left_child == left_id {
-                0
-            } else {
-                usize::MAX
-            };
-            if pos == usize::MAX {
-                let key_count = header.key_count as usize;
-                for idx in 0..key_count {
-                    let value = entry_value_at(&parent, idx).unwrap();
-                    if decode_child_id(value) == left_id {
-                        pos = idx + 1;
-                        break;
-                    }
-                }
-                if pos == usize::MAX {
-                    pos = header.key_count as usize;
-                }
-            }
-
-            let total = header.key_count as usize + 1;
-            let size =
-                HEADER_SIZE + total * OFFSET_ENTRY_SIZE + total * entry_size(PAGE_TYPE_INTERNAL);
-            if size <= PAGE_SIZE {
-                let encoded = encode_child_id(right_id);
-                let rebuilt = rebuild_page_with_insert(&parent, header, pos, &separator, &encoded)?;
-                self.provider.write_page(parent_id, rebuilt).await;
-                return Ok(());
-            }
-
-            // Split parent, then continue climbing with the new (parent_id, new_right_id, sep).
-            let mut entries = collect_entries(&parent);
-            entries.insert(pos, (separator, encode_child_id(right_id)));
-            let (sep, right_page) = split_internal(&parent, &entries)?;
-            let new_right_id = self.provider.alloc_page_id();
-            self.provider.write_page(parent_id, right_page.0).await;
-            self.provider.write_page(new_right_id, right_page.1).await;
-
-            left_id = parent_id;
-            right_id = new_right_id;
-            separator = sep;
+    async fn ensure_root_not_full(&self) -> Result<()> {
+        let root_id = self.provider.root_page_id();
+        let _root_guard = self.provider.acquire_write_latch(root_id).await;
+        let root = self
+            .provider
+            .read_page(root_id)
+            .await
+            .ok_or_else(|| Error::InvalidPageSize(root_id as usize, PAGE_SIZE))?;
+        let root_header = page_header(&root);
+        if !page_is_full_for_insert(root_header) {
+            return Ok(());
         }
+
+        let entries = collect_entries(&root);
+        let right_id = self.provider.alloc_page_id();
+        let (separator, mut left_page, mut right_page) = if root_header.page_type == PAGE_TYPE_LEAF
+        {
+            let (separator, (left, right)) = split_leaf(&root, &entries)?;
+            (separator, left, right)
+        } else {
+            let (separator, (left, right)) = split_internal(&root, &entries)?;
+            (separator, left, right)
+        };
+
+        if root_header.page_type == PAGE_TYPE_LEAF {
+            let old_header = leaf_page_header(&root);
+            let mut left_header = leaf_page_header(&left_page);
+            left_header.next_leaf = Some(right_id);
+            left_header.prev_leaf = old_header.prev_leaf;
+            write_header(&mut left_page, left_header);
+
+            let mut right_header = leaf_page_header(&right_page);
+            right_header.prev_leaf = Some(root_id);
+            right_header.next_leaf = old_header.next_leaf;
+            write_header(&mut right_page, right_header);
+        }
+
+        self.provider.write_page(root_id, left_page).await;
+        self.provider.write_page(right_id, right_page).await;
+
+        let mut new_root = new_page(PAGE_TYPE_INTERNAL, root_header.level.saturating_add(1));
+        let mut new_root_header = page_header(&new_root);
+        new_root_header.left_child = root_id;
+        let entries = vec![(separator, encode_child_id(right_id))];
+        encode_entries(&mut new_root, &entries, new_root_header)?;
+        let new_root_id = self.provider.alloc_page_id();
+        self.provider.write_page(new_root_id, new_root).await;
+        self.provider.set_root_page_id(new_root_id);
+        Ok(())
+    }
+
+    async fn split_child_and_update_parent(
+        &self,
+        parent_id: PageId,
+        mut parent_page: Page,
+        parent_header: PageHeader,
+        child_id: PageId,
+        child_page: Page,
+        child_header: PageHeader,
+        child_pos: usize,
+    ) -> Result<(Vec<u8>, PageId)> {
+        let entries = collect_entries(&child_page);
+        let right_id = self.provider.alloc_page_id();
+        let (separator, mut left_page, mut right_page) = if child_header.page_type == PAGE_TYPE_LEAF
+        {
+            let (separator, (left, right)) = split_leaf(&child_page, &entries)?;
+            (separator, left, right)
+        } else {
+            let (separator, (left, right)) = split_internal(&child_page, &entries)?;
+            (separator, left, right)
+        };
+
+        if child_header.page_type == PAGE_TYPE_LEAF {
+            let old_header = leaf_page_header(&child_page);
+            let mut left_header = leaf_page_header(&left_page);
+            left_header.next_leaf = Some(right_id);
+            left_header.prev_leaf = old_header.prev_leaf;
+            write_header(&mut left_page, left_header);
+
+            let mut right_header = leaf_page_header(&right_page);
+            right_header.prev_leaf = Some(child_id);
+            right_header.next_leaf = old_header.next_leaf;
+            write_header(&mut right_page, right_header);
+        }
+
+        self.provider.write_page(child_id, left_page).await;
+        self.provider.write_page(right_id, right_page).await;
+
+        let mut parent_entries = collect_entries(&parent_page);
+        parent_entries.insert(child_pos, (separator.clone(), encode_child_id(right_id)));
+        encode_entries(&mut parent_page, &parent_entries, parent_header)?;
+        self.provider.write_page(parent_id, parent_page).await;
+
+        Ok((separator, right_id))
     }
 }
 
@@ -932,6 +985,43 @@ fn find_key_pos(page: &Page, key: &[u8]) -> Option<(bool, usize)> {
         }
     }
     Some((false, lo))
+}
+
+fn page_has_room_for_one_more(header: PageHeader) -> bool {
+    let total = header.key_count as usize + 1;
+    let size = HEADER_SIZE + total * OFFSET_ENTRY_SIZE + total * entry_size(header.page_type);
+    size <= PAGE_SIZE
+}
+
+fn page_is_full_for_insert(header: PageHeader) -> bool {
+    !page_has_room_for_one_more(header)
+}
+
+fn child_insert_pos_for_key(page: &Page, header: PageHeader, key: &[u8]) -> usize {
+    let mut lo = 0usize;
+    let mut hi = header.key_count as usize;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let Some(mid_key) = entry_key_at(page, mid) else {
+            return lo;
+        };
+        if key < mid_key {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+fn child_id_at_pos(page: &Page, header: PageHeader, pos: usize) -> PageId {
+    if pos == 0 {
+        return header.left_child;
+    }
+    let idx = pos.saturating_sub(1);
+    entry_value_at(page, idx)
+        .map(decode_child_id)
+        .unwrap_or(header.left_child)
 }
 
 fn rebuild_page_with_insert(
@@ -1204,6 +1294,8 @@ mod tests {
     use super::{AsyncPageProvider, InMemoryPageProvider, LeafValue, PageBPlusTree};
     use crate::{KEY_SIZE, VALUE_SIZE};
     use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+    use tokio::task::LocalSet;
 
     fn key_for(i: u32) -> Vec<u8> {
         let mut key = format!("k{:03}", i).into_bytes();
@@ -1339,5 +1431,70 @@ mod tests {
         assert_eq!(tree.get(&key).await, Some(slot));
 
         assert!(pages.len() >= 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_concurrent_inserts_split_safety() {
+        use super::{PageCache, SharedPageProvider};
+        use std::sync::Arc;
+
+        let pages = Arc::new(PageCache::new_with_capacity(8, 256));
+        let next_page_id = Arc::new(AtomicU64::new(1));
+        let provider = SharedPageProvider::new(Arc::clone(&pages), Arc::clone(&next_page_id));
+
+        // Initialize root once; other tree handles share provider state and latch table.
+        let _tree = PageBPlusTree::new_with_provider(provider.clone());
+
+        let workers = 6u32;
+        let per_worker = 180u32;
+        let local = LocalSet::new();
+        let provider_for_tasks = provider.clone();
+
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            local
+                .run_until(async move {
+                    let mut handles = Vec::new();
+                    for worker in 0..workers {
+                        let provider = provider_for_tasks.clone();
+                        handles.push(tokio::task::spawn_local(async move {
+                            let mut tree = PageBPlusTree::with_provider(provider);
+                            for i in 0..per_worker {
+                                let logical = worker * per_worker + i;
+                                let key = key_for(logical);
+                                let slot = LeafValue {
+                                    value: [logical as u8; VALUE_SIZE],
+                                    commit_lsn: logical as u64,
+                                    undo_ptr: None,
+                                    flags: 0,
+                                    intent_txn_id: 0,
+                                    intent_lsn: 0,
+                                };
+                                tree.insert(key, slot).await.unwrap();
+                            }
+                        }));
+                    }
+                    for handle in handles {
+                        handle.await.unwrap();
+                    }
+                })
+                .await;
+        })
+        .await
+        .expect("concurrent insert run timed out (possible deadlock)");
+
+        let tree = PageBPlusTree::with_provider(provider.clone());
+        for logical in 0..(workers * per_worker) {
+            let key = key_for(logical);
+            assert!(
+                tree.get(&key).await.is_some(),
+                "missing key after concurrent split inserts: logical={}",
+                logical
+            );
+        }
+
+        let start = key_for(0);
+        let end = key_for(workers * per_worker - 1);
+        let rows = tree.range(&start, &end).await;
+        assert!(!rows.is_empty());
     }
 }
