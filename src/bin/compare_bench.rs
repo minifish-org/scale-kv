@@ -14,6 +14,7 @@ const REDB_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
 #[derive(Clone, Copy, Debug)]
 enum BackendKind {
     ScaleKv,
+    ScaleKvMem,
     Redb,
 }
 
@@ -38,6 +39,7 @@ struct Config {
     value_size: usize,
     txn_ops: usize,
     scan_len: usize,
+    no_materialize: bool,
     seed: u64,
 }
 
@@ -52,6 +54,7 @@ enum BackendState {
         _server: StorageServer,
         _dir: TempDir,
     },
+    ScaleKvMem,
     Redb {
         _dir: TempDir,
     },
@@ -141,6 +144,7 @@ fn parse_config() -> anyhow::Result<Config> {
         value_size: VALUE_SIZE,
         txn_ops: 16,
         scan_len: 64,
+        no_materialize: false,
         seed: rand::random::<u64>(),
     };
 
@@ -153,8 +157,11 @@ fn parse_config() -> anyhow::Result<Config> {
                 let val = args.get(i).context("missing value for --backend")?;
                 cfg.backend = match val.as_str() {
                     "scale-kv" => BackendKind::ScaleKv,
+                    "scale-kv-mem" => BackendKind::ScaleKvMem,
                     "redb" => BackendKind::Redb,
-                    other => bail!("invalid --backend: {other} (expected scale-kv|redb)"),
+                    other => {
+                        bail!("invalid --backend: {other} (expected scale-kv|scale-kv-mem|redb)")
+                    }
                 };
             }
             "--mode" => {
@@ -233,6 +240,9 @@ fn parse_config() -> anyhow::Result<Config> {
                     .parse::<usize>()
                     .context("invalid --scan-len")?;
             }
+            "--no-materialize" => {
+                cfg.no_materialize = true;
+            }
             "--seed" => {
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     i += 1;
@@ -272,7 +282,9 @@ fn parse_config() -> anyhow::Result<Config> {
     if cfg.scan_len == 0 {
         bail!("--scan-len must be > 0");
     }
-    if matches!(cfg.backend, BackendKind::ScaleKv) && cfg.value_size != VALUE_SIZE {
+    if matches!(cfg.backend, BackendKind::ScaleKv | BackendKind::ScaleKvMem)
+        && cfg.value_size != VALUE_SIZE
+    {
         bail!(
             "scale-kv requires fixed --value-size {} (got {})",
             VALUE_SIZE,
@@ -285,7 +297,7 @@ fn parse_config() -> anyhow::Result<Config> {
 
 fn print_help() {
     println!(
-        "Usage: compare_bench [--backend scale-kv|redb] [--mode put|get|scan] [--clients N] [--duration-secs S] [--keyspace K] \\\n[--preload-keys N] [--preload] [--skip-preload] [--preload-only] [--allow-misses] [--value-size BYTES] [--txn-ops N] [--scan-len N] [--seed [SEED]]"
+        "Usage: compare_bench [--backend scale-kv|scale-kv-mem|redb] [--mode put|get|scan] [--clients N] [--duration-secs S] [--keyspace K] \\\n[--preload-keys N] [--preload] [--skip-preload] [--preload-only] [--allow-misses] [--value-size BYTES] [--txn-ops N] [--scan-len N] [--no-materialize] [--seed [SEED]]\n\nExamples:\n  compare_bench --backend scale-kv --mode get\n  compare_bench --backend scale-kv --mode get --no-materialize\n  compare_bench --backend scale-kv-mem --mode scan --no-materialize\n  compare_bench --backend redb --mode get"
     );
 }
 
@@ -324,6 +336,10 @@ async fn init_backend(
                 },
                 SharedBackend::ScaleKv(compute),
             ))
+        }
+        BackendKind::ScaleKvMem => {
+            let compute = EmbeddedCompute::connect_inprocess(local).await?;
+            Ok((BackendState::ScaleKvMem, SharedBackend::ScaleKv(compute)))
         }
         BackendKind::Redb => {
             let dir = tempfile::tempdir().context("create temp dir for redb")?;
@@ -443,6 +459,7 @@ enum TxnPlan {
 async fn do_scale_get_txn(
     compute: &EmbeddedCompute,
     keys: &[[u8; KEY_SIZE]],
+    no_materialize: bool,
     deadline: Instant,
     retryable_read_errors: &mut u64,
 ) -> anyhow::Result<Option<Duration>> {
@@ -454,7 +471,12 @@ async fn do_scale_get_txn(
 
         let mut tx = compute.begin_ro_timeout(Duration::from_secs(5));
         for key in keys {
-            match tx.get(key).await {
+            let read = if no_materialize {
+                tx.get_exists(key).await.map(|_| ())
+            } else {
+                tx.get(key).await.map(|_| ())
+            };
+            match read {
                 Ok(_) => {}
                 Err(err) if is_retryable_backpressure(&err) => {
                     *retryable_read_errors += 1;
@@ -472,6 +494,7 @@ async fn do_scale_get_txn(
 async fn do_scale_scan_txn(
     compute: &EmbeddedCompute,
     ranges: &[([u8; KEY_SIZE], [u8; KEY_SIZE], usize)],
+    no_materialize: bool,
     deadline: Instant,
     retryable_read_errors: &mut u64,
 ) -> anyhow::Result<Option<Duration>> {
@@ -483,7 +506,16 @@ async fn do_scale_scan_txn(
 
         let mut tx = compute.begin_ro_timeout(Duration::from_secs(5));
         for (range_start, range_end, limit) in ranges {
-            match tx.scan_range(range_start, range_end, *limit).await {
+            let read = if no_materialize {
+                tx.scan_range_exists_count(range_start, range_end, *limit)
+                    .await
+                    .map(|_| ())
+            } else {
+                tx.scan_range(range_start, range_end, *limit)
+                    .await
+                    .map(|_| ())
+            };
+            match read {
                 Ok(_) => {}
                 Err(err) if is_retryable_backpressure(&err) => {
                     *retryable_read_errors += 1;
@@ -617,6 +649,7 @@ async fn run_workers(backend: SharedBackend, cfg: &Config) -> anyhow::Result<Wor
         let value_size = cfg.value_size;
         let worker_seed = cfg.seed ^ ((worker as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15));
         let worker_deadline = deadline;
+        let no_materialize = cfg.no_materialize;
 
         join_handles.push(tokio::task::spawn_local(async move {
             let mut rng = StdRng::seed_from_u64(worker_seed);
@@ -670,6 +703,7 @@ async fn run_workers(backend: SharedBackend, cfg: &Config) -> anyhow::Result<Wor
                         do_scale_get_txn(
                             compute,
                             &keys,
+                            no_materialize,
                             worker_deadline,
                             &mut stats.retryable_read_errors,
                         )
@@ -679,6 +713,7 @@ async fn run_workers(backend: SharedBackend, cfg: &Config) -> anyhow::Result<Wor
                         do_scale_scan_txn(
                             compute,
                             &ranges,
+                            no_materialize,
                             worker_deadline,
                             &mut stats.retryable_read_errors,
                         )
@@ -730,6 +765,7 @@ async fn run_workers(backend: SharedBackend, cfg: &Config) -> anyhow::Result<Wor
 fn backend_name(backend: BackendKind) -> &'static str {
     match backend {
         BackendKind::ScaleKv => "scale-kv",
+        BackendKind::ScaleKvMem => "scale-kv-mem",
         BackendKind::Redb => "redb",
     }
 }
@@ -747,7 +783,7 @@ async fn run(cfg: Config, local: &LocalSet) -> anyhow::Result<()> {
     if cfg.preload_only {
         println!("backend={}", backend_name(cfg.backend));
         println!(
-            "config mode={} clients={} duration_secs={} keyspace={} preload_keys={} preload={} preload_only={} allow_misses={} value_size={} txn_ops={} scan_len={} seed={}",
+            "config mode={} clients={} duration_secs={} keyspace={} preload_keys={} preload={} preload_only={} allow_misses={} value_size={} txn_ops={} scan_len={} no_materialize={} seed={}",
             mode_name(cfg.mode),
             cfg.clients,
             cfg.duration_secs,
@@ -759,6 +795,7 @@ async fn run(cfg: Config, local: &LocalSet) -> anyhow::Result<()> {
             cfg.value_size,
             cfg.txn_ops,
             cfg.scan_len,
+            cfg.no_materialize,
             cfg.seed,
         );
         println!("workload_keyspace={}", workload_keyspace);
@@ -784,7 +821,7 @@ async fn run(cfg: Config, local: &LocalSet) -> anyhow::Result<()> {
 
     println!("backend={}", backend_name(cfg.backend));
     println!(
-        "config mode={} clients={} duration_secs={} keyspace={} preload_keys={} preload={} preload_only={} allow_misses={} value_size={} txn_ops={} scan_len={} seed={}",
+        "config mode={} clients={} duration_secs={} keyspace={} preload_keys={} preload={} preload_only={} allow_misses={} value_size={} txn_ops={} scan_len={} no_materialize={} seed={}",
         mode_name(cfg.mode),
         cfg.clients,
         cfg.duration_secs,
@@ -796,6 +833,7 @@ async fn run(cfg: Config, local: &LocalSet) -> anyhow::Result<()> {
         cfg.value_size,
         cfg.txn_ops,
         cfg.scan_len,
+        cfg.no_materialize,
         cfg.seed,
     );
     println!("workload_keyspace={}", workload_keyspace);

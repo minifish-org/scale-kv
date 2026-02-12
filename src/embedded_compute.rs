@@ -16,7 +16,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::LocalSet;
@@ -24,12 +24,174 @@ use tokio::task::LocalSet;
 const FLAG_TOMBSTONE: u16 = 1;
 const FLAG_INTENT: u16 = 2;
 
+#[derive(Default)]
+pub struct InProcessPageStore {
+    pages: std::sync::Mutex<HashMap<PageId, Page>>,
+}
+
+impl InProcessPageStore {
+    pub fn get(&self, page_id: PageId) -> Option<Page> {
+        self.pages
+            .lock()
+            .expect("inprocess page store lock poisoned")
+            .get(&page_id)
+            .cloned()
+    }
+
+    pub fn put_pages(&self, pages: Vec<(PageId, Page)>) {
+        let mut guard = self
+            .pages
+            .lock()
+            .expect("inprocess page store lock poisoned");
+        for (page_id, page) in pages {
+            guard.insert(page_id, page);
+        }
+    }
+}
+
+pub struct InProcessSequencer {
+    page_store: Arc<InProcessPageStore>,
+    next_lsn: AtomicU64,
+    request_id: AtomicU64,
+    durable_lsn: AtomicU64,
+}
+
+impl InProcessSequencer {
+    pub fn new(page_store: Arc<InProcessPageStore>) -> Self {
+        let seed = {
+            let r = rand::random::<u64>();
+            if r == 0 { 1 } else { r }
+        };
+        Self {
+            page_store,
+            next_lsn: AtomicU64::new(0),
+            request_id: AtomicU64::new(seed),
+            durable_lsn: AtomicU64::new(0),
+        }
+    }
+
+    pub fn durable_lsn(&self) -> u64 {
+        self.durable_lsn.load(Ordering::Acquire)
+    }
+
+    pub fn begin_ro(&self) -> u64 {
+        self.durable_lsn()
+    }
+
+    pub fn allocate_request_id(&self) -> u64 {
+        self.request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn reserve_txn_with_request_id(
+        &self,
+        n_writes: usize,
+        request_id: u64,
+    ) -> Result<(u64, u64)> {
+        if n_writes == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "txn batch must be non-empty",
+            )));
+        }
+        if request_id == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "request_id must be non-zero",
+            )));
+        }
+        let n = n_writes as u64;
+        let start_lsn = self.next_lsn.fetch_add(n, Ordering::AcqRel);
+        let end_lsn = start_lsn + n;
+        Ok((start_lsn, end_lsn))
+    }
+
+    pub fn reserve_txn(&self, n_writes: usize) -> Result<(u64, u64, u64)> {
+        let request_id = self.allocate_request_id();
+        let (start_lsn, end_lsn) = self.reserve_txn_with_request_id(n_writes, request_id)?;
+        Ok((request_id, start_lsn, end_lsn))
+    }
+
+    pub async fn commit_pages_reserved(
+        &self,
+        _request_id: u64,
+        _start_lsn: u64,
+        end_lsn: u64,
+        pages: Vec<(PageId, Page)>,
+    ) -> Result<u64> {
+        self.page_store.put_pages(pages);
+        self.durable_lsn.fetch_max(end_lsn, Ordering::AcqRel);
+        Ok(end_lsn)
+    }
+}
+
+#[derive(Clone)]
+enum Sequencer {
+    Network(Arc<ComputeSequencer>),
+    InProcess(Arc<InProcessSequencer>),
+}
+
+impl Sequencer {
+    fn begin_ro(&self) -> u64 {
+        match self {
+            Self::Network(s) => s.begin_ro(),
+            Self::InProcess(s) => s.begin_ro(),
+        }
+    }
+
+    fn durable_lsn(&self) -> u64 {
+        match self {
+            Self::Network(s) => s.durable_lsn(),
+            Self::InProcess(s) => s.durable_lsn(),
+        }
+    }
+
+    fn allocate_request_id(&self) -> u64 {
+        match self {
+            Self::Network(s) => s.allocate_request_id(),
+            Self::InProcess(s) => s.allocate_request_id(),
+        }
+    }
+
+    fn reserve_txn_with_request_id(&self, n_writes: usize, request_id: u64) -> Result<(u64, u64)> {
+        match self {
+            Self::Network(s) => s.reserve_txn_with_request_id(n_writes, request_id),
+            Self::InProcess(s) => s.reserve_txn_with_request_id(n_writes, request_id),
+        }
+    }
+
+    fn reserve_txn(&self, n_writes: usize) -> Result<(u64, u64, u64)> {
+        match self {
+            Self::Network(s) => s.reserve_txn(n_writes),
+            Self::InProcess(s) => s.reserve_txn(n_writes),
+        }
+    }
+
+    async fn commit_pages_reserved(
+        &self,
+        request_id: u64,
+        start_lsn: u64,
+        end_lsn: u64,
+        pages: Vec<(PageId, Page)>,
+    ) -> Result<u64> {
+        match self {
+            Self::Network(s) => {
+                s.commit_reserved_txn_batch(request_id, start_lsn, end_lsn, pages)
+                    .await
+            }
+            Self::InProcess(s) => {
+                s.commit_pages_reserved(request_id, start_lsn, end_lsn, pages)
+                    .await
+            }
+        }
+    }
+}
+
 /// Embedded compute-side API for an Aurora-style KV (page-level redo).
 ///
 /// Compute owns the B+Tree and the page cache. Writes are page after-images.
 #[derive(Clone)]
 pub struct EmbeddedCompute {
-    sequencer: Arc<ComputeSequencer>,
+    sequencer: Sequencer,
     readers: Arc<Vec<Arc<StorageClient>>>,
 
     min_read_lsn: Arc<std::sync::atomic::AtomicU64>,
@@ -63,7 +225,9 @@ impl EmbeddedCompute {
     }
 
     pub async fn connect(addrs: &[String], quorum: usize, local: &LocalSet) -> Result<Self> {
-        let sequencer = Arc::new(ComputeSequencer::connect(addrs, quorum, local).await?);
+        let sequencer = Sequencer::Network(Arc::new(
+            ComputeSequencer::connect(addrs, quorum, local).await?,
+        ));
 
         let mut readers: Vec<Arc<StorageClient>> = Vec::with_capacity(addrs.len());
         for addr in addrs {
@@ -148,6 +312,71 @@ impl EmbeddedCompute {
         };
 
         // Initialize or recover meta/root.
+        this.recover_or_init().await?;
+        this.spawn_txn_reaper(local);
+        Ok(this)
+    }
+
+    pub async fn connect_inprocess(local: &LocalSet) -> Result<Self> {
+        // Buffer pool sizing:
+        // Align with PostgreSQL default shared_buffers=128MB.
+        // Our page size is 16KB, so 128MB ~= 8192 pages.
+        // Override via env SCALE_KV_PAGE_CACHE_PAGES.
+        let default_pages: usize = 8 * 1024;
+        let capacity_pages: usize = std::env::var("SCALE_KV_PAGE_CACHE_PAGES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_pages);
+
+        let page_cache = Arc::new(PageCache::new_with_capacity(
+            DEFAULT_PAGE_CACHE_SHARDS,
+            capacity_pages,
+        ));
+        let page_store = Arc::new(InProcessPageStore::default());
+        let sequencer =
+            Sequencer::InProcess(Arc::new(InProcessSequencer::new(Arc::clone(&page_store))));
+
+        let page_fetcher: Arc<
+            dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>,
+        > = Arc::new(move |pid, _need| {
+            let page_store = Arc::clone(&page_store);
+            Box::pin(async move { page_store.get(pid) })
+        });
+
+        let next_page_id = Arc::new(AtomicU64::new(1));
+        let min_read_lsn = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let min_read_lsn2 = Arc::clone(&min_read_lsn);
+        let page_fetcher2 = Arc::clone(&page_fetcher);
+        let fetcher_for_provider: Arc<
+            dyn Fn(PageId) -> futures::future::LocalBoxFuture<'static, Option<Page>>,
+        > = Arc::new(move |pid| {
+            let need = min_read_lsn2.load(std::sync::atomic::Ordering::Acquire);
+            page_fetcher2(pid, need)
+        });
+
+        let provider = Arc::new(TxnPageProvider::new(
+            page_cache.clone(),
+            next_page_id,
+            BTREE_META_PAGE_ID,
+            fetcher_for_provider,
+        ));
+        let tree = Arc::new(PageBPlusTree::with_provider((*provider).clone()));
+
+        let this = Self {
+            sequencer,
+            readers: Arc::new(Vec::new()),
+            min_read_lsn,
+            active_reads: Arc::new(ActiveReads::new()),
+            page_cache,
+            page_fetcher,
+            provider,
+            tree,
+            txn_registry: Arc::new(Mutex::new(HashMap::new())),
+            default_rw_txn_timeout: Self::read_duration_env_ms("SCALE_KV_RW_TXN_TIMEOUT_MS", 5_000),
+            txn_reaper_interval: Self::read_duration_env_ms("SCALE_KV_TXN_REAPER_MS", 100),
+        };
+
         this.recover_or_init().await?;
         this.spawn_txn_reaper(local);
         Ok(this)
@@ -360,6 +589,9 @@ impl EmbeddedCompute {
 
     /// Warm up compute by scanning pages from storage and caching them locally.
     pub async fn warmup_scan_all(&self, limit_per_batch: u32) -> Result<usize> {
+        if self.readers.is_empty() {
+            return Ok(self.warmed_pages());
+        }
         let limit_per_batch = limit_per_batch.max(1);
         let reader = self.readers.get(0).ok_or_else(|| {
             Error::Io(std::io::Error::new(
@@ -545,6 +777,15 @@ impl EmbeddedCompute {
         tx.get(key).await
     }
 
+    /// Return whether `key` is visible at this snapshot without materializing value bytes.
+    pub async fn get_exists(&self, key: &[u8]) -> Result<bool> {
+        if key.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
+        }
+        let mut tx = self.begin_tx(true, None);
+        tx.get_exists(key).await
+    }
+
     /// Scan the primary key range `[start, end]` (inclusive) at a read-only snapshot.
     ///
     /// Returns up to `limit` visible key/value pairs according to this scan's `read_lsn`.
@@ -565,6 +806,26 @@ impl EmbeddedCompute {
         }
         let mut tx = self.begin_tx(true, None);
         tx.scan_range(start, end, limit).await
+    }
+
+    /// Count visible rows in `[start, end]` (inclusive) up to `limit` without materializing values.
+    pub async fn scan_range_exists_count(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<usize> {
+        if start.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(start.len(), KEY_SIZE));
+        }
+        if end.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(end.len(), KEY_SIZE));
+        }
+        if limit == 0 {
+            return Ok(0);
+        }
+        let mut tx = self.begin_tx(true, None);
+        tx.scan_range_exists_count(start, end, limit).await
     }
 
     pub async fn delete(&self, key: &[u8]) -> Result<u64> {
@@ -722,7 +983,7 @@ impl EmbeddedCompute {
 
         let commit_lsn = self
             .sequencer
-            .commit_reserved_txn_batch(request_id, start_lsn, end_lsn, writes.clone())
+            .commit_pages_reserved(request_id, start_lsn, end_lsn, writes.clone())
             .await?;
         for (pid, p) in writes {
             self.page_cache.insert(pid, p);
@@ -968,6 +1229,25 @@ impl EmbeddedTxn {
         Ok(None)
     }
 
+    async fn read_visible_exists_from_undo(&mut self, mut undo: Option<UndoPtr>) -> Result<bool> {
+        while let Some(ptr) = undo {
+            let upage = self
+                .get_page_for_read(ptr.page_id)
+                .await
+                .ok_or(Error::InMemoryPageMissing(ptr.page_id))?;
+            let rec = undo_pg::read_record(&upage, ptr.slot_id)?;
+            if (rec.old_flags & FLAG_INTENT) != 0 {
+                undo = rec.prev;
+                continue;
+            }
+            if rec.old_commit_lsn <= self.read_lsn {
+                return Ok((rec.old_flags & FLAG_TOMBSTONE) == 0);
+            }
+            undo = rec.prev;
+        }
+        Ok(false)
+    }
+
     async fn read_visible_value_from_row(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let intent_wait_grace = Duration::from_millis(50);
         loop {
@@ -1003,6 +1283,38 @@ impl EmbeddedTxn {
 
             // Not visible at this snapshot: walk undo chain to find latest visible version.
             return self.read_visible_from_undo(row.undo_ptr).await;
+        }
+    }
+
+    async fn read_visible_exists_from_row(&mut self, key: &[u8]) -> Result<bool> {
+        let intent_wait_grace = Duration::from_millis(50);
+        loop {
+            self.ensure_not_timed_out()?;
+
+            let row = self.tree_get(key).await;
+            let Some(row) = row else {
+                return Ok(false);
+            };
+
+            if (row.flags & FLAG_INTENT) != 0 {
+                if self.undo_txn_id == Some(row.intent_txn_id) {
+                    return Ok((row.flags & FLAG_TOMBSTONE) == 0);
+                }
+                if row.intent_lsn > self.read_lsn {
+                    return self.read_visible_exists_from_undo(row.undo_ptr).await;
+                }
+                self.compute
+                    .wait_on_pending_txn(row.intent_txn_id, intent_wait_grace)
+                    .await?;
+                continue;
+            }
+
+            if row.commit_lsn <= self.read_lsn {
+                return Ok((row.flags & FLAG_TOMBSTONE) == 0);
+            }
+
+            // Not visible at this snapshot: walk undo chain to find latest visible version.
+            return self.read_visible_exists_from_undo(row.undo_ptr).await;
         }
     }
 
@@ -1062,6 +1374,14 @@ impl EmbeddedTxn {
         self.read_visible_value_from_row(key).await
     }
 
+    pub async fn get_exists(&mut self, key: &[u8]) -> Result<bool> {
+        self.ensure_not_timed_out()?;
+        if key.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
+        }
+        self.read_visible_exists_from_row(key).await
+    }
+
     /// Scan the primary key range `[start, end]` (inclusive) at this txn snapshot.
     ///
     /// Visibility is evaluated using MVCC metadata (`commit_lsn` and undo chain) at `read_lsn`.
@@ -1095,6 +1415,38 @@ impl EmbeddedTxn {
             }
         }
         Ok(out)
+    }
+
+    /// Count visible rows in `[start, end]` (inclusive), up to `limit`, without copying values.
+    pub async fn scan_range_exists_count(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<usize> {
+        self.ensure_not_timed_out()?;
+        if start.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(start.len(), KEY_SIZE));
+        }
+        if end.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(end.len(), KEY_SIZE));
+        }
+        if limit == 0 {
+            return Ok(0);
+        }
+
+        let entries = self.tree_range(start, end).await;
+
+        let mut visible = 0usize;
+        for (key, _row) in entries {
+            if self.read_visible_exists_from_row(&key).await? {
+                visible += 1;
+                if visible >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(visible)
     }
 
     pub async fn debug_check_mapping(&mut self, key: &[u8]) -> Result<()> {
