@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
+use tokio::sync::{Mutex, Notify};
 use tokio::task::LocalSet;
 
 const FLAG_TOMBSTONE: u16 = 1;
@@ -38,7 +38,6 @@ pub struct EmbeddedCompute {
         Arc<dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>>,
     provider: Arc<TxnPageProvider>,
     tree: Arc<PageBPlusTree<TxnPageProvider>>,
-    write_lock: Arc<Mutex<()>>,
     txn_registry: Arc<Mutex<HashMap<u64, PendingTxn>>>,
     default_rw_txn_timeout: Duration,
     txn_reaper_interval: Duration,
@@ -141,7 +140,6 @@ impl EmbeddedCompute {
             page_fetcher,
             provider,
             tree,
-            write_lock: Arc::new(Mutex::new(())),
             txn_registry: Arc::new(Mutex::new(HashMap::new())),
             default_rw_txn_timeout: Self::read_duration_env_ms("SCALE_KV_RW_TXN_TIMEOUT_MS", 5_000),
             txn_reaper_interval: Self::read_duration_env_ms("SCALE_KV_TXN_REAPER_MS", 100),
@@ -176,7 +174,6 @@ impl EmbeddedCompute {
                     continue;
                 }
                 for txn_id in expired {
-                    let _write_guard = compute.write_lock.clone().lock_owned().await;
                     let write_keys = {
                         let now = Instant::now();
                         let registry = compute.txn_registry.lock().await;
@@ -266,20 +263,22 @@ impl EmbeddedCompute {
 
     async fn resolve_txn_intents(&self, txn_id: u64, keys: &[[u8; KEY_SIZE]]) -> Result<()> {
         for key in keys {
-            let Some(row) = self.tree.get(key).await else {
+            let Some(current) = self.tree.get(key).await else {
                 continue;
             };
-            if (row.flags & FLAG_INTENT) == 0 || row.intent_txn_id != txn_id {
+            if (current.flags & FLAG_INTENT) == 0 || current.intent_txn_id != txn_id {
                 continue;
             }
-            let mut undo_ptr = row.undo_ptr;
-            if undo_ptr.is_none() {
-                self.tree.remove(key).await?;
-                continue;
-            }
+            let mut undo_ptr = current.undo_ptr;
             loop {
                 let Some(ptr) = undo_ptr else {
-                    self.tree.remove(key).await?;
+                    if let Some(latest) = self.tree.get(key).await
+                        && (latest.flags & FLAG_INTENT) != 0
+                        && latest.intent_txn_id == txn_id
+                        && latest.undo_ptr.is_none()
+                    {
+                        self.tree.remove(key).await?;
+                    }
                     break;
                 };
                 let upage = self
@@ -292,7 +291,12 @@ impl EmbeddedCompute {
                     continue;
                 }
                 if rec.old_commit_lsn == 0 && rec.prev.is_none() {
-                    self.tree.remove(key).await?;
+                    if let Some(latest) = self.tree.get(key).await
+                        && (latest.flags & FLAG_INTENT) != 0
+                        && latest.intent_txn_id == txn_id
+                    {
+                        self.tree.remove(key).await?;
+                    }
                 } else {
                     let restored = LeafValue {
                         value: rec.old_value,
@@ -302,7 +306,12 @@ impl EmbeddedCompute {
                         intent_txn_id: 0,
                         intent_lsn: 0,
                     };
-                    self.tree.insert(key.to_vec(), restored).await?;
+                    if let Some(latest) = self.tree.get(key).await
+                        && (latest.flags & FLAG_INTENT) != 0
+                        && latest.intent_txn_id == txn_id
+                    {
+                        self.tree.insert(key.to_vec(), restored).await?;
+                    }
                 }
                 break;
             }
@@ -445,14 +454,7 @@ impl EmbeddedCompute {
         Ok(())
     }
 
-    fn begin_tx(
-        &self,
-        read_only: bool,
-        timeout: Option<Duration>,
-        write_guard: Option<OwnedMutexGuard<()>>,
-    ) -> EmbeddedTxn {
-        // Clear dirty pages collected by provider from any previous operations.
-        let _ = self.provider.take_dirty();
+    fn begin_tx(&self, read_only: bool, timeout: Option<Duration>) -> EmbeddedTxn {
         let read_lsn = self.begin_ro();
         // make sure demand paging won't read behind our snapshot fence
         self.min_read_lsn
@@ -468,7 +470,6 @@ impl EmbeddedCompute {
             timeout,
             read_only,
             write_attempted: false,
-            write_guard,
             dirty: BTreeMap::new(),
             ro_cache: BTreeMap::new(),
             modified: BTreeSet::new(),
@@ -488,8 +489,7 @@ impl EmbeddedCompute {
 
     /// Begin a read-write transaction.
     pub async fn begin_rw(&self) -> EmbeddedTxn {
-        let write_guard = Some(self.write_lock.clone().lock_owned().await);
-        let tx = self.begin_tx(false, None, write_guard);
+        let tx = self.begin_tx(false, None);
         if let Some(txn_id) = tx.undo_txn_id {
             let deadline = tx.registry_deadline(self.default_rw_txn_timeout);
             self.register_pending_txn(txn_id, deadline).await;
@@ -499,13 +499,12 @@ impl EmbeddedCompute {
 
     /// Begin a read-only transaction with timeout.
     pub fn begin_ro_timeout(&self, timeout: Duration) -> EmbeddedTxn {
-        self.begin_tx(true, Some(timeout), None)
+        self.begin_tx(true, Some(timeout))
     }
 
     /// Begin a read-write transaction with timeout.
     pub async fn begin_rw_timeout(&self, timeout: Duration) -> EmbeddedTxn {
-        let write_guard = Some(self.write_lock.clone().lock_owned().await);
-        let tx = self.begin_tx(false, Some(timeout), write_guard);
+        let tx = self.begin_tx(false, Some(timeout));
         if let Some(txn_id) = tx.undo_txn_id {
             let deadline = tx.registry_deadline(self.default_rw_txn_timeout);
             self.register_pending_txn(txn_id, deadline).await;
@@ -539,7 +538,7 @@ impl EmbeddedCompute {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
-        let mut tx = self.begin_tx(true, None, None);
+        let mut tx = self.begin_tx(true, None);
         tx.get(key).await
     }
 
@@ -561,7 +560,7 @@ impl EmbeddedCompute {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut tx = self.begin_tx(true, None, None);
+        let mut tx = self.begin_tx(true, None);
         tx.scan_range(start, end, limit).await
     }
 
@@ -739,7 +738,6 @@ pub struct EmbeddedTxn {
     timeout: Option<Duration>,
     read_only: bool,
     write_attempted: bool,
-    write_guard: Option<OwnedMutexGuard<()>>,
 
     dirty: BTreeMap<PageId, Page>,
     ro_cache: BTreeMap<PageId, Page>,
@@ -757,7 +755,6 @@ impl Drop for EmbeddedTxn {
     fn drop(&mut self) {
         // Ensure we never leak active read snapshots if a txn is dropped early.
         let _ = self.read_guard.take();
-        let _ = self.write_guard.take();
     }
 }
 
@@ -782,10 +779,8 @@ impl EmbeddedTxn {
         }
         // Stage into txn-local dirty map.
         self.dirty.insert(page_id, page.clone());
-        // Also update shared page_cache so helper subsystems (e.g. FSM hint tree)
-        // that consult only page_cache can observe txn-local changes.
-        // NOTE: EmbeddedCompute currently assumes a single writer; if we later add
-        // concurrent txns, this must become txn-scoped.
+        // Also update shared page_cache so helper subsystems that consult page_cache
+        // can observe the latest in-memory page image.
         self.compute.page_cache.insert(page_id, page);
     }
 
@@ -1146,7 +1141,6 @@ impl EmbeddedTxn {
     pub async fn abort(mut self) -> Result<()> {
         if self.read_only {
             let _ = self.read_guard.take();
-            let _ = self.write_guard.take();
             return Ok(());
         }
         let txn_id = self.undo_txn_id.unwrap_or(0);
@@ -1154,7 +1148,6 @@ impl EmbeddedTxn {
         let out = self.compute.resolve_txn_intents(txn_id, &keys).await;
         let _ = self.compute.remove_pending_txn(txn_id).await;
         let _ = self.read_guard.take();
-        let _ = self.write_guard.take();
         out.map(|_| ())
     }
 
@@ -1163,7 +1156,6 @@ impl EmbeddedTxn {
         if self.read_only {
             let wrote = self.write_attempted || !self.dirty.is_empty() || !self.modified.is_empty();
             let _ = self.read_guard.take();
-            let _ = self.write_guard.take();
             if wrote {
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -1216,8 +1208,21 @@ impl EmbeddedTxn {
         if !self.modified.is_empty() {
             for key in &self.modified {
                 if let Some(mut row) = self.compute.tree.get(key).await {
+                    if (row.flags & FLAG_INTENT) == 0 || row.intent_txn_id != request_id {
+                        let _ = self.read_guard.take();
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "intent ownership changed before commit",
+                        )));
+                    }
                     row.commit_lsn = 1;
                     self.compute.tree.insert(key.to_vec(), row).await?;
+                } else {
+                    let _ = self.read_guard.take();
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "intent missing before commit",
+                    )));
                 }
             }
         }
@@ -1268,6 +1273,13 @@ impl EmbeddedTxn {
         if !self.modified.is_empty() {
             for key in &self.modified {
                 if let Some(mut row) = self.compute.tree.get(key).await {
+                    if (row.flags & FLAG_INTENT) == 0 || row.intent_txn_id != request_id {
+                        let _ = self.read_guard.take();
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "intent ownership changed before commit",
+                        )));
+                    }
                     row.commit_lsn = commit_lsn;
                     row.flags &= !FLAG_INTENT;
                     row.intent_txn_id = 0;
@@ -1351,7 +1363,6 @@ impl EmbeddedTxn {
 
         // Mark snapshot inactive before returning.
         let _ = self.read_guard.take();
-        let _ = self.write_guard.take();
 
         out
     }

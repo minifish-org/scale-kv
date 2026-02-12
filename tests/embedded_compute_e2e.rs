@@ -1,6 +1,7 @@
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{fs, process};
 
@@ -142,7 +143,7 @@ async fn test_scan_range_snapshot_inclusive_and_limit() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_rw_txn_is_serialized_by_single_writer_gate() {
+async fn test_concurrent_rw_txns_on_different_keys_both_commit() {
     if !tcp_bind_allowed() {
         return;
     }
@@ -158,39 +159,95 @@ async fn test_rw_txn_is_serialized_by_single_writer_gate() {
             let addrs = vec![server.addr().to_string()];
             let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
 
-            let mut tx1 = compute.begin_rw().await;
-            tx1.write_page(100, vec![1u8; PAGE_SIZE]);
+            let k1 = test_key(2001);
+            let k2 = test_key(2002);
+            let v1 = test_value(11);
+            let v2 = test_value(22);
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
 
             let compute2 = compute.clone();
-            let tx2_done = std::sync::Arc::new(AtomicBool::new(false));
-            let tx2_done2 = tx2_done.clone();
-            tokio::task::spawn_local(async move {
-                let mut tx2 = compute2.begin_rw().await;
-                tx2.write_page(101, vec![2u8; PAGE_SIZE]);
-                tx2.commit().await.unwrap();
-                tx2_done2.store(true, Ordering::Release);
+            let barrier1 = barrier.clone();
+            let k1_task = k1.clone();
+            let v1_task = v1.clone();
+            let t1 = tokio::task::spawn_local(async move {
+                let mut tx = compute2.begin_rw().await;
+                barrier1.wait().await;
+                tx.put(&k1_task, &v1_task).await.unwrap();
+                tx.commit().await.unwrap();
             });
 
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), async {
-                    while !tx2_done.load(Ordering::Acquire) {
-                        tokio::task::yield_now().await;
-                    }
-                })
+            let compute3 = compute.clone();
+            let barrier2 = barrier.clone();
+            let k2_task = k2.clone();
+            let v2_task = v2.clone();
+            let t2 = tokio::task::spawn_local(async move {
+                let mut tx = compute3.begin_rw().await;
+                barrier2.wait().await;
+                tx.put(&k2_task, &v2_task).await.unwrap();
+                tx.commit().await.unwrap();
+            });
+
+            t1.await.unwrap();
+            t2.await.unwrap();
+
+            assert_eq!(compute.get(&k1).await.unwrap(), Some(v1));
+            assert_eq!(compute.get(&k2).await.unwrap(), Some(v2));
+        })
+        .await;
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_concurrent_rw_txns_on_same_key_conflict_is_retryable() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir = temp_dir();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
                 .await
-                .is_err()
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+
+            let key = test_key(3001);
+            let winner = test_value(7);
+            let loser = test_value(9);
+
+            let (intent_ready_tx, intent_ready_rx) = tokio::sync::oneshot::channel();
+            let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+
+            let compute2 = compute.clone();
+            let key2 = key.clone();
+            let winner2 = winner.clone();
+            let writer = tokio::task::spawn_local(async move {
+                let mut tx = compute2.begin_rw().await;
+                tx.put(&key2, &winner2).await.unwrap();
+                let _ = intent_ready_tx.send(());
+                let _ = commit_rx.await;
+                tx.commit().await.unwrap();
+            });
+
+            intent_ready_rx.await.unwrap();
+
+            let mut tx2 = compute.begin_rw().await;
+            let err = tx2.put(&key, &loser).await.unwrap_err();
+            assert_eq!(err.category(), ErrorCategory::Backpressure);
+            assert!(err.is_retryable());
+            assert!(
+                matches!(err, scale_kv::Error::Io(ref ioe) if ioe.kind() == ErrorKind::WouldBlock)
             );
+            tx2.abort().await.unwrap();
 
-            tx1.commit().await.unwrap();
+            let _ = commit_tx.send(());
+            writer.await.unwrap();
 
-            // After tx1 finishes, tx2 can acquire the writer gate and commit.
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while !tx2_done.load(Ordering::Acquire) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
+            assert_eq!(compute.get(&key).await.unwrap(), Some(winner));
         })
         .await;
 
