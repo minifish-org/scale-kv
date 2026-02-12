@@ -1,6 +1,6 @@
 use crate::{Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, VALUE_SIZE, undo_pg::UndoPtr};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
@@ -27,6 +27,9 @@ const OFFSET_ENTRY_SIZE: usize = 2;
 pub const LEAF_VALUE_SIZE: usize = VALUE_SIZE + 8 + 8 + 2 + 2 + 8 + 8;
 const CHILD_ID_SIZE: usize = 8;
 const DEFAULT_LATCH_SHARDS: usize = 256;
+const MAX_TRAVERSAL_RETRIES: usize = 8;
+const MAX_RIGHT_LINK_HOPS: usize = 256;
+const MAX_SCAN_LEAF_HOPS: usize = 8192;
 
 pub type PageReadLatchGuard = OwnedRwLockReadGuard<()>;
 pub type PageWriteLatchGuard = OwnedRwLockWriteGuard<()>;
@@ -363,23 +366,24 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     }
 
     pub async fn get(&self, key: &[u8]) -> Option<LeafValue> {
-        for _ in 0..8 {
+        for _ in 0..MAX_TRAVERSAL_RETRIES {
             let mut leaf_id = self.find_leaf_for_read(key).await?;
-            loop {
+            for _ in 0..MAX_RIGHT_LINK_HOPS {
                 let _leaf_guard = self.provider.acquire_read_latch(leaf_id).await;
                 let page = self.provider.read_page(leaf_id).await?;
                 let header = page_header(&page);
                 if header.page_type != PAGE_TYPE_LEAF {
                     break;
                 }
-                if let Some(hk) = header.high_key {
-                    if key > hk.as_slice() {
-                        if let Some(next) = header.next_leaf {
-                            leaf_id = next;
-                            continue;
-                        }
+                if let Some(hk) = header.high_key
+                    && key > hk.as_slice()
+                    && let Some(next) = header.next_leaf
+                {
+                    if next == leaf_id {
                         break;
                     }
+                    leaf_id = next;
+                    continue;
                 }
                 return find_in_leaf(&page, key);
             }
@@ -388,10 +392,12 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     }
 
     /// Locking protocol:
-    /// - Writers use top-down split-before-descend with write-latch coupling.
-    /// - The parent is always write-latched while splitting a full child.
-    /// - We never upgrade a child lock to parent, avoiding upgrade deadlocks.
-    /// Not handled yet: merge/rebalance on delete, range/key gap locks, and full phantom protection.
+    /// - Writers use top-down split/merge-before-descend with write-latch coupling.
+    /// - The parent is always write-latched while fixing an unsafe child.
+    /// - We never upgrade from child to parent, avoiding upgrade deadlocks.
+    /// Known limits:
+    /// - Range/key gap locks are not implemented, so phantom protection is not provided.
+    /// - Readers are lock-coupled for physical safety, but are not a serializable snapshot.
     pub async fn insert(&mut self, key: Vec<u8>, leaf_value: LeafValue) -> Result<()> {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
@@ -480,26 +486,320 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     }
 
     pub async fn remove(&mut self, key: &[u8]) -> Result<()> {
-        // Merge/rebalance is intentionally deferred. Deletes only remove the key from the leaf.
-        let leaf_id = match self.find_leaf_for_read(key).await {
-            Some(id) => id,
-            None => return Ok(()),
-        };
-        let _leaf_guard = self.provider.acquire_write_latch(leaf_id).await;
-        let leaf = match self.provider.read_page(leaf_id).await {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        let (found, pos) = find_key_pos(&leaf, key).unwrap_or((false, 0));
-        if !found {
-            return Ok(());
+        if key.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
 
-        let header = leaf_page_header(&leaf);
-        let rebuilt = rebuild_page_with_remove(&leaf, header, pos)?;
-        self.provider.write_page(leaf_id, rebuilt).await;
-        self.len = self.len.saturating_sub(1);
-        Ok(())
+        // Top-down delete:
+        // Keep parent write-latched while making the next child safe (borrow/merge),
+        // then descend. This avoids lock upgrades and underflow cascades after descent.
+        let root_guard = self.provider.acquire_write_latch(ROOT_LATCH_PAGE_ID).await;
+        let mut current_id = self.provider.root_page_id();
+        let mut current_guard = self.provider.acquire_write_latch(current_id).await;
+        let mut parent_hint: Option<(PageId, usize)> = None;
+        drop(root_guard);
+
+        loop {
+            let current_page = match self.provider.read_page(current_id).await {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            let current_header = page_header(&current_page);
+            if current_header.page_type == PAGE_TYPE_LEAF {
+                let (found, pos) = find_key_pos(&current_page, key).unwrap_or((false, 0));
+                if found {
+                    let rebuilt = rebuild_page_with_remove(&current_page, current_header, pos)?;
+                    let new_first = if pos == 0 {
+                        entry_key_at(&rebuilt, 0).map(|k| k.to_vec())
+                    } else {
+                        None
+                    };
+                    self.provider.write_page(current_id, rebuilt).await;
+                    self.len = self.len.saturating_sub(1);
+                    drop(current_guard);
+                    if let (Some((parent_id, hint_pos)), Some(new_first_key)) =
+                        (parent_hint, new_first.as_ref())
+                    {
+                        self.repair_parent_separator_after_leaf_first_key_change(
+                            parent_id,
+                            hint_pos,
+                            current_id,
+                            new_first_key,
+                        )
+                        .await?;
+                    }
+                    self.repair_leaf_boundary_after_delete(current_id).await?;
+                    self.refresh_leaf_high_keys().await?;
+                    self.maybe_collapse_root_after_delete().await?;
+                    return Ok(());
+                }
+                drop(current_guard);
+                self.maybe_collapse_root_after_delete().await?;
+                return Ok(());
+            }
+
+            let child_pos = child_insert_pos_for_key(&current_page, current_header, key);
+            let descend_id = child_id_at_pos(&current_page, current_header, child_pos);
+            let descend_guard = self.provider.acquire_write_latch(descend_id).await;
+            let mut child_page = self
+                .provider
+                .read_page(descend_id)
+                .await
+                .ok_or_else(|| Error::InvalidPageSize(descend_id as usize, PAGE_SIZE))?;
+            let mut child_header = page_header(&child_page);
+            let min_keys = min_keys_non_root(child_header.page_type);
+
+            if child_header.key_count as usize <= min_keys {
+                let mut parent_entries = collect_entries(&current_page);
+                let child_type = child_header.page_type;
+
+                let left_option = if child_pos > 0 {
+                    let left_id = child_id_at_pos(&current_page, current_header, child_pos - 1);
+                    let left_guard = self.provider.acquire_write_latch(left_id).await;
+                    let left_page = self
+                        .provider
+                        .read_page(left_id)
+                        .await
+                        .ok_or_else(|| Error::InvalidPageSize(left_id as usize, PAGE_SIZE))?;
+                    Some((left_id, left_guard, left_page))
+                } else {
+                    None
+                };
+
+                if let Some((left_id, left_guard, left_page)) = left_option {
+                    let left_header = page_header(&left_page);
+                    if left_header.key_count as usize > min_keys {
+                        let mut left_entries = collect_entries(&left_page);
+                        let mut child_entries = collect_entries(&child_page);
+                        if child_type == PAGE_TYPE_LEAF {
+                            let borrowed = left_entries.pop().ok_or_else(|| {
+                                Error::InvalidPageSize(left_id as usize, PAGE_SIZE)
+                            })?;
+                            child_entries.insert(0, borrowed);
+                            let new_sep = child_entries[0].0.clone();
+                            parent_entries[child_pos - 1].0 = new_sep.clone();
+
+                            let mut left_header_new = leaf_page_header(&left_page);
+                            left_header_new.high_key = key_to_high_key(&new_sep);
+                            let mut child_header_new = leaf_page_header(&child_page);
+                            child_header_new.prev_leaf = Some(left_id);
+                            encode_entries(&mut child_page, &child_entries, child_header_new)?;
+                            let mut left_rebuilt = left_page.clone();
+                            encode_entries(&mut left_rebuilt, &left_entries, left_header_new)?;
+                            self.provider.write_page(left_id, left_rebuilt).await;
+                        } else {
+                            let sep_idx = child_pos - 1;
+                            let parent_sep = parent_entries[sep_idx].0.clone();
+                            let (up_key, up_right_child) = left_entries.pop().ok_or_else(|| {
+                                Error::InvalidPageSize(left_id as usize, PAGE_SIZE)
+                            })?;
+                            let old_left = child_header.left_child;
+                            child_header.left_child = decode_child_id(&up_right_child);
+                            child_entries.insert(0, (parent_sep, encode_child_id(old_left)));
+                            parent_entries[sep_idx].0 = up_key.clone();
+
+                            let mut left_header_new = page_header(&left_page);
+                            left_header_new.high_key = key_to_high_key(&up_key);
+                            let mut left_rebuilt = left_page.clone();
+                            encode_entries(&mut left_rebuilt, &left_entries, left_header_new)?;
+                            encode_entries(&mut child_page, &child_entries, child_header)?;
+                            self.provider.write_page(left_id, left_rebuilt).await;
+                        }
+
+                        let mut parent_rebuilt = current_page.clone();
+                        encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
+                        self.provider.write_page(current_id, parent_rebuilt).await;
+                        let parent_id = current_id;
+                        drop(left_guard);
+                        drop(current_guard);
+                        parent_hint = Some((parent_id, child_pos));
+                        current_id = descend_id;
+                        current_guard = descend_guard;
+                        continue;
+                    }
+                    drop(left_guard);
+                }
+
+                let right_option = if child_pos < current_header.key_count as usize {
+                    let right_id = child_id_at_pos(&current_page, current_header, child_pos + 1);
+                    let right_guard = self.provider.acquire_write_latch(right_id).await;
+                    let right_page = self
+                        .provider
+                        .read_page(right_id)
+                        .await
+                        .ok_or_else(|| Error::InvalidPageSize(right_id as usize, PAGE_SIZE))?;
+                    Some((right_id, right_guard, right_page))
+                } else {
+                    None
+                };
+
+                if let Some((right_id, right_guard, right_page)) = right_option {
+                    let right_header = page_header(&right_page);
+                    if right_header.key_count as usize > min_keys {
+                        let mut right_entries = collect_entries(&right_page);
+                        let mut child_entries = collect_entries(&child_page);
+                        if child_type == PAGE_TYPE_LEAF {
+                            let borrowed = right_entries.remove(0);
+                            child_entries.push(borrowed);
+                            let new_sep = right_entries[0].0.clone();
+                            parent_entries[child_pos].0 = new_sep.clone();
+
+                            let mut child_header_new = leaf_page_header(&child_page);
+                            child_header_new.high_key = key_to_high_key(&new_sep);
+                            let mut right_header_new = leaf_page_header(&right_page);
+                            right_header_new.prev_leaf = Some(descend_id);
+                            encode_entries(&mut child_page, &child_entries, child_header_new)?;
+                            let mut right_rebuilt = right_page.clone();
+                            encode_entries(&mut right_rebuilt, &right_entries, right_header_new)?;
+                            self.provider.write_page(right_id, right_rebuilt).await;
+                        } else {
+                            let sep_idx = child_pos;
+                            let parent_sep = parent_entries[sep_idx].0.clone();
+                            let promoted = right_entries.remove(0);
+                            let mut right_header_new = right_header;
+                            let old_left_of_right = right_header_new.left_child;
+                            right_header_new.left_child = decode_child_id(&promoted.1);
+                            child_entries.push((parent_sep, encode_child_id(old_left_of_right)));
+                            parent_entries[sep_idx].0 = promoted.0.clone();
+
+                            let mut child_header_new = child_header;
+                            child_header_new.high_key = key_to_high_key(&promoted.0);
+                            let mut right_rebuilt = right_page.clone();
+                            encode_entries(&mut right_rebuilt, &right_entries, right_header_new)?;
+                            encode_entries(&mut child_page, &child_entries, child_header_new)?;
+                            self.provider.write_page(right_id, right_rebuilt).await;
+                        }
+
+                        let mut parent_rebuilt = current_page.clone();
+                        encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
+                        self.provider.write_page(current_id, parent_rebuilt).await;
+                        let parent_id = current_id;
+                        drop(right_guard);
+                        drop(current_guard);
+                        parent_hint = Some((parent_id, child_pos));
+                        current_id = descend_id;
+                        current_guard = descend_guard;
+                        continue;
+                    }
+
+                    if child_type == PAGE_TYPE_LEAF {
+                        let mut child_entries = collect_entries(&child_page);
+                        let right_entries = collect_entries(&right_page);
+                        child_entries.extend(right_entries);
+                        let mut child_header_new = leaf_page_header(&child_page);
+                        child_header_new.next_leaf = right_header.next_leaf;
+                        child_header_new.high_key = right_header.high_key;
+                        encode_entries(&mut child_page, &child_entries, child_header_new)?;
+                    } else {
+                        let mut child_entries = collect_entries(&child_page);
+                        let right_entries = collect_entries(&right_page);
+                        let sep = parent_entries[child_pos].0.clone();
+                        child_entries.push((sep, encode_child_id(right_header.left_child)));
+                        child_entries.extend(right_entries);
+                        let mut child_header_new = child_header;
+                        child_header_new.high_key = right_header.high_key;
+                        encode_entries(&mut child_page, &child_entries, child_header_new)?;
+                    }
+
+                    parent_entries.remove(child_pos);
+                    let mut parent_rebuilt = current_page.clone();
+                    encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
+                    self.provider.write_page(current_id, parent_rebuilt).await;
+                    self.provider
+                        .write_page(descend_id, child_page.clone())
+                        .await;
+                    let parent_id = current_id;
+                    drop(right_guard);
+                    drop(current_guard);
+                    parent_hint = Some((parent_id, child_pos));
+                    current_id = descend_id;
+                    current_guard = descend_guard;
+                    continue;
+                }
+
+                if child_pos > 0 {
+                    let left_id = child_id_at_pos(&current_page, current_header, child_pos - 1);
+                    let left_guard = self.provider.acquire_write_latch(left_id).await;
+                    let mut left_page = self
+                        .provider
+                        .read_page(left_id)
+                        .await
+                        .ok_or_else(|| Error::InvalidPageSize(left_id as usize, PAGE_SIZE))?;
+                    let mut left_entries = collect_entries(&left_page);
+                    if child_type == PAGE_TYPE_LEAF {
+                        let child_entries = collect_entries(&child_page);
+                        left_entries.extend(child_entries);
+                        let mut left_header = leaf_page_header(&left_page);
+                        left_header.next_leaf = child_header.next_leaf;
+                        left_header.high_key = child_header.high_key;
+                        encode_entries(&mut left_page, &left_entries, left_header)?;
+                    } else {
+                        let child_entries = collect_entries(&child_page);
+                        let sep = parent_entries[child_pos - 1].0.clone();
+                        left_entries.push((sep, encode_child_id(child_header.left_child)));
+                        left_entries.extend(child_entries);
+                        let mut left_header = page_header(&left_page);
+                        left_header.high_key = child_header.high_key;
+                        encode_entries(&mut left_page, &left_entries, left_header)?;
+                    }
+
+                    parent_entries.remove(child_pos - 1);
+                    let mut parent_rebuilt = current_page.clone();
+                    encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
+                    self.provider.write_page(current_id, parent_rebuilt).await;
+                    self.provider.write_page(left_id, left_page).await;
+                    let parent_id = current_id;
+                    drop(descend_guard);
+                    drop(current_guard);
+                    parent_hint = Some((parent_id, child_pos - 1));
+                    current_id = left_id;
+                    current_guard = left_guard;
+                    continue;
+                }
+            }
+
+            if child_header.page_type == PAGE_TYPE_LEAF {
+                let (found, pos) = find_key_pos(&child_page, key).unwrap_or((false, 0));
+                if found {
+                    let rebuilt = rebuild_page_with_remove(&child_page, child_header, pos)?;
+                    self.provider.write_page(descend_id, rebuilt.clone()).await;
+                    if child_pos > 0 && pos == 0 {
+                        if let Some(new_first) = entry_key_at(&rebuilt, 0) {
+                            let mut parent_entries = collect_entries(&current_page);
+                            parent_entries[child_pos - 1].0 = new_first.to_vec();
+                            let mut parent_rebuilt = current_page.clone();
+                            encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
+                            self.provider.write_page(current_id, parent_rebuilt).await;
+
+                            let left_id =
+                                child_id_at_pos(&current_page, current_header, child_pos - 1);
+                            let _left_guard = self.provider.acquire_write_latch(left_id).await;
+                            if let Some(mut left_page) = self.provider.read_page(left_id).await {
+                                let mut left_header = leaf_page_header(&left_page);
+                                left_header.high_key = key_to_high_key(new_first);
+                                write_header(&mut left_page, left_header);
+                                self.provider.write_page(left_id, left_page).await;
+                            }
+                        }
+                    }
+                    self.len = self.len.saturating_sub(1);
+                }
+                drop(descend_guard);
+                drop(current_guard);
+                if found {
+                    self.repair_leaf_boundary_after_delete(descend_id).await?;
+                    self.refresh_leaf_high_keys().await?;
+                }
+                self.maybe_collapse_root_after_delete().await?;
+                return Ok(());
+            }
+
+            let parent_id = current_id;
+            drop(current_guard);
+            parent_hint = Some((parent_id, child_pos));
+            current_id = descend_id;
+            current_guard = descend_guard;
+        }
     }
 
     pub async fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, LeafValue)> {
@@ -566,81 +866,264 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         end: &[u8],
         mut f: impl FnMut(&[u8], LeafValue) -> bool,
     ) {
-        let Some(mut leaf_id) = self.find_leaf_for_read(start).await else {
-            return;
-        };
-
-        // Same high-key correction as point lookup.
-        loop {
-            let _leaf_guard = self.provider.acquire_read_latch(leaf_id).await;
-            let page = match self.provider.read_page(leaf_id).await {
-                Some(page) => page,
-                None => break,
+        for _ in 0..MAX_TRAVERSAL_RETRIES {
+            let Some(mut leaf_id) = self.find_leaf_for_read(start).await else {
+                return;
             };
-            let header = leaf_page_header(&page);
-            if let Some(hk) = header.high_key {
-                if start > hk.as_slice() {
-                    if let Some(next) = header.next_leaf {
-                        leaf_id = next;
-                        continue;
+            let mut first = true;
+            let mut visited = HashSet::new();
+            for _ in 0..MAX_SCAN_LEAF_HOPS {
+                if !visited.insert(leaf_id) {
+                    break;
+                }
+                let _leaf_guard = self.provider.acquire_read_latch(leaf_id).await;
+                let page = match self.provider.read_page(leaf_id).await {
+                    Some(page) => page,
+                    None => break,
+                };
+                let header = leaf_page_header(&page);
+                if header.page_type != PAGE_TYPE_LEAF {
+                    break;
+                }
+                if let Some(hk) = header.high_key
+                    && start > hk.as_slice()
+                    && let Some(next) = header.next_leaf
+                {
+                    if next == leaf_id {
+                        break;
                     }
+                    leaf_id = next;
+                    continue;
                 }
-            }
-            break;
-        }
+                let mut idx = if first {
+                    lower_bound_in_leaf(&page, start)
+                } else {
+                    0
+                };
+                first = false;
+                let key_count = header.key_count as usize;
+                while idx < key_count {
+                    let Some(key) = entry_key_at(&page, idx) else {
+                        break;
+                    };
+                    if key > end {
+                        return;
+                    }
+                    let Some(value) = entry_value_at(&page, idx) else {
+                        break;
+                    };
+                    if !f(key, decode_leaf_value(value)) {
+                        return;
+                    }
+                    idx += 1;
+                }
 
-        let mut current = Some(leaf_id);
-        while let Some(page_id) = current {
-            let _page_guard = self.provider.acquire_read_latch(page_id).await;
-            let page = match self.provider.read_page(page_id).await {
-                Some(page) => page,
-                None => break,
-            };
-            let header = leaf_page_header(&page);
-            let mut idx = if page_id == leaf_id {
-                lower_bound_in_leaf(&page, start)
-            } else {
-                0
-            };
-            let key_count = header.key_count as usize;
-            while idx < key_count {
-                let key = match entry_key_at(&page, idx) {
-                    Some(key) => key,
-                    None => break,
-                };
-                if key > end {
+                let Some(next) = header.next_leaf else {
                     return;
-                }
-                let value = match entry_value_at(&page, idx) {
-                    Some(value) => value,
-                    None => break,
                 };
-                if !f(key, decode_leaf_value(value)) {
-                    return;
+                if next == leaf_id {
+                    break;
                 }
-                idx += 1;
+                leaf_id = next;
             }
-            current = header.next_leaf;
         }
     }
 
     async fn find_leaf_for_read(&self, key: &[u8]) -> Option<PageId> {
-        let mut current = self.provider.root_page_id();
-        let mut current_guard = self.provider.acquire_read_latch(current).await;
+        for _ in 0..MAX_TRAVERSAL_RETRIES {
+            let mut current = self.provider.root_page_id();
+            let mut current_guard = self.provider.acquire_read_latch(current).await;
+            for _ in 0..MAX_SCAN_LEAF_HOPS {
+                let page = match self.provider.read_page(current).await {
+                    Some(p) => p,
+                    None => break,
+                };
+                let header = page_header(&page);
+                if header.page_type == PAGE_TYPE_LEAF {
+                    drop(current_guard);
+                    return Some(current);
+                }
+                // Read-coupling: parent read latch is held while acquiring child read latch,
+                // so child pointers cannot be concurrently torn by structural writes.
+                let child =
+                    child_id_at_pos(&page, header, child_insert_pos_for_key(&page, header, key));
+                let child_guard = self.provider.acquire_read_latch(child).await;
+                drop(current_guard);
+                current = child;
+                current_guard = child_guard;
+            }
+            drop(current_guard);
+        }
+        None
+    }
+
+    async fn maybe_collapse_root_after_delete(&self) -> Result<()> {
+        let _root_guard = self.provider.acquire_write_latch(ROOT_LATCH_PAGE_ID).await;
         loop {
-            let page = self.provider.read_page(current).await?;
+            let root_id = self.provider.root_page_id();
+            let _root_page_guard = self.provider.acquire_write_latch(root_id).await;
+            let root = match self.provider.read_page(root_id).await {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            let header = page_header(&root);
+            if header.page_type == PAGE_TYPE_INTERNAL
+                && header.key_count == 0
+                && header.left_child != 0
+            {
+                self.provider.set_root_page_id(header.left_child);
+                continue;
+            }
+            return Ok(());
+        }
+    }
+
+    async fn repair_parent_separator_after_leaf_first_key_change(
+        &self,
+        parent_id: PageId,
+        hint_pos: usize,
+        child_id: PageId,
+        new_first_key: &[u8],
+    ) -> Result<()> {
+        let _parent_guard = self.provider.acquire_write_latch(parent_id).await;
+        let mut parent_page = match self.provider.read_page(parent_id).await {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let parent_header = page_header(&parent_page);
+        if parent_header.page_type != PAGE_TYPE_INTERNAL || parent_header.key_count == 0 {
+            return Ok(());
+        }
+
+        let mut pos = None;
+        if hint_pos <= parent_header.key_count as usize
+            && child_id_at_pos(&parent_page, parent_header, hint_pos) == child_id
+        {
+            pos = Some(hint_pos);
+        } else {
+            for idx in 0..=parent_header.key_count as usize {
+                if child_id_at_pos(&parent_page, parent_header, idx) == child_id {
+                    pos = Some(idx);
+                    break;
+                }
+            }
+        }
+        let Some(child_pos) = pos else {
+            return Ok(());
+        };
+        if child_pos == 0 {
+            return Ok(());
+        }
+
+        let mut parent_entries = collect_entries(&parent_page);
+        parent_entries[child_pos - 1].0 = new_first_key.to_vec();
+        let left_id = child_id_at_pos(&parent_page, parent_header, child_pos - 1);
+        encode_entries(&mut parent_page, &parent_entries, parent_header)?;
+        self.provider.write_page(parent_id, parent_page).await;
+        let _left_guard = self.provider.acquire_write_latch(left_id).await;
+        if let Some(mut left_page) = self.provider.read_page(left_id).await {
+            let mut left_header = leaf_page_header(&left_page);
+            left_header.high_key = key_to_high_key(new_first_key);
+            write_header(&mut left_page, left_header);
+            self.provider.write_page(left_id, left_page).await;
+        }
+        Ok(())
+    }
+
+    async fn repair_leaf_boundary_after_delete(&self, leaf_id: PageId) -> Result<()> {
+        let _leaf_guard = self.provider.acquire_write_latch(leaf_id).await;
+        let mut leaf_page = match self.provider.read_page(leaf_id).await {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let leaf_header = leaf_page_header(&leaf_page);
+        if leaf_header.page_type != PAGE_TYPE_LEAF {
+            return Ok(());
+        }
+        let leaf_first = entry_key_at(&leaf_page, 0).map(|k| k.to_vec());
+        let next_first = if let Some(next_id) = leaf_header.next_leaf {
+            self.provider
+                .read_page(next_id)
+                .await
+                .and_then(|next_page| entry_key_at(&next_page, 0).map(|k| k.to_vec()))
+        } else {
+            None
+        };
+        let mut leaf_header_new = leaf_header;
+        leaf_header_new.high_key = next_first.as_deref().and_then(key_to_high_key);
+        write_header(&mut leaf_page, leaf_header_new);
+        self.provider.write_page(leaf_id, leaf_page).await;
+        drop(_leaf_guard);
+
+        if let (Some(prev_id), Some(first_key)) = (leaf_header.prev_leaf, leaf_first.as_deref()) {
+            let _prev_guard = self.provider.acquire_write_latch(prev_id).await;
+            if let Some(mut prev_page) = self.provider.read_page(prev_id).await {
+                let mut prev_header = leaf_page_header(&prev_page);
+                if prev_header.page_type == PAGE_TYPE_LEAF && prev_header.next_leaf == Some(leaf_id)
+                {
+                    prev_header.high_key = key_to_high_key(first_key);
+                    write_header(&mut prev_page, prev_header);
+                    self.provider.write_page(prev_id, prev_page).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn refresh_leaf_high_keys(&self) -> Result<()> {
+        let mut current = self.provider.root_page_id();
+        for _ in 0..MAX_SCAN_LEAF_HOPS {
+            let _guard = self.provider.acquire_read_latch(current).await;
+            let page = match self.provider.read_page(current).await {
+                Some(p) => p,
+                None => return Ok(()),
+            };
             let header = page_header(&page);
             if header.page_type == PAGE_TYPE_LEAF {
-                drop(current_guard);
-                return Some(current);
+                break;
             }
-            let child =
-                child_id_at_pos(&page, header, child_insert_pos_for_key(&page, header, key));
-            let child_guard = self.provider.acquire_read_latch(child).await;
-            drop(current_guard);
-            current = child;
-            current_guard = child_guard;
+            current = header.left_child;
         }
+
+        for _ in 0..MAX_SCAN_LEAF_HOPS {
+            let _leaf_guard = self.provider.acquire_write_latch(current).await;
+            let mut leaf_page = match self.provider.read_page(current).await {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            let leaf_header = leaf_page_header(&leaf_page);
+            if leaf_header.page_type != PAGE_TYPE_LEAF {
+                return Ok(());
+            }
+
+            let next = leaf_header.next_leaf;
+            let new_hk = if let Some(next_id) = next {
+                self.provider
+                    .read_page(next_id)
+                    .await
+                    .and_then(|next_page| entry_key_at(&next_page, 0).map(|k| k.to_vec()))
+                    .as_deref()
+                    .and_then(key_to_high_key)
+            } else {
+                None
+            };
+
+            if leaf_header.high_key != new_hk {
+                let mut updated = leaf_header;
+                updated.high_key = new_hk;
+                write_header(&mut leaf_page, updated);
+                self.provider.write_page(current, leaf_page).await;
+            }
+
+            let Some(next_id) = next else {
+                return Ok(());
+            };
+            if next_id == current {
+                return Ok(());
+            }
+            current = next_id;
+        }
+        Ok(())
     }
 
     async fn ensure_root_not_full(&self) -> Result<()> {
@@ -737,6 +1220,164 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         self.provider.write_page(parent_id, parent_page).await;
 
         Ok((separator, right_id))
+    }
+
+    #[cfg(test)]
+    pub async fn validate(&self) -> std::result::Result<(), String> {
+        let root_id = self.provider.root_page_id();
+        let mut stack: Vec<(PageId, Option<Vec<u8>>, Option<Vec<u8>>)> =
+            vec![(root_id, None, None)];
+        let mut seen = HashSet::new();
+        let mut leaves = HashSet::new();
+
+        while let Some((page_id, lower, upper)) = stack.pop() {
+            if !seen.insert(page_id) {
+                return Err(format!("cycle detected at page_id={page_id}"));
+            }
+            let _guard = self.provider.acquire_read_latch(page_id).await;
+            let page = self
+                .provider
+                .read_page(page_id)
+                .await
+                .ok_or_else(|| format!("missing page_id={page_id}"))?;
+            let header = page_header(&page);
+            let entries = collect_entries(&page);
+
+            for i in 1..entries.len() {
+                if entries[i - 1].0 >= entries[i].0 {
+                    return Err(format!("non-ascending keys in page_id={page_id}"));
+                }
+            }
+            if let Some(lo) = &lower
+                && let Some(first) = entries.first()
+                && first.0.as_slice() < lo.as_slice()
+            {
+                return Err(format!("page_id={page_id} violates lower bound"));
+            }
+            if let Some(hi) = &upper
+                && let Some(last) = entries.last()
+                && last.0.as_slice() >= hi.as_slice()
+            {
+                return Err(format!("page_id={page_id} violates upper bound"));
+            }
+
+            if header.page_type == PAGE_TYPE_LEAF {
+                leaves.insert(page_id);
+                if let Some(hk) = header.high_key
+                    && let Some(last) = entries.last()
+                    && last.0.as_slice() >= hk.as_slice()
+                {
+                    return Err(format!("leaf page_id={page_id} key >= high_key"));
+                }
+                continue;
+            }
+
+            if header.page_type != PAGE_TYPE_INTERNAL {
+                return Err(format!(
+                    "unknown page type {} at page_id={page_id}",
+                    header.page_type
+                ));
+            }
+
+            if header.left_child == 0 && !entries.is_empty() {
+                return Err(format!("internal page_id={page_id} has zero left child"));
+            }
+
+            let mut child_ids = Vec::with_capacity(entries.len() + 1);
+            child_ids.push(header.left_child);
+            child_ids.extend(entries.iter().map(|(_, v)| decode_child_id(v)));
+            for i in (0..child_ids.len()).rev() {
+                let child = child_ids[i];
+                let child_lower = if i == 0 {
+                    lower.clone()
+                } else {
+                    Some(entries[i - 1].0.clone())
+                };
+                let child_upper = if i == entries.len() {
+                    upper.clone()
+                } else {
+                    Some(entries[i].0.clone())
+                };
+                stack.push((child, child_lower, child_upper));
+            }
+        }
+
+        let mut leftmost = root_id;
+        loop {
+            let _guard = self.provider.acquire_read_latch(leftmost).await;
+            let page = self
+                .provider
+                .read_page(leftmost)
+                .await
+                .ok_or_else(|| format!("missing page_id={leftmost}"))?;
+            let header = page_header(&page);
+            if header.page_type == PAGE_TYPE_LEAF {
+                break;
+            }
+            leftmost = header.left_child;
+        }
+
+        let mut chain_seen = HashSet::new();
+        let mut current = Some(leftmost);
+        let mut prev_last: Option<Vec<u8>> = None;
+        let mut hops = 0usize;
+        while let Some(pid) = current {
+            hops += 1;
+            if hops > leaves.len().saturating_add(1) {
+                return Err("leaf chain exceeded expected length".to_string());
+            }
+            if !chain_seen.insert(pid) {
+                return Err(format!("leaf chain cycle at page_id={pid}"));
+            }
+
+            let _guard = self.provider.acquire_read_latch(pid).await;
+            let page = self
+                .provider
+                .read_page(pid)
+                .await
+                .ok_or_else(|| format!("missing page_id={pid}"))?;
+            let header = leaf_page_header(&page);
+            let entries = collect_entries(&page);
+            if let Some(prev) = &prev_last
+                && let Some(first) = entries.first()
+                && first.0.as_slice() < prev.as_slice()
+            {
+                return Err(format!("leaf chain out of order at page_id={pid}"));
+            }
+            if let Some(last) = entries.last() {
+                prev_last = Some(last.0.clone());
+            }
+
+            match (header.high_key, header.next_leaf) {
+                (Some(hk), Some(next)) => {
+                    let _next_guard = self.provider.acquire_read_latch(next).await;
+                    let next_page = self
+                        .provider
+                        .read_page(next)
+                        .await
+                        .ok_or_else(|| format!("missing next leaf page_id={next}"))?;
+                    let next_entries = collect_entries(&next_page);
+                    if let Some(next_first) = next_entries.first()
+                        && hk.as_slice() != next_first.0.as_slice()
+                    {
+                        return Err(format!(
+                            "high_key mismatch at page_id={pid}: hk={} next_first={}",
+                            hex::encode(hk),
+                            hex::encode(&next_first.0)
+                        ));
+                    }
+                    current = Some(next);
+                }
+                (None, Some(_)) => return Err(format!("missing high_key at page_id={pid}")),
+                (_, None) => current = None,
+            }
+        }
+
+        if chain_seen != leaves {
+            return Err("leaf chain does not match discovered leaves".to_string());
+        }
+
+        Ok(())
     }
 }
 
@@ -995,6 +1636,28 @@ fn page_has_room_for_one_more(header: PageHeader) -> bool {
 
 fn page_is_full_for_insert(header: PageHeader) -> bool {
     !page_has_room_for_one_more(header)
+}
+
+fn max_keys_for_page_type(page_type: u8) -> usize {
+    let unit = OFFSET_ENTRY_SIZE + entry_size(page_type);
+    if unit == 0 || PAGE_SIZE <= HEADER_SIZE {
+        return 0;
+    }
+    (PAGE_SIZE - HEADER_SIZE) / unit
+}
+
+fn min_keys_non_root(page_type: u8) -> usize {
+    let max = max_keys_for_page_type(page_type);
+    max / 2
+}
+
+fn key_to_high_key(key: &[u8]) -> Option<[u8; HIGH_KEY_SIZE]> {
+    if key.len() != HIGH_KEY_SIZE {
+        return None;
+    }
+    let mut out = [0u8; HIGH_KEY_SIZE];
+    out.copy_from_slice(key);
+    Some(out)
 }
 
 fn child_insert_pos_for_key(page: &Page, header: PageHeader, key: &[u8]) -> usize {
@@ -1306,6 +1969,13 @@ mod tests {
         key
     }
 
+    fn next_rand(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_insert_get_remove_len() {
         let mut tree = PageBPlusTree::new();
@@ -1339,6 +2009,7 @@ mod tests {
         tree.remove(&key).await.unwrap();
         assert_eq!(tree.get(&key).await, None);
         assert_eq!(tree.len(), 0);
+        tree.validate().await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1496,5 +2167,80 @@ mod tests {
         let end = key_for(workers * per_worker - 1);
         let rows = tree.range(&start, &end).await;
         assert!(!rows.is_empty());
+        tree.validate().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_concurrent_mixed_workload_delete_rebalance_safety() {
+        use super::{PageCache, SharedPageProvider};
+        use std::sync::Arc;
+
+        let pages = Arc::new(PageCache::new_with_capacity(16, 1024));
+        let next_page_id = Arc::new(AtomicU64::new(1));
+        let provider = SharedPageProvider::new(Arc::clone(&pages), Arc::clone(&next_page_id));
+        let _tree = PageBPlusTree::new_with_provider(provider.clone());
+
+        let workers = 8u32;
+        let ops_per_worker = 500u32;
+        let local = LocalSet::new();
+        let provider_for_tasks = provider.clone();
+
+        tokio::time::timeout(Duration::from_secs(20), async move {
+            local
+                .run_until(async move {
+                    let mut handles = Vec::new();
+                    for worker in 0..workers {
+                        let provider = provider_for_tasks.clone();
+                        handles.push(tokio::task::spawn_local(async move {
+                            let mut tree = PageBPlusTree::with_provider(provider);
+                            let mut seed = worker as u64 + 1;
+                            for _ in 0..ops_per_worker {
+                                let r = next_rand(&mut seed);
+                                let key_id = (r % 220) as u32;
+                                let key = key_for(key_id);
+                                let op = ((r >> 16) % 100) as u32;
+                                if op < 38 {
+                                    let slot = LeafValue {
+                                        value: [((key_id + worker) & 0xff) as u8; VALUE_SIZE],
+                                        commit_lsn: r,
+                                        undo_ptr: None,
+                                        flags: 0,
+                                        intent_txn_id: 0,
+                                        intent_lsn: 0,
+                                    };
+                                    tree.insert(key, slot).await.unwrap();
+                                } else if op < 65 {
+                                    tree.remove(&key).await.unwrap();
+                                } else if op < 85 {
+                                    let _ = tree.get(&key).await;
+                                } else {
+                                    let k2 = (key_id + ((r >> 24) % 12) as u32).min(219);
+                                    let (s, e) = if key_id <= k2 {
+                                        (key_for(key_id), key_for(k2))
+                                    } else {
+                                        (key_for(k2), key_for(key_id))
+                                    };
+                                    let _ = tree.range(&s, &e).await;
+                                }
+                                if (r & 0x0f) == 0 {
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                        }));
+                    }
+                    for handle in handles {
+                        handle.await.unwrap();
+                    }
+                })
+                .await;
+        })
+        .await
+        .expect("mixed concurrent run timed out (possible deadlock)");
+
+        let tree = PageBPlusTree::with_provider(provider.clone());
+        tree.validate().await.unwrap();
+
+        let rows = tree.range(&key_for(0), &key_for(219)).await;
+        assert!(rows.windows(2).all(|w| w[0].0 < w[1].0));
     }
 }
