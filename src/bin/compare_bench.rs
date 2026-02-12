@@ -31,6 +31,10 @@ struct Config {
     clients: usize,
     duration_secs: u64,
     keyspace: u64,
+    preload_keys: u64,
+    preload: bool,
+    preload_only: bool,
+    allow_misses: bool,
     value_size: usize,
     txn_ops: usize,
     scan_len: usize,
@@ -130,12 +134,17 @@ fn parse_config() -> anyhow::Result<Config> {
         clients: 8,
         duration_secs: 10,
         keyspace: 100_000,
+        preload_keys: 100_000,
+        preload: true,
+        preload_only: false,
+        allow_misses: false,
         value_size: VALUE_SIZE,
         txn_ops: 16,
         scan_len: 64,
         seed: rand::random::<u64>(),
     };
 
+    let mut preload_keys_set = false;
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -178,6 +187,27 @@ fn parse_config() -> anyhow::Result<Config> {
                     .context("missing value for --keyspace")?
                     .parse::<u64>()
                     .context("invalid --keyspace")?;
+            }
+            "--preload-keys" => {
+                i += 1;
+                cfg.preload_keys = args
+                    .get(i)
+                    .context("missing value for --preload-keys")?
+                    .parse::<u64>()
+                    .context("invalid --preload-keys")?;
+                preload_keys_set = true;
+            }
+            "--preload" => {
+                cfg.preload = true;
+            }
+            "--skip-preload" => {
+                cfg.preload = false;
+            }
+            "--preload-only" => {
+                cfg.preload_only = true;
+            }
+            "--allow-misses" => {
+                cfg.allow_misses = true;
             }
             "--value-size" => {
                 i += 1;
@@ -227,6 +257,15 @@ fn parse_config() -> anyhow::Result<Config> {
     if cfg.keyspace == 0 {
         bail!("--keyspace must be > 0");
     }
+    if !preload_keys_set {
+        cfg.preload_keys = cfg.keyspace;
+    }
+    if cfg.preload_keys > cfg.keyspace {
+        cfg.preload_keys = cfg.keyspace;
+    }
+    if !cfg.preload_only && !cfg.allow_misses && cfg.preload_keys == 0 {
+        bail!("--preload-keys must be > 0 unless --allow-misses or --preload-only is set");
+    }
     if cfg.txn_ops == 0 {
         bail!("--txn-ops must be > 0");
     }
@@ -246,7 +285,7 @@ fn parse_config() -> anyhow::Result<Config> {
 
 fn print_help() {
     println!(
-        "Usage: compare_bench [--backend scale-kv|redb] [--mode put|get|scan] [--clients N] [--duration-secs S] [--keyspace K] \\\n[--value-size BYTES] [--txn-ops N] [--scan-len N] [--seed [SEED]]"
+        "Usage: compare_bench [--backend scale-kv|redb] [--mode put|get|scan] [--clients N] [--duration-secs S] [--keyspace K] \\\n[--preload-keys N] [--preload] [--skip-preload] [--preload-only] [--allow-misses] [--value-size BYTES] [--txn-ops N] [--scan-len N] [--seed [SEED]]"
     );
 }
 
@@ -307,32 +346,56 @@ async fn init_backend(
 }
 
 async fn preload(backend: &SharedBackend, cfg: &Config) -> anyhow::Result<()> {
+    const PRELOAD_LOG_INTERVAL: u64 = 10_000;
+    let preload_keys = cfg.preload_keys.min(cfg.keyspace);
+    if preload_keys == 0 {
+        return Ok(());
+    }
+
     match backend {
         SharedBackend::ScaleKv(compute) => {
-            for i in 0..cfg.keyspace {
-                let key = key_for(i);
-                let value = value_for(i, cfg.value_size);
+            let preload_batch = cfg.txn_ops.max(1) as u64;
+            let mut next = 0u64;
+            while next < preload_keys {
+                let batch_end = (next + preload_batch).min(preload_keys);
                 loop {
                     let mut tx = compute.begin_rw().await;
-                    match tx.put(&key, &value).await {
-                        Ok(()) => match tx.commit().await {
-                            Ok(_) => break,
+                    let mut retry_batch = false;
+                    for i in next..batch_end {
+                        let key = key_for(i);
+                        let value = value_for(i, cfg.value_size);
+                        match tx.put(&key, &value).await {
+                            Ok(()) => {}
                             Err(err) if is_retryable_backpressure(&err) => {
-                                tokio::time::sleep(Duration::from_millis(1)).await;
+                                retry_batch = true;
+                                break;
                             }
                             Err(err) => return Err(err.into()),
-                        },
+                        }
+                    }
+
+                    if retry_batch {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        continue;
+                    }
+
+                    match tx.commit().await {
+                        Ok(_) => break,
                         Err(err) if is_retryable_backpressure(&err) => {
                             tokio::time::sleep(Duration::from_millis(1)).await;
                         }
                         Err(err) => return Err(err.into()),
                     }
                 }
+                next = batch_end;
+                if next % PRELOAD_LOG_INTERVAL == 0 || next == preload_keys {
+                    println!("preload_progress loaded={} total={}", next, preload_keys);
+                }
             }
         }
         SharedBackend::Redb(db) => {
             let db = Arc::clone(db);
-            let keyspace = cfg.keyspace;
+            let keyspace = preload_keys;
             let value_size = cfg.value_size;
             tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 const PRELOAD_TXN_BATCH: u64 = 1024;
@@ -356,6 +419,9 @@ async fn preload(backend: &SharedBackend, cfg: &Config) -> anyhow::Result<()> {
                         }
                     }
                     write_txn.commit().context("redb preload commit")?;
+                    if next % PRELOAD_LOG_INTERVAL == 0 || next == keyspace {
+                        println!("preload_progress loaded={} total={}", next, keyspace);
+                    }
                 }
                 Ok(())
             })
@@ -529,6 +595,14 @@ fn mode_name(mode: BenchMode) -> &'static str {
     }
 }
 
+fn effective_keyspace(cfg: &Config) -> u64 {
+    if cfg.allow_misses {
+        cfg.keyspace
+    } else {
+        cfg.preload_keys.min(cfg.keyspace)
+    }
+}
+
 async fn run_workers(backend: SharedBackend, cfg: &Config) -> anyhow::Result<WorkerStats> {
     let mut join_handles = Vec::with_capacity(cfg.clients);
     let duration = Duration::from_secs(cfg.duration_secs);
@@ -537,7 +611,7 @@ async fn run_workers(backend: SharedBackend, cfg: &Config) -> anyhow::Result<Wor
     for worker in 0..cfg.clients {
         let backend = backend.clone();
         let mode = cfg.mode;
-        let keyspace = cfg.keyspace;
+        let keyspace = effective_keyspace(cfg);
         let txn_ops = cfg.txn_ops;
         let scan_len = cfg.scan_len;
         let value_size = cfg.value_size;
@@ -664,8 +738,34 @@ async fn run(cfg: Config, local: &LocalSet) -> anyhow::Result<()> {
     let (_state, backend) = init_backend(&cfg, local).await?;
 
     let preload_start = Instant::now();
-    preload(&backend, &cfg).await?;
+    if cfg.preload {
+        preload(&backend, &cfg).await?;
+    }
     let preload_elapsed = preload_start.elapsed();
+    let workload_keyspace = effective_keyspace(&cfg);
+
+    if cfg.preload_only {
+        println!("backend={}", backend_name(cfg.backend));
+        println!(
+            "config mode={} clients={} duration_secs={} keyspace={} preload_keys={} preload={} preload_only={} allow_misses={} value_size={} txn_ops={} scan_len={} seed={}",
+            mode_name(cfg.mode),
+            cfg.clients,
+            cfg.duration_secs,
+            cfg.keyspace,
+            cfg.preload_keys,
+            cfg.preload,
+            cfg.preload_only,
+            cfg.allow_misses,
+            cfg.value_size,
+            cfg.txn_ops,
+            cfg.scan_len,
+            cfg.seed,
+        );
+        println!("workload_keyspace={}", workload_keyspace);
+        println!("preload_seconds={:.3}", preload_elapsed.as_secs_f64());
+        println!("preload_only=true");
+        return Ok(());
+    }
 
     let run_start = Instant::now();
     let mut stats = run_workers(backend, &cfg).await?;
@@ -684,16 +784,21 @@ async fn run(cfg: Config, local: &LocalSet) -> anyhow::Result<()> {
 
     println!("backend={}", backend_name(cfg.backend));
     println!(
-        "config mode={} clients={} duration_secs={} keyspace={} value_size={} txn_ops={} scan_len={} seed={}",
+        "config mode={} clients={} duration_secs={} keyspace={} preload_keys={} preload={} preload_only={} allow_misses={} value_size={} txn_ops={} scan_len={} seed={}",
         mode_name(cfg.mode),
         cfg.clients,
         cfg.duration_secs,
         cfg.keyspace,
+        cfg.preload_keys,
+        cfg.preload,
+        cfg.preload_only,
+        cfg.allow_misses,
         cfg.value_size,
         cfg.txn_ops,
         cfg.scan_len,
         cfg.seed,
     );
+    println!("workload_keyspace={}", workload_keyspace);
     println!("preload_seconds={:.3}", preload_elapsed.as_secs_f64());
     println!("run_seconds={:.3}", run_elapsed.as_secs_f64());
     println!("ops_total={}", total_ops);
