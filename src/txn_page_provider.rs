@@ -1,13 +1,17 @@
 use crate::page_bptree::{AsyncPageProvider, PageCache, PageLatchTable};
 use crate::{Page, PageId};
 use futures::future::LocalBoxFuture;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
-/// A shared page provider that additionally tracks pages written since the last `take_dirty()`.
-///
-/// This is used on compute side to collect page after-images for page-level redo.
+tokio::task_local! {
+    pub(crate) static CURRENT_TXN_DIRTY: Rc<RefCell<BTreeMap<PageId, Page>>>;
+}
+
+/// Shared page provider for B+Tree pages.
 #[derive(Clone)]
 pub struct TxnPageProvider {
     pages: Arc<PageCache>,
@@ -15,8 +19,6 @@ pub struct TxnPageProvider {
     root: Arc<AtomicU64>,
     btree_meta_page_id: PageId,
     fetcher: Arc<dyn Fn(PageId) -> LocalBoxFuture<'static, Option<Page>>>,
-
-    dirty: Arc<Mutex<BTreeMap<PageId, Page>>>,
 }
 
 impl TxnPageProvider {
@@ -32,7 +34,6 @@ impl TxnPageProvider {
             root: Arc::new(AtomicU64::new(0)),
             btree_meta_page_id,
             fetcher,
-            dirty: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -43,25 +44,10 @@ impl TxnPageProvider {
     pub fn next_page_id(&self) -> PageId {
         self.next_page_id.load(Ordering::Acquire)
     }
-
-    pub fn take_dirty(&self) -> Vec<(PageId, Page)> {
-        let mut d = self.dirty.lock().unwrap();
-        let out: Vec<(PageId, Page)> = d.iter().map(|(k, v)| (*k, v.clone())).collect();
-        d.clear();
-        out
-    }
-
-    fn record_dirty(&self, page_id: PageId, page: &Page) {
-        self.dirty.lock().unwrap().insert(page_id, page.clone());
-    }
 }
 
 impl AsyncPageProvider for TxnPageProvider {
     async fn read_page(&self, page_id: PageId) -> Option<Page> {
-        // Prefer in-txn dirty version.
-        if let Some(p) = self.dirty.lock().unwrap().get(&page_id).cloned() {
-            return Some(p);
-        }
         if let Some(p) = self.pages.get(page_id) {
             return Some(p);
         }
@@ -73,7 +59,9 @@ impl AsyncPageProvider for TxnPageProvider {
 
     async fn write_page(&self, page_id: PageId, page: Page) {
         self.pages.insert(page_id, page.clone());
-        self.record_dirty(page_id, &page);
+        let _ = CURRENT_TXN_DIRTY.try_with(|dirty| {
+            dirty.borrow_mut().insert(page_id, page);
+        });
     }
 
     fn alloc_page_id(&self) -> PageId {
@@ -93,7 +81,9 @@ impl AsyncPageProvider for TxnPageProvider {
         };
         let page = meta.encode();
         self.pages.insert(self.btree_meta_page_id, page.clone());
-        self.record_dirty(self.btree_meta_page_id, &page);
+        let _ = CURRENT_TXN_DIRTY.try_with(|dirty| {
+            dirty.borrow_mut().insert(self.btree_meta_page_id, page);
+        });
     }
 
     fn page_latch_table(&self) -> Arc<PageLatchTable> {
