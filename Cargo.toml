@@ -20,11 +20,12 @@ rand = "0.8"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+redb = "2"
+sled = "0.34"
+tempfile = "3"
 
 [dev-dependencies]
 criterion = "0.5"
-sled = "0.34"
-tempfile = "3"
 
 [[bench]]
 name = "ycsb"
