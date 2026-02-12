@@ -12,12 +12,15 @@ use crate::{
         self, SEGMENT_STATE_COMMITTED, SEGMENT_STATE_PURGED, UndoPtr, UndoRecord, UndoSegmentHeader,
     },
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use tokio::task::LocalSet;
+
+const FLAG_TOMBSTONE: u16 = 1;
+const FLAG_INTENT: u16 = 2;
 
 /// Embedded compute-side API for an Aurora-style KV (page-level redo).
 ///
@@ -36,9 +39,28 @@ pub struct EmbeddedCompute {
     provider: Arc<TxnPageProvider>,
     tree: Arc<Mutex<PageBPlusTree<TxnPageProvider>>>,
     write_lock: Arc<Mutex<()>>,
+    txn_registry: Arc<Mutex<HashMap<u64, PendingTxn>>>,
+    default_rw_txn_timeout: Duration,
+    txn_reaper_interval: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct PendingTxn {
+    deadline: Instant,
+    write_keys: BTreeSet<[u8; KEY_SIZE]>,
+    notify: Arc<Notify>,
 }
 
 impl EmbeddedCompute {
+    fn read_duration_env_ms(name: &str, default_ms: u64) -> Duration {
+        let ms = std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_ms);
+        Duration::from_millis(ms)
+    }
+
     pub async fn connect(addrs: &[String], quorum: usize, local: &LocalSet) -> Result<Self> {
         let sequencer = Arc::new(ComputeSequencer::connect(addrs, quorum, local).await?);
 
@@ -122,15 +144,173 @@ impl EmbeddedCompute {
             provider,
             tree,
             write_lock: Arc::new(Mutex::new(())),
+            txn_registry: Arc::new(Mutex::new(HashMap::new())),
+            default_rw_txn_timeout: Self::read_duration_env_ms("SCALE_KV_RW_TXN_TIMEOUT_MS", 5_000),
+            txn_reaper_interval: Self::read_duration_env_ms("SCALE_KV_TXN_REAPER_MS", 100),
         };
 
         // Initialize or recover meta/root.
         this.recover_or_init().await?;
+        this.spawn_txn_reaper(local);
         Ok(this)
+    }
+
+    fn spawn_txn_reaper(&self, _local: &LocalSet) {
+        let compute = self.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                tokio::time::sleep(compute.txn_reaper_interval).await;
+                let expired = {
+                    let now = Instant::now();
+                    let registry = compute.txn_registry.lock().await;
+                    registry
+                        .iter()
+                        .filter_map(|(txn_id, pending)| {
+                            if pending.deadline <= now {
+                                Some(*txn_id)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
+                if expired.is_empty() {
+                    continue;
+                }
+                for txn_id in expired {
+                    let _write_guard = compute.write_lock.clone().lock_owned().await;
+                    let write_keys = {
+                        let now = Instant::now();
+                        let registry = compute.txn_registry.lock().await;
+                        registry
+                            .get(&txn_id)
+                            .and_then(|pending| {
+                                if pending.deadline <= now {
+                                    Some(pending.write_keys.iter().copied().collect::<Vec<_>>())
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_default()
+                    };
+                    let _ = compute.resolve_txn_intents(txn_id, &write_keys).await;
+                    let _ = compute.remove_pending_txn(txn_id).await;
+                }
+            }
+        });
     }
 
     pub(crate) fn begin_ro(&self) -> u64 {
         self.sequencer.begin_ro()
+    }
+
+    async fn register_pending_txn(&self, txn_id: u64, deadline: Instant) {
+        let mut registry = self.txn_registry.lock().await;
+        registry.insert(
+            txn_id,
+            PendingTxn {
+                deadline,
+                write_keys: BTreeSet::new(),
+                notify: Arc::new(Notify::new()),
+            },
+        );
+    }
+
+    async fn record_txn_write(&self, txn_id: u64, key: [u8; KEY_SIZE]) {
+        let mut registry = self.txn_registry.lock().await;
+        if let Some(pending) = registry.get_mut(&txn_id) {
+            pending.write_keys.insert(key);
+        }
+    }
+
+    async fn remove_pending_txn(&self, txn_id: u64) -> Option<PendingTxn> {
+        let pending = self.txn_registry.lock().await.remove(&txn_id);
+        if let Some(p) = &pending {
+            p.notify.notify_waiters();
+        }
+        pending
+    }
+
+    async fn wait_on_pending_txn(&self, txn_id: u64, grace: Duration) -> Result<()> {
+        loop {
+            let pending = { self.txn_registry.lock().await.get(&txn_id).cloned() };
+            let Some(pending) = pending else {
+                return Ok(());
+            };
+
+            let deadline = pending.deadline + grace;
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "timed out waiting for intent txn_id={} deadline_with_grace_elapsed",
+                        txn_id
+                    ),
+                )));
+            }
+
+            let sleep_until = tokio::time::Instant::from_std(deadline);
+            match tokio::time::timeout_at(sleep_until, pending.notify.notified()).await {
+                Ok(_) => {}
+                Err(_) => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "timed out waiting for intent txn_id={} deadline_with_grace_elapsed",
+                            txn_id
+                        ),
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn resolve_txn_intents(&self, txn_id: u64, keys: &[[u8; KEY_SIZE]]) -> Result<()> {
+        let mut tree = self.tree.lock().await;
+        for key in keys {
+            let Some(row) = tree.get(key).await else {
+                continue;
+            };
+            if (row.flags & FLAG_INTENT) == 0 || row.intent_txn_id != txn_id {
+                continue;
+            }
+            let mut undo_ptr = row.undo_ptr;
+            if undo_ptr.is_none() {
+                tree.remove(key).await?;
+                continue;
+            }
+            loop {
+                let Some(ptr) = undo_ptr else {
+                    tree.remove(key).await?;
+                    break;
+                };
+                let upage = self
+                    .page_cache
+                    .get(ptr.page_id)
+                    .ok_or(Error::InMemoryPageMissing(ptr.page_id))?;
+                let rec = undo_pg::read_record(&upage, ptr.slot_id)?;
+                if (rec.old_flags & FLAG_INTENT) != 0 {
+                    undo_ptr = rec.prev;
+                    continue;
+                }
+                if rec.old_commit_lsn == 0 && rec.prev.is_none() {
+                    tree.remove(key).await?;
+                } else {
+                    let restored = LeafValue {
+                        value: rec.old_value,
+                        commit_lsn: rec.old_commit_lsn,
+                        undo_ptr: rec.prev,
+                        flags: rec.old_flags & !FLAG_INTENT,
+                        intent_txn_id: 0,
+                        intent_lsn: 0,
+                    };
+                    tree.insert(key.to_vec(), restored).await?;
+                }
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Begin a read snapshot and keep it active (for GC watermarking) until the guard is dropped.
@@ -296,12 +476,14 @@ impl EmbeddedCompute {
             write_guard,
             dirty: BTreeMap::new(),
             ro_cache: BTreeMap::new(),
-            modified: Vec::new(),
+            modified: BTreeSet::new(),
             undo_txn_id: if read_only {
                 None
             } else {
                 Some(self.sequencer.allocate_request_id())
             },
+            // Use txn snapshot LSN as intent base for first writes in this txn.
+            intent_base_lsn: if read_only { 0 } else { read_lsn },
             undo_segment_first_page_id: None,
             undo_segment_last_page_id: None,
             undo_segment_last_record: None,
@@ -312,7 +494,12 @@ impl EmbeddedCompute {
     /// Begin a read-write transaction.
     pub async fn begin_rw(&self) -> EmbeddedTxn {
         let write_guard = Some(self.write_lock.clone().lock_owned().await);
-        self.begin_tx(false, None, write_guard)
+        let tx = self.begin_tx(false, None, write_guard);
+        if let Some(txn_id) = tx.undo_txn_id {
+            let deadline = tx.registry_deadline(self.default_rw_txn_timeout);
+            self.register_pending_txn(txn_id, deadline).await;
+        }
+        tx
     }
 
     /// Begin a read-only transaction with timeout.
@@ -323,7 +510,12 @@ impl EmbeddedCompute {
     /// Begin a read-write transaction with timeout.
     pub async fn begin_rw_timeout(&self, timeout: Duration) -> EmbeddedTxn {
         let write_guard = Some(self.write_lock.clone().lock_owned().await);
-        self.begin_tx(false, Some(timeout), write_guard)
+        let tx = self.begin_tx(false, Some(timeout), write_guard);
+        if let Some(txn_id) = tx.undo_txn_id {
+            let deadline = tx.registry_deadline(self.default_rw_txn_timeout);
+            self.register_pending_txn(txn_id, deadline).await;
+        }
+        tx
     }
 
     /// Convenience: write a single page after-image in its own txn.
@@ -415,7 +607,7 @@ impl EmbeddedCompute {
                 continue;
             }
 
-            if (row.flags & 1) != 0 {
+            if (row.flags & FLAG_TOMBSTONE) != 0 {
                 keys_to_remove.push(key);
                 continue;
             }
@@ -561,9 +753,10 @@ pub struct EmbeddedTxn {
 
     dirty: BTreeMap<PageId, Page>,
     ro_cache: BTreeMap<PageId, Page>,
-    modified: Vec<[u8; KEY_SIZE]>,
+    modified: BTreeSet<[u8; KEY_SIZE]>,
 
     undo_txn_id: Option<u64>,
+    intent_base_lsn: u64,
     undo_segment_first_page_id: Option<PageId>,
     undo_segment_last_page_id: Option<PageId>,
     undo_segment_last_record: Option<UndoPtr>,
@@ -579,6 +772,10 @@ impl Drop for EmbeddedTxn {
 }
 
 impl EmbeddedTxn {
+    fn registry_deadline(&self, default_timeout: Duration) -> Instant {
+        self.started_at + self.timeout.unwrap_or(default_timeout)
+    }
+
     fn ensure_not_timed_out(&self) -> Result<()> {
         if let Some(timeout) = self.timeout
             && self.started_at.elapsed() > timeout
@@ -720,32 +917,70 @@ impl EmbeddedTxn {
         Ok(ptr)
     }
 
-    async fn read_visible_value_from_row(&mut self, row: &LeafValue) -> Result<Option<Vec<u8>>> {
-        if row.commit_lsn <= self.read_lsn {
-            if (row.flags & 1) != 0 {
-                return Ok(None);
-            }
-            return Ok(Some(row.value.to_vec()));
-        }
-
-        // Not visible at this snapshot: walk undo chain to find latest visible version.
-        let mut undo = row.undo_ptr;
+    async fn read_visible_from_undo(
+        &mut self,
+        mut undo: Option<UndoPtr>,
+    ) -> Result<Option<Vec<u8>>> {
         while let Some(ptr) = undo {
             let upage = self
                 .get_page_for_read(ptr.page_id)
                 .await
                 .ok_or(Error::InMemoryPageMissing(ptr.page_id))?;
             let rec = undo_pg::read_record(&upage, ptr.slot_id)?;
+            if (rec.old_flags & FLAG_INTENT) != 0 {
+                undo = rec.prev;
+                continue;
+            }
             if rec.old_commit_lsn <= self.read_lsn {
-                if (rec.old_flags & 1) != 0 {
+                if (rec.old_flags & FLAG_TOMBSTONE) != 0 {
                     return Ok(None);
                 }
                 return Ok(Some(rec.old_value.to_vec()));
             }
             undo = rec.prev;
         }
-
         Ok(None)
+    }
+
+    async fn read_visible_value_from_row(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let intent_wait_grace = Duration::from_millis(50);
+        loop {
+            self.ensure_not_timed_out()?;
+
+            let row = {
+                let tree = self.compute.tree.lock().await;
+                tree.get(key).await
+            };
+            let Some(row) = row else {
+                return Ok(None);
+            };
+
+            if (row.flags & FLAG_INTENT) != 0 {
+                if self.undo_txn_id == Some(row.intent_txn_id) {
+                    if (row.flags & FLAG_TOMBSTONE) != 0 {
+                        return Ok(None);
+                    }
+                    return Ok(Some(row.value.to_vec()));
+                }
+                if row.intent_lsn > self.read_lsn {
+                    return self.read_visible_from_undo(row.undo_ptr).await;
+                }
+                self.compute
+                    .wait_on_pending_txn(row.intent_txn_id, intent_wait_grace)
+                    .await?;
+                continue;
+            }
+
+            if row.commit_lsn <= self.read_lsn {
+                if (row.flags & FLAG_TOMBSTONE) != 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(row.value.to_vec()));
+            }
+
+            // Not visible at this snapshot: walk undo chain to find latest visible version.
+            return self.read_visible_from_undo(row.undo_ptr).await;
+        }
     }
 
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -767,20 +1002,37 @@ impl EmbeddedTxn {
             value: new_value,
             commit_lsn: 0,
             undo_ptr: None,
-            flags: 0,
+            flags: FLAG_INTENT,
+            intent_txn_id: self.undo_txn_id.unwrap_or(0),
+            intent_lsn: self.intent_base_lsn,
         };
         if let Some(old) = existing {
-            row.undo_ptr = Some(
-                self.append_undo(0, 0, old.undo_ptr, old.commit_lsn, old.flags, &old.value)
-                    .await?,
-            );
+            if (old.flags & FLAG_INTENT) != 0 && self.undo_txn_id == Some(old.intent_txn_id) {
+                row.undo_ptr = old.undo_ptr;
+                row.intent_lsn = old.intent_lsn;
+            } else {
+                if (old.flags & FLAG_INTENT) != 0 && self.undo_txn_id != Some(old.intent_txn_id) {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!("encountered foreign intent txn_id={}", old.intent_txn_id),
+                    )));
+                }
+                row.undo_ptr = Some(
+                    self.append_undo(0, 0, old.undo_ptr, old.commit_lsn, old.flags, &old.value)
+                        .await?,
+                );
+            }
         }
 
         {
             let mut tree = self.compute.tree.lock().await;
             tree.insert(key.to_vec(), row).await?;
         }
-        self.modified.push(key.try_into().unwrap());
+        let key_arr: [u8; KEY_SIZE] = key.try_into().unwrap();
+        self.modified.insert(key_arr);
+        if let Some(txn_id) = self.undo_txn_id {
+            self.compute.record_txn_write(txn_id, key_arr).await;
+        }
 
         Ok(())
     }
@@ -790,15 +1042,7 @@ impl EmbeddedTxn {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
-        let row = {
-            let tree = self.compute.tree.lock().await;
-            tree.get(key).await
-        };
-        let Some(row) = row else {
-            return Ok(None);
-        };
-
-        self.read_visible_value_from_row(&row).await
+        self.read_visible_value_from_row(key).await
     }
 
     /// Scan the primary key range `[start, end]` (inclusive) at this txn snapshot.
@@ -828,8 +1072,8 @@ impl EmbeddedTxn {
         };
 
         let mut out = Vec::with_capacity(limit.min(entries.len()));
-        for (key, row) in entries {
-            if let Some(value) = self.read_visible_value_from_row(&row).await? {
+        for (key, _row) in entries {
+            if let Some(value) = self.read_visible_value_from_row(&key).await? {
                 out.push((key, value));
                 if out.len() >= limit {
                     break;
@@ -885,22 +1129,61 @@ impl EmbeddedTxn {
         };
 
         if let Some(old) = existing {
-            let undo_ptr = self
-                .append_undo(0, 0, old.undo_ptr, old.commit_lsn, old.flags, &old.value)
-                .await?;
+            if (old.flags & FLAG_INTENT) != 0 && self.undo_txn_id != Some(old.intent_txn_id) {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("encountered foreign intent txn_id={}", old.intent_txn_id),
+                )));
+            }
+            let undo_ptr =
+                if (old.flags & FLAG_INTENT) != 0 && self.undo_txn_id == Some(old.intent_txn_id) {
+                    old.undo_ptr
+                } else {
+                    Some(
+                        self.append_undo(0, 0, old.undo_ptr, old.commit_lsn, old.flags, &old.value)
+                            .await?,
+                    )
+                };
             let row = LeafValue {
                 value: old.value,
                 commit_lsn: 0,
-                undo_ptr: Some(undo_ptr),
-                flags: old.flags | 1,
+                undo_ptr,
+                flags: FLAG_TOMBSTONE | FLAG_INTENT,
+                intent_txn_id: self.undo_txn_id.unwrap_or(0),
+                intent_lsn: if (old.flags & FLAG_INTENT) != 0
+                    && self.undo_txn_id == Some(old.intent_txn_id)
+                {
+                    old.intent_lsn
+                } else {
+                    self.intent_base_lsn
+                },
             };
             let mut tree = self.compute.tree.lock().await;
             tree.insert(key.to_vec(), row).await?;
             drop(tree);
-            self.modified.push(key.try_into().unwrap());
+            let key_arr: [u8; KEY_SIZE] = key.try_into().unwrap();
+            self.modified.insert(key_arr);
+            if let Some(txn_id) = self.undo_txn_id {
+                self.compute.record_txn_write(txn_id, key_arr).await;
+            }
         }
 
         Ok(())
+    }
+
+    pub async fn abort(mut self) -> Result<()> {
+        if self.read_only {
+            let _ = self.read_guard.take();
+            let _ = self.write_guard.take();
+            return Ok(());
+        }
+        let txn_id = self.undo_txn_id.unwrap_or(0);
+        let keys = self.modified.iter().copied().collect::<Vec<_>>();
+        let out = self.compute.resolve_txn_intents(txn_id, &keys).await;
+        let _ = self.compute.remove_pending_txn(txn_id).await;
+        let _ = self.read_guard.take();
+        let _ = self.write_guard.take();
+        out.map(|_| ())
     }
 
     pub async fn commit(mut self) -> Result<u64> {
@@ -1018,6 +1301,9 @@ impl EmbeddedTxn {
             for key in &self.modified {
                 if let Some(mut row) = tree.get(key).await {
                     row.commit_lsn = commit_lsn;
+                    row.flags &= !FLAG_INTENT;
+                    row.intent_txn_id = 0;
+                    row.intent_lsn = 0;
                     tree.insert(key.to_vec(), row).await?;
                 }
             }
@@ -1092,6 +1378,10 @@ impl EmbeddedTxn {
             .compute
             .commit_pages_reserved(request_id, start_lsn, end_lsn, pages)
             .await;
+
+        if out.is_ok() {
+            let _ = self.compute.remove_pending_txn(request_id).await;
+        }
 
         // Mark snapshot inactive before returning.
         let _ = self.read_guard.take();

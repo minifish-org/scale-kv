@@ -22,7 +22,7 @@ const HEADER_SIZE: usize = 48; // padded header
 // 29..(29+HIGH_KEY_SIZE): high_key bytes
 
 const OFFSET_ENTRY_SIZE: usize = 2;
-pub const LEAF_VALUE_SIZE: usize = VALUE_SIZE + 8 + 8 + 2 + 2;
+pub const LEAF_VALUE_SIZE: usize = VALUE_SIZE + 8 + 8 + 2 + 2 + 8 + 8;
 const CHILD_ID_SIZE: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +31,8 @@ pub struct LeafValue {
     pub commit_lsn: u64,
     pub undo_ptr: Option<UndoPtr>,
     pub flags: u16,
+    pub intent_txn_id: u64,
+    pub intent_lsn: u64,
 }
 
 /// Trait for page storage backend.
@@ -1151,6 +1153,8 @@ fn encode_leaf_value(leaf_value: &LeafValue) -> Vec<u8> {
     buf.extend_from_slice(&undo_pid.to_le_bytes());
     buf.extend_from_slice(&undo_sid.to_le_bytes());
     buf.extend_from_slice(&leaf_value.flags.to_le_bytes());
+    buf.extend_from_slice(&leaf_value.intent_txn_id.to_le_bytes());
+    buf.extend_from_slice(&leaf_value.intent_lsn.to_le_bytes());
     buf
 }
 
@@ -1165,6 +1169,10 @@ fn decode_leaf_value(buf: &[u8]) -> LeafValue {
     let undo_slot_id = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap());
     off += 2;
     let flags = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap());
+    off += 2;
+    let intent_txn_id = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+    off += 8;
+    let intent_lsn = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
     let undo_ptr = if undo_page_id == 0 {
         None
     } else {
@@ -1178,6 +1186,8 @@ fn decode_leaf_value(buf: &[u8]) -> LeafValue {
         commit_lsn,
         undo_ptr,
         flags,
+        intent_txn_id,
+        intent_lsn,
     }
 }
 
@@ -1213,12 +1223,16 @@ mod tests {
             commit_lsn: 11,
             undo_ptr: None,
             flags: 0,
+            intent_txn_id: 0,
+            intent_lsn: 0,
         };
         let updated = LeafValue {
             value: [2u8; VALUE_SIZE],
             commit_lsn: 22,
             undo_ptr: None,
             flags: 1,
+            intent_txn_id: 0,
+            intent_lsn: 0,
         };
 
         assert_eq!(tree.get(&key).await, None);
@@ -1245,6 +1259,8 @@ mod tests {
                 commit_lsn: i as u64,
                 undo_ptr: None,
                 flags: 0,
+                intent_txn_id: 0,
+                intent_lsn: 0,
             };
             tree.insert(key, slot).await.unwrap();
         }
@@ -1269,6 +1285,8 @@ mod tests {
             commit_lsn: 100,
             undo_ptr: None,
             flags: 0,
+            intent_txn_id: 0,
+            intent_lsn: 0,
         };
 
         tree.insert(key.clone(), slot.clone()).await.unwrap();
@@ -1313,6 +1331,8 @@ mod tests {
             commit_lsn: 42,
             undo_ptr: None,
             flags: 0,
+            intent_txn_id: 0,
+            intent_lsn: 0,
         };
 
         tree.insert(key.clone(), slot.clone()).await.unwrap();

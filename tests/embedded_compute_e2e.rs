@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{fs, process};
 
-use scale_kv::{EmbeddedCompute, KEY_SIZE, PAGE_SIZE, StorageServer, VALUE_SIZE};
+use scale_kv::{EmbeddedCompute, ErrorCategory, KEY_SIZE, PAGE_SIZE, StorageServer, VALUE_SIZE};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -191,6 +191,180 @@ async fn test_rw_txn_is_serialized_by_single_writer_gate() {
             })
             .await
             .unwrap();
+        })
+        .await;
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_timeout_reaper_aborts_dropped_rw_txn_and_resolves_intent() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir = temp_dir();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
+                .await
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+
+            let key = test_key(42);
+            let old_value = test_value(7);
+            let new_value = test_value(9);
+            compute.put(&key, &old_value).await.unwrap();
+
+            {
+                let mut tx = compute.begin_rw_timeout(Duration::from_millis(100)).await;
+                tx.put(&key, &new_value).await.unwrap();
+                // Drop without commit/abort.
+            }
+
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            let got = compute.get(&key).await.unwrap();
+            assert_eq!(got, Some(old_value));
+        })
+        .await;
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_reader_waits_on_foreign_intent_until_commit() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir = temp_dir();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
+                .await
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+
+            let key = test_key(99);
+            let old_value = test_value(1);
+            let pending = test_value(2);
+            compute.put(&key, &old_value).await.unwrap();
+
+            let mut tx = compute.begin_rw_timeout(Duration::from_secs(2)).await;
+            tx.put(&key, &pending).await.unwrap();
+
+            let compute2 = compute.clone();
+            let key2 = key.clone();
+            let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_local(async move {
+                let _ = done_tx.send(compute2.get(&key2).await);
+            });
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut done_rx)
+                    .await
+                    .is_err()
+            );
+
+            tx.commit().await.unwrap();
+
+            let got = tokio::time::timeout(Duration::from_secs(2), &mut done_rx)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            // Reader snapshot was taken while the intent existed, so even after waiting for
+            // commit it should read the old version if commit_lsn > read_lsn.
+            assert_eq!(got, Some(old_value));
+        })
+        .await;
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_reader_does_not_wait_when_intent_is_newer_than_snapshot() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir = temp_dir();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
+                .await
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+
+            let key = test_key(101);
+            let old_value = test_value(5);
+            let pending_value = test_value(6);
+            compute.put(&key, &old_value).await.unwrap();
+
+            let mut ro = compute.begin_ro_timeout(Duration::from_secs(2));
+            // Advance global LSN after the RO snapshot so the upcoming intent_lsn (writer start_lsn)
+            // is greater than ro.read_lsn, and RO should NOT wait.
+            let bump_key = test_key(1);
+            let bump_val = test_value(1);
+            compute.put(&bump_key, &bump_val).await.unwrap();
+
+            let mut tx = compute.begin_rw_timeout(Duration::from_secs(2)).await;
+            tx.put(&key, &pending_value).await.unwrap();
+
+            let got = tokio::time::timeout(Duration::from_millis(100), ro.get(&key))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(got, Some(old_value));
+
+            tx.abort().await.unwrap();
+        })
+        .await;
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_reader_times_out_waiting_on_unresolved_foreign_intent() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir = temp_dir();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
+                .await
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+
+            let key = test_key(100);
+            let pending = test_value(3);
+
+            let mut tx = compute.begin_rw_timeout(Duration::from_millis(120)).await;
+            tx.put(&key, &pending).await.unwrap();
+
+            let err = compute.get(&key).await.unwrap_err();
+            assert!(err.is_retryable());
+            assert_eq!(err.category(), ErrorCategory::Backpressure);
+
+            let scan_err = compute.scan_range(&key, &key, 10).await.unwrap_err();
+            assert!(scan_err.is_retryable());
+            assert_eq!(scan_err.category(), ErrorCategory::Backpressure);
+
+            tx.abort().await.unwrap();
         })
         .await;
 
