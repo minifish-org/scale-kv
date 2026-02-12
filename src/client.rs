@@ -95,7 +95,11 @@ impl StorageClient {
         let r = response.get()?;
         let durable = r.get_durable_lsn();
         if r.get_found() {
-            Ok(Some((r.get_page()?.to_vec(), r.get_page_lsn(), durable)))
+            Ok(Some((
+                Page::copy_from_slice(r.get_page()?),
+                r.get_page_lsn(),
+                durable,
+            )))
         } else {
             Ok(None)
         }
@@ -122,7 +126,7 @@ impl StorageClient {
             out.push((
                 item.get_page_id(),
                 item.get_page_lsn(),
-                item.get_page()?.to_vec(),
+                Page::copy_from_slice(item.get_page()?),
             ));
         }
         Ok((out, durable))

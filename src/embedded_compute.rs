@@ -907,7 +907,8 @@ impl EmbeddedCompute {
             let mut head_page = self
                 .get_page(head, gc_lsn)
                 .await
-                .ok_or(Error::InMemoryPageMissing(head))?;
+                .ok_or(Error::InMemoryPageMissing(head))?
+                .to_vec();
             let mut head_hdr = undo_pg::read_segment_header(&head_page)?;
             if head_hdr.state != SEGMENT_STATE_COMMITTED || head_hdr.commit_lsn > gc_lsn {
                 break;
@@ -922,11 +923,12 @@ impl EmbeddedCompute {
                 let mut next_page = self
                     .get_page(next, gc_lsn)
                     .await
-                    .ok_or(Error::InMemoryPageMissing(next))?;
+                    .ok_or(Error::InMemoryPageMissing(next))?
+                    .to_vec();
                 let mut next_hdr = undo_pg::read_segment_header(&next_page)?;
                 next_hdr.history_prev = 0;
                 undo_pg::write_segment_header(&mut next_page, next_hdr)?;
-                dirty_pages.insert(next, next_page);
+                dirty_pages.insert(next, Page::from(next_page));
             }
 
             let mut pid = head_hdr.first_page_id;
@@ -944,7 +946,7 @@ impl EmbeddedCompute {
             head_hdr.history_prev = 0;
             head_hdr.history_next = 0;
             undo_pg::write_segment_header(&mut head_page, head_hdr)?;
-            dirty_pages.insert(head, head_page);
+            dirty_pages.insert(head, Page::from(head_page));
         }
 
         if dirty_pages.is_empty() {
@@ -1160,7 +1162,8 @@ impl EmbeddedTxn {
             .cloned()
             .or_else(|| self.compute.page_cache.get(current_id))
             .or_else(|| self.ro_cache.get(&current_id).cloned())
-            .ok_or(Error::InMemoryPageMissing(current_id))?;
+            .ok_or(Error::InMemoryPageMissing(current_id))?
+            .to_vec();
 
         let mut old_value_arr = [0u8; VALUE_SIZE];
         old_value_arr.copy_from_slice(old_value);
@@ -1180,9 +1183,9 @@ impl EmbeddedTxn {
             Err(_) => {
                 let new_pid = alloc_page_id(&mut meta);
                 undo_pg::set_page_next_id(&mut page, new_pid)?;
-                self.write_page(current_id, page);
+                self.write_page(current_id, Page::from(page));
 
-                let mut new_page = undo_pg::new_undo_page();
+                let mut new_page = undo_pg::new_undo_page().to_vec();
                 let s = undo_pg::append_record(&mut new_page, &rec)?;
                 current_id = new_pid;
                 page = new_page;
@@ -1198,7 +1201,7 @@ impl EmbeddedTxn {
         self.undo_segment_last_record = Some(ptr);
         self.undo_segment_record_count = self.undo_segment_record_count.saturating_add(1);
 
-        self.write_page(current_id, page);
+        self.write_page(current_id, Page::from(page));
         self.write_page(META_PAGE_ID, meta.encode());
 
         Ok(ptr)
@@ -1691,7 +1694,8 @@ impl EmbeddedTxn {
                 .get(&first_pid)
                 .cloned()
                 .or_else(|| self.compute.page_cache.get(first_pid))
-                .ok_or(Error::InMemoryPageMissing(first_pid))?;
+                .ok_or(Error::InMemoryPageMissing(first_pid))?
+                .to_vec();
 
             let old_tail = base_meta.undo_history_tail;
             let hdr = UndoSegmentHeader {
@@ -1706,7 +1710,7 @@ impl EmbeddedTxn {
                 history_next: 0,
             };
             undo_pg::write_segment_header(&mut head_page, hdr)?;
-            map.insert(first_pid, head_page);
+            map.insert(first_pid, Page::from(head_page));
 
             if old_tail != 0 {
                 let mut tail_page = map
@@ -1714,11 +1718,12 @@ impl EmbeddedTxn {
                     .cloned()
                     .or_else(|| self.compute.page_cache.get(old_tail))
                     .or_else(|| self.ro_cache.get(&old_tail).cloned())
-                    .ok_or(Error::InMemoryPageMissing(old_tail))?;
+                    .ok_or(Error::InMemoryPageMissing(old_tail))?
+                    .to_vec();
                 let mut tail_hdr = undo_pg::read_segment_header(&tail_page)?;
                 tail_hdr.history_next = first_pid;
                 undo_pg::write_segment_header(&mut tail_page, tail_hdr)?;
-                map.insert(old_tail, tail_page);
+                map.insert(old_tail, Page::from(tail_page));
             } else {
                 meta.undo_history_head = first_pid;
             }

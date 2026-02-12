@@ -1,4 +1,4 @@
-use crate::{Error, Result, StorageClient};
+use crate::{Error, Page, Result, StorageClient};
 use futures::future::join_all;
 use rand;
 use std::sync::Arc;
@@ -131,7 +131,7 @@ impl ComputeSequencer {
     ///
     /// Convenience wrapper: reserves an LSN range then commits.
     /// Returns commitLsn (= end_lsn) on success.
-    pub async fn commit_txn_batch(&self, writes: Vec<(u64, Vec<u8>)>) -> Result<u64> {
+    pub async fn commit_txn_batch(&self, writes: Vec<(u64, Page)>) -> Result<u64> {
         let (request_id, start_lsn, end_lsn) = self.reserve_txn(writes.len())?;
         self.commit_reserved_txn_batch(request_id, start_lsn, end_lsn, writes)
             .await
@@ -145,7 +145,7 @@ impl ComputeSequencer {
         request_id: u64,
         start_lsn: u64,
         end_lsn: u64,
-        writes: Vec<(u64, Vec<u8>)>,
+        writes: Vec<(u64, Page)>,
     ) -> Result<u64> {
         // Enforce global dispatch order by reserved LSN range.
         loop {

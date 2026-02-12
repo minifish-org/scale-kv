@@ -107,7 +107,7 @@ pub fn new_undo_page() -> Page {
     write_u16(&mut p, OFF_FREE_END, PAGE_SIZE as u16);
     write_u16(&mut p, OFF_COUNT, 0);
     write_u64(&mut p, OFF_PAGE_NEXT, 0);
-    p
+    Page::from(p)
 }
 
 pub fn new_undo_segment_page(txn_id: u64, page_id: PageId) -> Page {
@@ -125,7 +125,7 @@ pub fn new_undo_segment_page(txn_id: u64, page_id: PageId) -> Page {
     write_u32(&mut p, OFF_SEG_RECORD_COUNT, 0);
     write_u64(&mut p, OFF_SEG_HISTORY_PREV, 0);
     write_u64(&mut p, OFF_SEG_HISTORY_NEXT, 0);
-    p
+    Page::from(p)
 }
 
 pub fn undo_count(page: &[u8]) -> u16 {

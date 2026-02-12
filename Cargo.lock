@@ -854,6 +854,7 @@ name = "scale_kv"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "capnp",
  "capnp-rpc",
  "capnpc",

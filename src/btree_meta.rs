@@ -22,7 +22,7 @@ impl BtreeMeta {
         p[0..8].copy_from_slice(MAGIC);
         p[8..12].copy_from_slice(&VERSION.to_le_bytes());
         p[12..20].copy_from_slice(&self.root_page_id.to_le_bytes());
-        p
+        Page::from(p)
     }
 
     pub fn decode(page: &[u8]) -> Result<Self> {

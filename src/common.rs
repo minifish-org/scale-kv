@@ -1,9 +1,11 @@
+use bytes::Bytes;
+
 pub const PAGE_SIZE: usize = 16 * 1024;
 pub const KEY_SIZE: usize = 16;
 pub const VALUE_SIZE: usize = 1024;
 
 pub type PageId = u64;
-pub type Page = Vec<u8>;
+pub type Page = Bytes;
 pub type Value = Vec<u8>;
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -51,7 +51,10 @@ async fn test_page_redo_commit_and_recover_by_scan() {
             let page_id = 42u64;
             let mut page = vec![0u8; PAGE_SIZE];
             page[0] = 7;
-            let commit_lsn = compute1.write_page(page_id, page.clone()).await.unwrap();
+            let commit_lsn = compute1
+                .write_page(page_id, page.clone().into())
+                .await
+                .unwrap();
             assert!(commit_lsn > 0);
 
             // New compute instance should be able to warm up by scanning pages.

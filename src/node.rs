@@ -348,8 +348,8 @@ impl PageStoreReplay {
         let page = self
             .read_page(page_id)
             .await
-            .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
-        let mut page = page;
+            .unwrap_or_else(|| Page::from(vec![0u8; PAGE_SIZE]));
+        let mut page = page.to_vec();
         apply_wal_record(&mut page, &record)?;
         self.write_page(page_id, &page, lsn)?;
         self.update_last_applied(lsn).await;
@@ -1046,8 +1046,8 @@ async fn replay_page_records(
     let page = replay
         .read_page(page_id)
         .await
-        .unwrap_or_else(|| vec![0u8; PAGE_SIZE]);
-    let mut page = page;
+        .unwrap_or_else(|| Page::from(vec![0u8; PAGE_SIZE]));
+    let mut page = page.to_vec();
     for record in records {
         if record.lsn > max_lsn {
             max_lsn = record.lsn;
@@ -1545,7 +1545,7 @@ impl StorageNode {
                 page_id,
                 slot_id: 0,
                 key: Vec::new(),
-                value: page,
+                value: page.to_vec(),
             });
         }
 
@@ -1655,7 +1655,7 @@ impl StorageNode {
         if !self.page_index.lock().unwrap().contains(&key) {
             return None;
         }
-        self.page_store.get(key).await
+        self.page_store.get(key).await.map(|p| p.to_vec())
     }
 
     pub fn delete(&self, key: PageId) {
@@ -2046,7 +2046,7 @@ mod tests {
 
     #[test]
     fn test_wal_slot_key_mismatch_is_rejected() {
-        let mut page = crate::slotted_page::new_page();
+        let mut page = crate::slotted_page::new_page().to_vec();
         crate::slotted_page::insert_record_at_slot_checked(
             &mut page,
             0,
@@ -2420,7 +2420,7 @@ mod tests {
         let start = node.durable_lsn();
         let page = make_page(9);
         let err = node
-            .append_txn_batch_with_lsn_sync(1, start, start + 1, vec![(99, page)])
+            .append_txn_batch_with_lsn_sync(1, start, start + 1, vec![(99, page.into())])
             .await
             .unwrap_err();
         assert!(matches!(err, crate::Error::Io(ref ioe) if ioe.kind() == ErrorKind::WouldBlock));
@@ -2441,7 +2441,7 @@ mod tests {
             let start = node.durable_lsn();
             let page = make_page(5);
             let commit = node
-                .append_txn_batch_with_lsn_sync(10, start, start + 1, vec![(55, page)])
+                .append_txn_batch_with_lsn_sync(10, start, start + 1, vec![(55, page.into())])
                 .await
                 .unwrap();
             assert_eq!(commit, start + 1);

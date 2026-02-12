@@ -1,6 +1,6 @@
 // (no legacy WAL/TXN op constants needed for page-level redo)
 use crate::storage_capnp::storage;
-use crate::{Result, StorageMaintenanceConfig, StorageNode};
+use crate::{Page, Result, StorageMaintenanceConfig, StorageNode};
 use capnp::capability::Promise;
 use capnp_rpc::RpcSystem;
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -55,11 +55,11 @@ impl storage::Server for StorageService {
             Err(err) => return Promise::err(err),
         };
 
-        let mut page_writes: Vec<(u64, Vec<u8>)> = Vec::with_capacity(writes.len() as usize);
+        let mut page_writes: Vec<(u64, Page)> = Vec::with_capacity(writes.len() as usize);
         for w in writes.iter() {
             let page_id = w.get_page_id();
             let page = match w.get_page() {
-                Ok(p) => p.to_vec(),
+                Ok(p) => Page::copy_from_slice(p),
                 Err(err) => return Promise::err(err),
             };
             page_writes.push((page_id, page));

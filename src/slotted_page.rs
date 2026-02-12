@@ -57,7 +57,7 @@ fn payload_len() -> usize {
 pub fn new_page() -> Page {
     let mut page = vec![0u8; PAGE_SIZE];
     write_header(&mut page, 0, PAGE_HEADER_SIZE as u16, PAGE_SIZE as u16);
-    page
+    Page::from(page)
 }
 
 pub fn page_free_space(page: &[u8]) -> usize {

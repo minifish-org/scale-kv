@@ -134,7 +134,7 @@ impl PageFile {
                 if buf.iter().all(|&b| b == 0) {
                     return Ok(None);
                 }
-                Ok(Some(buf))
+                Ok(Some(Page::from(buf)))
             }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
             Err(e) => Err(e.into()),
@@ -244,7 +244,7 @@ impl PageStore {
             if let Some(bp) = pool.get_mut(&page_id) {
                 bp.touch();
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                return Some((bp.data.to_vec(), bp.lsn));
+                return Some((Page::copy_from_slice(&bp.data[..]), bp.lsn));
             }
         }
 

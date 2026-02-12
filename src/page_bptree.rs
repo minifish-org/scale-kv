@@ -1,4 +1,5 @@
 use crate::{Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, VALUE_SIZE, undo_pg::UndoPtr};
+use bytes::Bytes;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -423,7 +424,8 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 .provider
                 .read_page(current_id)
                 .await
-                .ok_or_else(|| Error::InvalidPageSize(current_id as usize, PAGE_SIZE))?;
+                .ok_or_else(|| Error::InvalidPageSize(current_id as usize, PAGE_SIZE))?
+                .to_vec();
             let current_header = page_header(&current_page);
 
             if current_header.page_type == PAGE_TYPE_LEAF {
@@ -434,7 +436,9 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                     let value_offset = offset + KEY_SIZE;
                     current_page[value_offset..value_offset + LEAF_VALUE_SIZE]
                         .copy_from_slice(&encoded);
-                    self.provider.write_page(current_id, current_page).await;
+                    self.provider
+                        .write_page(current_id, Bytes::from(current_page))
+                        .await;
                     drop(current_guard);
                     return Ok(());
                 }
@@ -465,7 +469,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 let (separator, right_id) = self
                     .split_child_and_update_parent(
                         current_id,
-                        current_page,
+                        Bytes::from(current_page),
                         current_header,
                         child_id,
                         child_page,
@@ -558,7 +562,8 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 .provider
                 .read_page(descend_id)
                 .await
-                .ok_or_else(|| Error::InvalidPageSize(descend_id as usize, PAGE_SIZE))?;
+                .ok_or_else(|| Error::InvalidPageSize(descend_id as usize, PAGE_SIZE))?
+                .to_vec();
             let mut child_header = page_header(&child_page);
             let min_keys = min_keys_non_root(child_header.page_type);
 
@@ -597,9 +602,11 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                             let mut child_header_new = leaf_page_header(&child_page);
                             child_header_new.prev_leaf = Some(left_id);
                             encode_entries(&mut child_page, &child_entries, child_header_new)?;
-                            let mut left_rebuilt = left_page.clone();
+                            let mut left_rebuilt = left_page.to_vec();
                             encode_entries(&mut left_rebuilt, &left_entries, left_header_new)?;
-                            self.provider.write_page(left_id, left_rebuilt).await;
+                            self.provider
+                                .write_page(left_id, Bytes::from(left_rebuilt))
+                                .await;
                         } else {
                             let sep_idx = child_pos - 1;
                             let parent_sep = parent_entries[sep_idx].0.clone();
@@ -613,15 +620,19 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
 
                             let mut left_header_new = page_header(&left_page);
                             left_header_new.high_key = key_to_high_key(&up_key);
-                            let mut left_rebuilt = left_page.clone();
+                            let mut left_rebuilt = left_page.to_vec();
                             encode_entries(&mut left_rebuilt, &left_entries, left_header_new)?;
                             encode_entries(&mut child_page, &child_entries, child_header)?;
-                            self.provider.write_page(left_id, left_rebuilt).await;
+                            self.provider
+                                .write_page(left_id, Bytes::from(left_rebuilt))
+                                .await;
                         }
 
-                        let mut parent_rebuilt = current_page.clone();
+                        let mut parent_rebuilt = current_page.to_vec();
                         encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
-                        self.provider.write_page(current_id, parent_rebuilt).await;
+                        self.provider
+                            .write_page(current_id, Bytes::from(parent_rebuilt))
+                            .await;
                         let parent_id = current_id;
                         drop(left_guard);
                         drop(current_guard);
@@ -662,9 +673,11 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                             let mut right_header_new = leaf_page_header(&right_page);
                             right_header_new.prev_leaf = Some(descend_id);
                             encode_entries(&mut child_page, &child_entries, child_header_new)?;
-                            let mut right_rebuilt = right_page.clone();
+                            let mut right_rebuilt = right_page.to_vec();
                             encode_entries(&mut right_rebuilt, &right_entries, right_header_new)?;
-                            self.provider.write_page(right_id, right_rebuilt).await;
+                            self.provider
+                                .write_page(right_id, Bytes::from(right_rebuilt))
+                                .await;
                         } else {
                             let sep_idx = child_pos;
                             let parent_sep = parent_entries[sep_idx].0.clone();
@@ -677,15 +690,19 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
 
                             let mut child_header_new = child_header;
                             child_header_new.high_key = key_to_high_key(&promoted.0);
-                            let mut right_rebuilt = right_page.clone();
+                            let mut right_rebuilt = right_page.to_vec();
                             encode_entries(&mut right_rebuilt, &right_entries, right_header_new)?;
                             encode_entries(&mut child_page, &child_entries, child_header_new)?;
-                            self.provider.write_page(right_id, right_rebuilt).await;
+                            self.provider
+                                .write_page(right_id, Bytes::from(right_rebuilt))
+                                .await;
                         }
 
-                        let mut parent_rebuilt = current_page.clone();
+                        let mut parent_rebuilt = current_page.to_vec();
                         encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
-                        self.provider.write_page(current_id, parent_rebuilt).await;
+                        self.provider
+                            .write_page(current_id, Bytes::from(parent_rebuilt))
+                            .await;
                         let parent_id = current_id;
                         drop(right_guard);
                         drop(current_guard);
@@ -715,11 +732,13 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                     }
 
                     parent_entries.remove(child_pos);
-                    let mut parent_rebuilt = current_page.clone();
+                    let mut parent_rebuilt = current_page.to_vec();
                     encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
-                    self.provider.write_page(current_id, parent_rebuilt).await;
                     self.provider
-                        .write_page(descend_id, child_page.clone())
+                        .write_page(current_id, Bytes::from(parent_rebuilt))
+                        .await;
+                    self.provider
+                        .write_page(descend_id, Bytes::from(child_page.to_vec()))
                         .await;
                     let parent_id = current_id;
                     drop(right_guard);
@@ -737,7 +756,8 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                         .provider
                         .read_page(left_id)
                         .await
-                        .ok_or_else(|| Error::InvalidPageSize(left_id as usize, PAGE_SIZE))?;
+                        .ok_or_else(|| Error::InvalidPageSize(left_id as usize, PAGE_SIZE))?
+                        .to_vec();
                     let mut left_entries = collect_entries(&left_page);
                     if child_type == PAGE_TYPE_LEAF {
                         let child_entries = collect_entries(&child_page);
@@ -757,10 +777,14 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                     }
 
                     parent_entries.remove(child_pos - 1);
-                    let mut parent_rebuilt = current_page.clone();
+                    let mut parent_rebuilt = current_page.to_vec();
                     encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
-                    self.provider.write_page(current_id, parent_rebuilt).await;
-                    self.provider.write_page(left_id, left_page).await;
+                    self.provider
+                        .write_page(current_id, Bytes::from(parent_rebuilt))
+                        .await;
+                    self.provider
+                        .write_page(left_id, Bytes::from(left_page))
+                        .await;
                     let parent_id = current_id;
                     drop(descend_guard);
                     drop(current_guard);
@@ -780,18 +804,24 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                         if let Some(new_first) = entry_key_at(&rebuilt, 0) {
                             let mut parent_entries = collect_entries(&current_page);
                             parent_entries[child_pos - 1].0 = new_first.to_vec();
-                            let mut parent_rebuilt = current_page.clone();
+                            let mut parent_rebuilt = current_page.to_vec();
                             encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
-                            self.provider.write_page(current_id, parent_rebuilt).await;
+                            self.provider
+                                .write_page(current_id, Bytes::from(parent_rebuilt))
+                                .await;
 
                             let left_id =
                                 child_id_at_pos(&current_page, current_header, child_pos - 1);
                             let _left_guard = self.provider.acquire_write_latch(left_id).await;
-                            if let Some(mut left_page) = self.provider.read_page(left_id).await {
+                            if let Some(mut left_page) =
+                                self.provider.read_page(left_id).await.map(|p| p.to_vec())
+                            {
                                 let mut left_header = leaf_page_header(&left_page);
                                 left_header.high_key = key_to_high_key(new_first);
                                 write_header(&mut left_page, left_header);
-                                self.provider.write_page(left_id, left_page).await;
+                                self.provider
+                                    .write_page(left_id, Bytes::from(left_page))
+                                    .await;
                             }
                         }
                     }
@@ -1004,7 +1034,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     ) -> Result<()> {
         let _parent_guard = self.provider.acquire_write_latch(parent_id).await;
         let mut parent_page = match self.provider.read_page(parent_id).await {
-            Some(p) => p,
+            Some(p) => p.to_vec(),
             None => return Ok(()),
         };
         let parent_header = page_header(&parent_page);
@@ -1036,13 +1066,17 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         parent_entries[child_pos - 1].0 = new_first_key.to_vec();
         let left_id = child_id_at_pos(&parent_page, parent_header, child_pos - 1);
         encode_entries(&mut parent_page, &parent_entries, parent_header)?;
-        self.provider.write_page(parent_id, parent_page).await;
+        self.provider
+            .write_page(parent_id, Bytes::from(parent_page))
+            .await;
         let _left_guard = self.provider.acquire_write_latch(left_id).await;
-        if let Some(mut left_page) = self.provider.read_page(left_id).await {
+        if let Some(mut left_page) = self.provider.read_page(left_id).await.map(|p| p.to_vec()) {
             let mut left_header = leaf_page_header(&left_page);
             left_header.high_key = key_to_high_key(new_first_key);
             write_header(&mut left_page, left_header);
-            self.provider.write_page(left_id, left_page).await;
+            self.provider
+                .write_page(left_id, Bytes::from(left_page))
+                .await;
         }
         Ok(())
     }
@@ -1050,7 +1084,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     async fn repair_leaf_boundary_after_delete(&self, leaf_id: PageId) -> Result<()> {
         let _leaf_guard = self.provider.acquire_write_latch(leaf_id).await;
         let mut leaf_page = match self.provider.read_page(leaf_id).await {
-            Some(p) => p,
+            Some(p) => p.to_vec(),
             None => return Ok(()),
         };
         let leaf_header = leaf_page_header(&leaf_page);
@@ -1069,18 +1103,23 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         let mut leaf_header_new = leaf_header;
         leaf_header_new.high_key = next_first.as_deref().and_then(key_to_high_key);
         write_header(&mut leaf_page, leaf_header_new);
-        self.provider.write_page(leaf_id, leaf_page).await;
+        self.provider
+            .write_page(leaf_id, Bytes::from(leaf_page))
+            .await;
         drop(_leaf_guard);
 
         if let (Some(prev_id), Some(first_key)) = (leaf_header.prev_leaf, leaf_first.as_deref()) {
             let _prev_guard = self.provider.acquire_write_latch(prev_id).await;
-            if let Some(mut prev_page) = self.provider.read_page(prev_id).await {
+            if let Some(mut prev_page) = self.provider.read_page(prev_id).await.map(|p| p.to_vec())
+            {
                 let mut prev_header = leaf_page_header(&prev_page);
                 if prev_header.page_type == PAGE_TYPE_LEAF && prev_header.next_leaf == Some(leaf_id)
                 {
                     prev_header.high_key = key_to_high_key(first_key);
                     write_header(&mut prev_page, prev_header);
-                    self.provider.write_page(prev_id, prev_page).await;
+                    self.provider
+                        .write_page(prev_id, Bytes::from(prev_page))
+                        .await;
                 }
             }
         }
@@ -1105,7 +1144,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         for _ in 0..MAX_SCAN_LEAF_HOPS {
             let _leaf_guard = self.provider.acquire_write_latch(current).await;
             let mut leaf_page = match self.provider.read_page(current).await {
-                Some(p) => p,
+                Some(p) => p.to_vec(),
                 None => return Ok(()),
             };
             let leaf_header = leaf_page_header(&leaf_page);
@@ -1129,7 +1168,9 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 let mut updated = leaf_header;
                 updated.high_key = new_hk;
                 write_header(&mut leaf_page, updated);
-                self.provider.write_page(current, leaf_page).await;
+                self.provider
+                    .write_page(current, Bytes::from(leaf_page))
+                    .await;
             }
 
             let Some(next_id) = next else {
@@ -1158,14 +1199,15 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
 
         let entries = collect_entries(&root);
         let right_id = self.provider.alloc_page_id();
-        let (separator, mut left_page, mut right_page) = if root_header.page_type == PAGE_TYPE_LEAF
-        {
+        let (separator, left_page, right_page) = if root_header.page_type == PAGE_TYPE_LEAF {
             let (separator, (left, right)) = split_leaf(&root, &entries)?;
             (separator, left, right)
         } else {
             let (separator, (left, right)) = split_internal(&root, &entries)?;
             (separator, left, right)
         };
+        let mut left_page = left_page.to_vec();
+        let mut right_page = right_page.to_vec();
 
         if root_header.page_type == PAGE_TYPE_LEAF {
             let old_header = leaf_page_header(&root);
@@ -1180,16 +1222,23 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
             write_header(&mut right_page, right_header);
         }
 
-        self.provider.write_page(root_id, left_page).await;
-        self.provider.write_page(right_id, right_page).await;
+        self.provider
+            .write_page(root_id, Bytes::from(left_page))
+            .await;
+        self.provider
+            .write_page(right_id, Bytes::from(right_page))
+            .await;
 
-        let mut new_root = new_page(PAGE_TYPE_INTERNAL, root_header.level.saturating_add(1));
+        let mut new_root =
+            new_page(PAGE_TYPE_INTERNAL, root_header.level.saturating_add(1)).to_vec();
         let mut new_root_header = page_header(&new_root);
         new_root_header.left_child = root_id;
         let entries = vec![(separator, encode_child_id(right_id))];
         encode_entries(&mut new_root, &entries, new_root_header)?;
         let new_root_id = self.provider.alloc_page_id();
-        self.provider.write_page(new_root_id, new_root).await;
+        self.provider
+            .write_page(new_root_id, Bytes::from(new_root))
+            .await;
         self.provider.set_root_page_id(new_root_id);
         Ok(())
     }
@@ -1197,7 +1246,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     async fn split_child_and_update_parent(
         &self,
         parent_id: PageId,
-        mut parent_page: Page,
+        parent_page: Page,
         parent_header: PageHeader,
         child_id: PageId,
         child_page: Page,
@@ -1206,14 +1255,15 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     ) -> Result<(Vec<u8>, PageId)> {
         let entries = collect_entries(&child_page);
         let right_id = self.provider.alloc_page_id();
-        let (separator, mut left_page, mut right_page) = if child_header.page_type == PAGE_TYPE_LEAF
-        {
+        let (separator, left_page, right_page) = if child_header.page_type == PAGE_TYPE_LEAF {
             let (separator, (left, right)) = split_leaf(&child_page, &entries)?;
             (separator, left, right)
         } else {
             let (separator, (left, right)) = split_internal(&child_page, &entries)?;
             (separator, left, right)
         };
+        let mut left_page = left_page.to_vec();
+        let mut right_page = right_page.to_vec();
 
         if child_header.page_type == PAGE_TYPE_LEAF {
             let old_header = leaf_page_header(&child_page);
@@ -1228,13 +1278,20 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
             write_header(&mut right_page, right_header);
         }
 
-        self.provider.write_page(child_id, left_page).await;
-        self.provider.write_page(right_id, right_page).await;
+        self.provider
+            .write_page(child_id, Bytes::from(left_page))
+            .await;
+        self.provider
+            .write_page(right_id, Bytes::from(right_page))
+            .await;
 
         let mut parent_entries = collect_entries(&parent_page);
         parent_entries.insert(child_pos, (separator.clone(), encode_child_id(right_id)));
-        encode_entries(&mut parent_page, &parent_entries, parent_header)?;
-        self.provider.write_page(parent_id, parent_page).await;
+        let mut parent_page_buf = parent_page.to_vec();
+        encode_entries(&mut parent_page_buf, &parent_entries, parent_header)?;
+        self.provider
+            .write_page(parent_id, Bytes::from(parent_page_buf))
+            .await;
 
         Ok((separator, right_id))
     }
@@ -1409,7 +1466,7 @@ struct PageHeader {
     high_key: Option<[u8; HIGH_KEY_SIZE]>,
 }
 
-fn page_header(page: &Page) -> PageHeader {
+fn page_header(page: &[u8]) -> PageHeader {
     let page_type = page[0];
     let level = page[1];
     let key_count = u16::from_le_bytes([page[2], page[3]]);
@@ -1443,11 +1500,11 @@ fn page_header(page: &Page) -> PageHeader {
     }
 }
 
-fn leaf_page_header(page: &Page) -> PageHeader {
+fn leaf_page_header(page: &[u8]) -> PageHeader {
     page_header(page)
 }
 
-fn write_header(page: &mut Page, header: PageHeader) {
+fn write_header(page: &mut [u8], header: PageHeader) {
     page[0] = header.page_type;
     page[1] = header.level;
     page[2..4].copy_from_slice(&header.key_count.to_le_bytes());
@@ -1489,7 +1546,7 @@ pub fn new_page(page_type: u8, level: u8) -> Page {
         high_key: None,
     };
     write_header(&mut page, header);
-    page
+    Bytes::from(page)
 }
 
 fn entry_value_size(page_type: u8) -> usize {
@@ -1520,7 +1577,7 @@ fn write_u16(page: &mut [u8], offset: usize, value: u16) {
 }
 
 #[allow(dead_code)]
-fn decode_entries(page: &Page) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn decode_entries(page: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let header = page_header(page);
     let mut entries = Vec::with_capacity(header.key_count as usize);
     let value_size = entry_value_size(header.page_type);
@@ -1542,7 +1599,7 @@ fn decode_entries(page: &Page) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 #[allow(dead_code)]
-fn for_each_entry<'a>(page: &'a Page, mut f: impl FnMut(&'a [u8], &'a [u8]) -> bool) {
+fn for_each_entry<'a>(page: &'a [u8], mut f: impl FnMut(&'a [u8], &'a [u8]) -> bool) {
     let header = page_header(page);
     let value_size = entry_value_size(header.page_type);
     let start = data_start(header.key_count);
@@ -1563,7 +1620,7 @@ fn for_each_entry<'a>(page: &'a Page, mut f: impl FnMut(&'a [u8], &'a [u8]) -> b
     }
 }
 
-fn entry_key_at<'a>(page: &'a Page, index: usize) -> Option<&'a [u8]> {
+fn entry_key_at<'a>(page: &'a [u8], index: usize) -> Option<&'a [u8]> {
     let header = page_header(page);
     if index >= header.key_count as usize {
         return None;
@@ -1579,7 +1636,7 @@ fn entry_key_at<'a>(page: &'a Page, index: usize) -> Option<&'a [u8]> {
     Some(&page[entry_offset..key_end])
 }
 
-fn entry_value_at<'a>(page: &'a Page, index: usize) -> Option<&'a [u8]> {
+fn entry_value_at<'a>(page: &'a [u8], index: usize) -> Option<&'a [u8]> {
     let header = page_header(page);
     if index >= header.key_count as usize {
         return None;
@@ -1597,7 +1654,7 @@ fn entry_value_at<'a>(page: &'a Page, index: usize) -> Option<&'a [u8]> {
     Some(&page[key_end..value_end])
 }
 
-fn collect_entries(page: &Page) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn collect_entries(page: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let header = page_header(page);
     let mut entries = Vec::with_capacity(header.key_count as usize);
     for index in 0..header.key_count as usize {
@@ -1614,7 +1671,7 @@ fn collect_entries(page: &Page) -> Vec<(Vec<u8>, Vec<u8>)> {
     entries
 }
 
-fn entry_offset_at(page: &Page, index: usize) -> Option<usize> {
+fn entry_offset_at(page: &[u8], index: usize) -> Option<usize> {
     let header = page_header(page);
     if index >= header.key_count as usize {
         return None;
@@ -1629,7 +1686,7 @@ fn entry_offset_at(page: &Page, index: usize) -> Option<usize> {
     Some(entry_offset)
 }
 
-fn find_key_pos(page: &Page, key: &[u8]) -> Option<(bool, usize)> {
+fn find_key_pos(page: &[u8], key: &[u8]) -> Option<(bool, usize)> {
     let header = page_header(page);
     let mut lo = 0usize;
     let mut hi = header.key_count as usize;
@@ -1677,7 +1734,7 @@ fn key_to_high_key(key: &[u8]) -> Option<[u8; HIGH_KEY_SIZE]> {
     Some(out)
 }
 
-fn child_insert_pos_for_key(page: &Page, header: PageHeader, key: &[u8]) -> usize {
+fn child_insert_pos_for_key(page: &[u8], header: PageHeader, key: &[u8]) -> usize {
     let mut lo = 0usize;
     let mut hi = header.key_count as usize;
     while lo < hi {
@@ -1694,7 +1751,7 @@ fn child_insert_pos_for_key(page: &Page, header: PageHeader, key: &[u8]) -> usiz
     lo
 }
 
-fn child_id_at_pos(page: &Page, header: PageHeader, pos: usize) -> PageId {
+fn child_id_at_pos(page: &[u8], header: PageHeader, pos: usize) -> PageId {
     if pos == 0 {
         return header.left_child;
     }
@@ -1705,7 +1762,7 @@ fn child_id_at_pos(page: &Page, header: PageHeader, pos: usize) -> PageId {
 }
 
 fn rebuild_page_with_insert(
-    page: &Page,
+    page: &[u8],
     header: PageHeader,
     insert_pos: usize,
     key: &[u8],
@@ -1713,7 +1770,7 @@ fn rebuild_page_with_insert(
 ) -> Result<Page> {
     let value_size = entry_value_size(header.page_type);
     let total = header.key_count as usize + 1;
-    let mut out = new_page(header.page_type, header.level);
+    let mut out = new_page(header.page_type, header.level).to_vec();
     let mut new_header = header;
     new_header.key_count = total as u16;
     write_header(&mut out, new_header);
@@ -1740,17 +1797,17 @@ fn rebuild_page_with_insert(
         out[cursor..cursor + value_size].copy_from_slice(v);
         cursor += value_size;
     }
-    Ok(out)
+    Ok(Bytes::from(out))
 }
 
-fn rebuild_page_with_remove(page: &Page, header: PageHeader, remove_pos: usize) -> Result<Page> {
+fn rebuild_page_with_remove(page: &[u8], header: PageHeader, remove_pos: usize) -> Result<Page> {
     let value_size = entry_value_size(header.page_type);
     let total = header.key_count as usize;
     if remove_pos >= total {
-        return Ok(page.clone());
+        return Ok(Bytes::copy_from_slice(page));
     }
     let new_total = total.saturating_sub(1);
-    let mut out = new_page(header.page_type, header.level);
+    let mut out = new_page(header.page_type, header.level).to_vec();
     let mut new_header = header;
     new_header.key_count = new_total as u16;
     write_header(&mut out, new_header);
@@ -1772,10 +1829,10 @@ fn rebuild_page_with_remove(page: &Page, header: PageHeader, remove_pos: usize) 
         cursor += value_size;
         out_pos += 1;
     }
-    Ok(out)
+    Ok(Bytes::from(out))
 }
 
-fn find_in_leaf(page: &Page, key: &[u8]) -> Option<LeafValue> {
+fn find_in_leaf(page: &[u8], key: &[u8]) -> Option<LeafValue> {
     let header = page_header(page);
     let mut lo = 0usize;
     let mut hi = header.key_count as usize;
@@ -1805,7 +1862,7 @@ fn find_in_leaf(page: &Page, key: &[u8]) -> Option<LeafValue> {
     None
 }
 
-fn lower_bound_in_leaf(page: &Page, key: &[u8]) -> usize {
+fn lower_bound_in_leaf(page: &[u8], key: &[u8]) -> usize {
     let header = page_header(page);
     let mut lo = 0usize;
     let mut hi = header.key_count as usize;
@@ -1825,7 +1882,7 @@ fn lower_bound_in_leaf(page: &Page, key: &[u8]) -> usize {
 }
 
 fn encode_entries(
-    page: &mut Page,
+    page: &mut [u8],
     entries: &[(Vec<u8>, Vec<u8>)],
     mut header: PageHeader,
 ) -> Result<()> {
@@ -1866,12 +1923,12 @@ fn fits_in_page(entries: &[(Vec<u8>, Vec<u8>)]) -> bool {
     size <= PAGE_SIZE
 }
 
-fn split_leaf(page: &Page, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8>, (Page, Page))> {
+fn split_leaf(page: &[u8], entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8>, (Page, Page))> {
     let mid = entries.len() / 2;
     let left_entries = &entries[..mid];
     let right_entries = &entries[mid..];
-    let mut left = new_page(PAGE_TYPE_LEAF, 0);
-    let mut right = new_page(PAGE_TYPE_LEAF, 0);
+    let mut left = new_page(PAGE_TYPE_LEAF, 0).to_vec();
+    let mut right = new_page(PAGE_TYPE_LEAF, 0).to_vec();
     let mut left_header = leaf_page_header(page);
     let mut right_header = leaf_page_header(page);
     let sep = right_entries[0].0.clone();
@@ -1885,16 +1942,16 @@ fn split_leaf(page: &Page, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8>, (
 
     encode_entries(&mut left, left_entries, left_header)?;
     encode_entries(&mut right, right_entries, right_header)?;
-    Ok((sep, (left, right)))
+    Ok((sep, (Bytes::from(left), Bytes::from(right))))
 }
 
-fn split_internal(page: &Page, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8>, (Page, Page))> {
+fn split_internal(page: &[u8], entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8>, (Page, Page))> {
     let mid = entries.len() / 2;
     let separator = entries[mid].0.clone();
     let left_entries = &entries[..mid];
     let right_entries = &entries[mid + 1..];
-    let mut left = new_page(PAGE_TYPE_INTERNAL, page_header(page).level);
-    let mut right = new_page(PAGE_TYPE_INTERNAL, page_header(page).level);
+    let mut left = new_page(PAGE_TYPE_INTERNAL, page_header(page).level).to_vec();
+    let mut right = new_page(PAGE_TYPE_INTERNAL, page_header(page).level).to_vec();
     let old_hk = page_header(page).high_key;
     let mut left_header = page_header(page);
     let mut right_header = page_header(page);
@@ -1909,7 +1966,7 @@ fn split_internal(page: &Page, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8
 
     encode_entries(&mut left, left_entries, left_header)?;
     encode_entries(&mut right, right_entries, right_header)?;
-    Ok((separator, (left, right)))
+    Ok((separator, (Bytes::from(left), Bytes::from(right))))
 }
 
 fn encode_leaf_value(leaf_value: &LeafValue) -> Vec<u8> {
@@ -2086,9 +2143,14 @@ mod tests {
         assert_eq!(p3, 3);
 
         let page_data = vec![42u8; crate::PAGE_SIZE];
-        provider.write_page(p1, page_data.clone()).await;
+        provider
+            .write_page(p1, crate::Page::from(page_data.clone()))
+            .await;
 
-        assert_eq!(provider.read_page(p1).await, Some(page_data));
+        assert_eq!(
+            provider.read_page(p1).await,
+            Some(crate::Page::from(page_data))
+        );
         assert_eq!(provider.read_page(p2).await, None);
     }
 

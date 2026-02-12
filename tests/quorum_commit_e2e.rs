@@ -75,7 +75,7 @@ async fn test_quorum_commit_with_one_ahead_node() {
                 let page_id = 9000 + i;
                 let mut page = vec![0u8; PAGE_SIZE];
                 page[0] = i as u8;
-                let _ = c3.write_page(page_id, page).await.unwrap();
+                let _ = c3.write_page(page_id, page.into()).await.unwrap();
             }
 
             let addrs = vec![a1, a2, a3];
@@ -85,7 +85,7 @@ async fn test_quorum_commit_with_one_ahead_node() {
             // Commit a single page write. s3 should reject due to being ahead.
             let mut page = vec![0u8; PAGE_SIZE];
             page[0] = 1;
-            let writes = vec![(42u64, page)];
+            let writes = vec![(42u64, page.into())];
             let commit_lsn = seq.commit_txn_batch(writes).await.unwrap();
             assert!(commit_lsn > read_lsn);
 
@@ -145,7 +145,7 @@ async fn test_quorum_commit_succeeds_with_one_backpressured_node() {
 
             let mut page = vec![0u8; PAGE_SIZE];
             page[0] = 9;
-            let writes = vec![(77u64, page)];
+            let writes = vec![(77u64, page.into())];
 
             let commit_lsn =
                 tokio::time::timeout(Duration::from_secs(5), seq.commit_txn_batch(writes))
@@ -208,7 +208,7 @@ async fn test_quorum_commit_fails_when_quorum_requires_backpressured_node() {
 
             let mut page = vec![0u8; PAGE_SIZE];
             page[0] = 11;
-            let writes = vec![(88u64, page)];
+            let writes = vec![(88u64, page.into())];
             let err = seq.commit_txn_batch(writes).await.unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("quorum not reached"));
@@ -245,7 +245,10 @@ async fn test_connect_allows_unreachable_nodes_if_quorum_reachable() {
             let seq = ComputeSequencer::connect(&addrs, 2, &local).await.unwrap();
             let mut page = vec![0u8; PAGE_SIZE];
             page[0] = 33;
-            let commit = seq.commit_txn_batch(vec![(333, page)]).await.unwrap();
+            let commit = seq
+                .commit_txn_batch(vec![(333, page.into())])
+                .await
+                .unwrap();
             assert!(commit > 0);
         })
         .await;
@@ -311,15 +314,13 @@ async fn test_concurrent_commits_preserve_lsn_order() {
             p2[0] = 2;
 
             let s1 = std::sync::Arc::clone(&seq);
-            let t1 =
-                tokio::task::spawn_local(
-                    async move { s1.commit_txn_batch(vec![(1001, p1)]).await },
-                );
+            let t1 = tokio::task::spawn_local(async move {
+                s1.commit_txn_batch(vec![(1001, p1.into())]).await
+            });
             let s2 = std::sync::Arc::clone(&seq);
-            let t2 =
-                tokio::task::spawn_local(
-                    async move { s2.commit_txn_batch(vec![(1002, p2)]).await },
-                );
+            let t2 = tokio::task::spawn_local(async move {
+                s2.commit_txn_batch(vec![(1002, p2.into())]).await
+            });
 
             let r1 = t1.await.unwrap().unwrap();
             let r2 = t2.await.unwrap().unwrap();

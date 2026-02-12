@@ -55,7 +55,7 @@ impl MetaPage {
             .copy_from_slice(&self.undo_history_head.to_le_bytes());
         page[OFF_UNDO_HISTORY_TAIL..OFF_UNDO_HISTORY_TAIL + 8]
             .copy_from_slice(&self.undo_history_tail.to_le_bytes());
-        page
+        Page::from(page)
     }
 
     pub fn decode(page: &[u8]) -> Result<Self> {
