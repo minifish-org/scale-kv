@@ -1,6 +1,9 @@
 use scale_kv::{EmbeddedCompute, KEY_SIZE, StorageServer, VALUE_SIZE};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::task::LocalSet;
+
+static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn tcp_bind_allowed() -> bool {
     std::net::TcpListener::bind("127.0.0.1:0").is_ok()
@@ -8,7 +11,8 @@ fn tcp_bind_allowed() -> bool {
 
 fn temp_dir() -> String {
     let mut p = std::env::temp_dir();
-    let name = format!("scale-kv-gc-{}", std::process::id());
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let name = format!("scale-kv-gc-{}-{}", std::process::id(), id);
     p.push(name);
     // best-effort cleanup first
     let _ = std::fs::remove_dir_all(&p);

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 use std::{fs, process};
 
 use scale_kv::{EmbeddedCompute, KEY_SIZE, PAGE_SIZE, StorageServer, VALUE_SIZE};
@@ -134,6 +135,62 @@ async fn test_scan_range_snapshot_inclusive_and_limit() {
             assert_eq!(limited.len(), 2);
             assert_eq!(limited[0], (k1, v1));
             assert_eq!(limited[1], (k2, v2_new));
+        })
+        .await;
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_rw_txn_is_serialized_by_single_writer_gate() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir = temp_dir();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
+                .await
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+
+            let mut tx1 = compute.begin_rw().await;
+            tx1.write_page(100, vec![1u8; PAGE_SIZE]);
+
+            let compute2 = compute.clone();
+            let tx2_done = std::sync::Arc::new(AtomicBool::new(false));
+            let tx2_done2 = tx2_done.clone();
+            tokio::task::spawn_local(async move {
+                let mut tx2 = compute2.begin_rw().await;
+                tx2.write_page(101, vec![2u8; PAGE_SIZE]);
+                tx2.commit().await.unwrap();
+                tx2_done2.store(true, Ordering::Release);
+            });
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), async {
+                    while !tx2_done.load(Ordering::Acquire) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .is_err()
+            );
+
+            tx1.commit().await.unwrap();
+
+            // After tx1 finishes, tx2 can acquire the writer gate and commit.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !tx2_done.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
         })
         .await;
 

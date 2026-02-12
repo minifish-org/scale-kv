@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
             let start = Instant::now();
             let mut i = 0u64;
             while (i as usize) < records {
-                let mut tx = compute.begin_rw();
+                let mut tx = compute.begin_rw().await;
                 let mut n = 0usize;
                 while n < 256 && (i as usize) < records {
                     let k = key_for(i);
@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
 
             if matches!(std::env::var("SCALE_KV_VERIFY_LOAD").as_deref(), Ok("1")) {
                 eprintln!("verifying mapping after load...");
-                let mut tx = compute.begin_rw();
+                let mut tx = compute.begin_rw().await;
                 for j in 0..(records as u64).min(10_000) {
                     let k = key_for(j);
                     tx.debug_check_mapping(&k).await.unwrap();
@@ -105,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
             let mut done = 0usize;
             let mut seq = 0u64;
             while done < ops {
-                let mut tx = compute.begin_rw();
+                let mut tx = compute.begin_rw().await;
                 let mut n = 0usize;
                 while n < 10 && done < ops {
                     let id = (rng.next_u32() as u64) % (records as u64);

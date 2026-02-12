@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::LocalSet;
 
 /// Embedded compute-side API for an Aurora-style KV (page-level redo).
@@ -35,6 +35,7 @@ pub struct EmbeddedCompute {
         Arc<dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>>,
     provider: Arc<TxnPageProvider>,
     tree: Arc<Mutex<PageBPlusTree<TxnPageProvider>>>,
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl EmbeddedCompute {
@@ -120,6 +121,7 @@ impl EmbeddedCompute {
             page_fetcher,
             provider,
             tree,
+            write_lock: Arc::new(Mutex::new(())),
         };
 
         // Initialize or recover meta/root.
@@ -231,7 +233,7 @@ impl EmbeddedCompute {
         const BPTREE_ROOT_ID: PageId = 10;
         const UNDO_BASE: PageId = 2_000_000;
 
-        let mut tx = self.begin_rw();
+        let mut tx = self.begin_rw().await;
 
         // Configure provider root + next_page_id (next after reserved ids).
         let mut tree = self.tree.lock().await;
@@ -268,7 +270,12 @@ impl EmbeddedCompute {
         Ok(())
     }
 
-    fn begin_tx(&self, read_only: bool, timeout: Option<Duration>) -> EmbeddedTxn {
+    fn begin_tx(
+        &self,
+        read_only: bool,
+        timeout: Option<Duration>,
+        write_guard: Option<OwnedMutexGuard<()>>,
+    ) -> EmbeddedTxn {
         // Clear dirty pages collected by provider from any previous operations.
         let _ = self.provider.take_dirty();
         let read_lsn = self.begin_ro();
@@ -286,6 +293,7 @@ impl EmbeddedCompute {
             timeout,
             read_only,
             write_attempted: false,
+            write_guard,
             dirty: BTreeMap::new(),
             ro_cache: BTreeMap::new(),
             modified: Vec::new(),
@@ -302,24 +310,26 @@ impl EmbeddedCompute {
     }
 
     /// Begin a read-write transaction.
-    pub fn begin_rw(&self) -> EmbeddedTxn {
-        self.begin_tx(false, None)
+    pub async fn begin_rw(&self) -> EmbeddedTxn {
+        let write_guard = Some(self.write_lock.clone().lock_owned().await);
+        self.begin_tx(false, None, write_guard)
     }
 
     /// Begin a read-only transaction with timeout.
     pub fn begin_ro_timeout(&self, timeout: Duration) -> EmbeddedTxn {
-        self.begin_tx(true, Some(timeout))
+        self.begin_tx(true, Some(timeout), None)
     }
 
     /// Begin a read-write transaction with timeout.
-    pub fn begin_rw_timeout(&self, timeout: Duration) -> EmbeddedTxn {
-        self.begin_tx(false, Some(timeout))
+    pub async fn begin_rw_timeout(&self, timeout: Duration) -> EmbeddedTxn {
+        let write_guard = Some(self.write_lock.clone().lock_owned().await);
+        self.begin_tx(false, Some(timeout), write_guard)
     }
 
     /// Convenience: write a single page after-image in its own txn.
     #[doc(hidden)]
     pub async fn write_page(&self, page_id: PageId, page: Page) -> Result<u64> {
-        let mut tx = self.begin_rw();
+        let mut tx = self.begin_rw().await;
         tx.write_page(page_id, page);
         tx.commit().await
     }
@@ -333,7 +343,7 @@ impl EmbeddedCompute {
             return Err(Error::InvalidValueSize(value.len(), VALUE_SIZE));
         }
 
-        let mut tx = self.begin_rw();
+        let mut tx = self.begin_rw().await;
         tx.put(key, value).await?;
         tx.commit().await
     }
@@ -342,7 +352,7 @@ impl EmbeddedCompute {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
-        let mut tx = self.begin_rw();
+        let mut tx = self.begin_tx(true, None, None);
         tx.get(key).await
     }
 
@@ -364,7 +374,7 @@ impl EmbeddedCompute {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut tx = self.begin_tx(true, None);
+        let mut tx = self.begin_tx(true, None, None);
         tx.scan_range(start, end, limit).await
     }
 
@@ -372,7 +382,7 @@ impl EmbeddedCompute {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
-        let mut tx = self.begin_rw();
+        let mut tx = self.begin_rw().await;
         tx.delete(key).await?;
         tx.commit().await
     }
@@ -383,7 +393,7 @@ impl EmbeddedCompute {
             return Ok(0);
         }
         let gc_lsn = self.gc_lsn();
-        let tx = self.begin_rw();
+        let tx = self.begin_rw().await;
         let start = vec![0u8; KEY_SIZE];
         let end = vec![0xFFu8; KEY_SIZE];
 
@@ -547,6 +557,7 @@ pub struct EmbeddedTxn {
     timeout: Option<Duration>,
     read_only: bool,
     write_attempted: bool,
+    write_guard: Option<OwnedMutexGuard<()>>,
 
     dirty: BTreeMap<PageId, Page>,
     ro_cache: BTreeMap<PageId, Page>,
@@ -563,6 +574,7 @@ impl Drop for EmbeddedTxn {
     fn drop(&mut self) {
         // Ensure we never leak active read snapshots if a txn is dropped early.
         let _ = self.read_guard.take();
+        let _ = self.write_guard.take();
     }
 }
 
@@ -896,6 +908,7 @@ impl EmbeddedTxn {
         if self.read_only {
             let wrote = self.write_attempted || !self.dirty.is_empty() || !self.modified.is_empty();
             let _ = self.read_guard.take();
+            let _ = self.write_guard.take();
             if wrote {
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -1082,6 +1095,7 @@ impl EmbeddedTxn {
 
         // Mark snapshot inactive before returning.
         let _ = self.read_guard.take();
+        let _ = self.write_guard.take();
 
         out
     }

@@ -117,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
             let load_start = Instant::now();
             let mut i = 0u64;
             while (i as usize) < cfg.records {
-                let mut tx = compute.begin_rw();
+                let mut tx = compute.begin_rw().await;
                 let mut n = 0usize;
                 while n < 256 && (i as usize) < cfg.records {
                     let key = key_for(i);
