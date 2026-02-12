@@ -300,7 +300,7 @@ impl AsyncPageProvider for SharedPageProvider {
 /// Page-based B+Tree that uses AsyncPageProvider for storage.
 pub struct PageBPlusTree<P: AsyncPageProvider> {
     provider: P,
-    len: usize,
+    len: AtomicU64,
 }
 
 impl PageBPlusTree<InMemoryPageProvider> {
@@ -314,7 +314,10 @@ impl PageBPlusTree<InMemoryPageProvider> {
                 .await;
         });
         provider.set_root_page_id(root_id);
-        Self { provider, len: 0 }
+        Self {
+            provider,
+            len: AtomicU64::new(0),
+        }
     }
 }
 
@@ -328,7 +331,10 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     /// Create a new B+Tree with a custom page provider.
     /// The provider should already have an empty root page allocated.
     pub fn with_provider(provider: P) -> Self {
-        Self { provider, len: 0 }
+        Self {
+            provider,
+            len: AtomicU64::new(0),
+        }
     }
 
     /// Create a new B+Tree, initializing the root page in the provider.
@@ -340,7 +346,10 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 .await;
         });
         provider.set_root_page_id(root_id);
-        Self { provider, len: 0 }
+        Self {
+            provider,
+            len: AtomicU64::new(0),
+        }
     }
 
     /// Get a reference to the page provider.
@@ -358,11 +367,11 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     }
 
     pub fn len(&self) -> usize {
-        self.len
+        self.len.load(Ordering::Acquire) as usize
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len.load(Ordering::Acquire) == 0
     }
 
     pub async fn get(&self, key: &[u8]) -> Option<LeafValue> {
@@ -398,7 +407,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     /// Known limits:
     /// - Range/key gap locks are not implemented, so phantom protection is not provided.
     /// - Readers are lock-coupled for physical safety, but are not a serializable snapshot.
-    pub async fn insert(&mut self, key: Vec<u8>, leaf_value: LeafValue) -> Result<()> {
+    pub async fn insert(&self, key: Vec<u8>, leaf_value: LeafValue) -> Result<()> {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
@@ -433,7 +442,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 let rebuilt =
                     rebuild_page_with_insert(&current_page, current_header, pos, &key, &encoded)?;
                 self.provider.write_page(current_id, rebuilt).await;
-                self.len += 1;
+                self.len.fetch_add(1, Ordering::AcqRel);
                 drop(current_guard);
                 return Ok(());
             }
@@ -485,7 +494,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         }
     }
 
-    pub async fn remove(&mut self, key: &[u8]) -> Result<()> {
+    pub async fn remove(&self, key: &[u8]) -> Result<()> {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
@@ -515,7 +524,11 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                         None
                     };
                     self.provider.write_page(current_id, rebuilt).await;
-                    self.len = self.len.saturating_sub(1);
+                    self.len
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                            Some(v.saturating_sub(1))
+                        })
+                        .ok();
                     drop(current_guard);
                     if let (Some((parent_id, hint_pos)), Some(new_first_key)) =
                         (parent_hint, new_first.as_ref())
@@ -782,7 +795,11 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                             }
                         }
                     }
-                    self.len = self.len.saturating_sub(1);
+                    self.len
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                            Some(v.saturating_sub(1))
+                        })
+                        .ok();
                 }
                 drop(descend_guard);
                 drop(current_guard);
@@ -1978,7 +1995,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_insert_get_remove_len() {
-        let mut tree = PageBPlusTree::new();
+        let tree = PageBPlusTree::new();
         let key = key_for(1);
         let slot = LeafValue {
             value: [1u8; VALUE_SIZE],
@@ -2014,7 +2031,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_range_across_splits() {
-        let mut tree = PageBPlusTree::new();
+        let tree = PageBPlusTree::new();
         for i in 0..120u32 {
             let key = key_for(i);
             let slot = LeafValue {
@@ -2040,7 +2057,6 @@ mod tests {
     async fn test_with_custom_provider() {
         let provider = InMemoryPageProvider::new();
         let tree = PageBPlusTree::new_with_provider(provider);
-        let mut tree = tree;
 
         let key = key_for(2);
         let slot = LeafValue {
@@ -2086,7 +2102,6 @@ mod tests {
 
         let provider = SharedPageProvider::new(pages.clone(), next_page_id.clone());
         let tree = PageBPlusTree::new_with_provider(provider);
-        let mut tree = tree;
 
         let key = key_for(3);
         let slot = LeafValue {
@@ -2128,7 +2143,7 @@ mod tests {
                     for worker in 0..workers {
                         let provider = provider_for_tasks.clone();
                         handles.push(tokio::task::spawn_local(async move {
-                            let mut tree = PageBPlusTree::with_provider(provider);
+                            let tree = PageBPlusTree::with_provider(provider);
                             for i in 0..per_worker {
                                 let logical = worker * per_worker + i;
                                 let key = key_for(logical);
@@ -2192,7 +2207,7 @@ mod tests {
                     for worker in 0..workers {
                         let provider = provider_for_tasks.clone();
                         handles.push(tokio::task::spawn_local(async move {
-                            let mut tree = PageBPlusTree::with_provider(provider);
+                            let tree = PageBPlusTree::with_provider(provider);
                             let mut seed = worker as u64 + 1;
                             for _ in 0..ops_per_worker {
                                 let r = next_rand(&mut seed);

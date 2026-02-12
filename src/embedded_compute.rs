@@ -37,7 +37,7 @@ pub struct EmbeddedCompute {
     page_fetcher:
         Arc<dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>>,
     provider: Arc<TxnPageProvider>,
-    tree: Arc<Mutex<PageBPlusTree<TxnPageProvider>>>,
+    tree: Arc<PageBPlusTree<TxnPageProvider>>,
     write_lock: Arc<Mutex<()>>,
     txn_registry: Arc<Mutex<HashMap<u64, PendingTxn>>>,
     default_rw_txn_timeout: Duration,
@@ -130,9 +130,7 @@ impl EmbeddedCompute {
             BTREE_META_PAGE_ID,
             fetcher_for_provider,
         ));
-        let tree = Arc::new(Mutex::new(PageBPlusTree::with_provider(
-            (*provider).clone(),
-        )));
+        let tree = Arc::new(PageBPlusTree::with_provider((*provider).clone()));
 
         let this = Self {
             sequencer,
@@ -267,9 +265,8 @@ impl EmbeddedCompute {
     }
 
     async fn resolve_txn_intents(&self, txn_id: u64, keys: &[[u8; KEY_SIZE]]) -> Result<()> {
-        let mut tree = self.tree.lock().await;
         for key in keys {
-            let Some(row) = tree.get(key).await else {
+            let Some(row) = self.tree.get(key).await else {
                 continue;
             };
             if (row.flags & FLAG_INTENT) == 0 || row.intent_txn_id != txn_id {
@@ -277,12 +274,12 @@ impl EmbeddedCompute {
             }
             let mut undo_ptr = row.undo_ptr;
             if undo_ptr.is_none() {
-                tree.remove(key).await?;
+                self.tree.remove(key).await?;
                 continue;
             }
             loop {
                 let Some(ptr) = undo_ptr else {
-                    tree.remove(key).await?;
+                    self.tree.remove(key).await?;
                     break;
                 };
                 let upage = self
@@ -295,7 +292,7 @@ impl EmbeddedCompute {
                     continue;
                 }
                 if rec.old_commit_lsn == 0 && rec.prev.is_none() {
-                    tree.remove(key).await?;
+                    self.tree.remove(key).await?;
                 } else {
                     let restored = LeafValue {
                         value: rec.old_value,
@@ -305,7 +302,7 @@ impl EmbeddedCompute {
                         intent_txn_id: 0,
                         intent_lsn: 0,
                     };
-                    tree.insert(key.to_vec(), restored).await?;
+                    self.tree.insert(key.to_vec(), restored).await?;
                 }
                 break;
             }
@@ -416,8 +413,7 @@ impl EmbeddedCompute {
         let mut tx = self.begin_rw().await;
 
         // Configure provider root + next_page_id (next after reserved ids).
-        let mut tree = self.tree.lock().await;
-        tree.provider_mut().set_root_page_id(BPTREE_ROOT_ID);
+        self.provider.set_root_page_id(BPTREE_ROOT_ID);
         self.provider.set_next_page_id(BPTREE_ROOT_ID + 1);
 
         // Root leaf page.
@@ -445,7 +441,6 @@ impl EmbeddedCompute {
         };
         tx.write_page(META_PAGE_ID, meta.encode());
 
-        drop(tree);
         tx.commit().await?;
         Ok(())
     }
@@ -589,10 +584,7 @@ impl EmbeddedCompute {
         let start = vec![0u8; KEY_SIZE];
         let end = vec![0xFFu8; KEY_SIZE];
 
-        let entries = {
-            let tree = tx.compute.tree.lock().await;
-            tree.range(&start, &end).await
-        };
+        let entries = { tx.compute.tree.range(&start, &end).await };
 
         let mut scanned = 0usize;
         let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
@@ -619,14 +611,12 @@ impl EmbeddedCompute {
         }
 
         if !keys_to_remove.is_empty() || !rows_to_update.is_empty() {
-            let mut tree = tx.compute.tree.lock().await;
             for key in keys_to_remove {
-                let _ = tree.remove(&key).await;
+                let _ = tx.compute.tree.remove(&key).await;
             }
             for (key, row) in rows_to_update {
-                tree.insert(key, row).await?;
+                tx.compute.tree.insert(key, row).await?;
             }
-            drop(tree);
             tx.commit().await?;
         }
 
@@ -947,10 +937,7 @@ impl EmbeddedTxn {
         loop {
             self.ensure_not_timed_out()?;
 
-            let row = {
-                let tree = self.compute.tree.lock().await;
-                tree.get(key).await
-            };
+            let row = { self.compute.tree.get(key).await };
             let Some(row) = row else {
                 return Ok(None);
             };
@@ -991,10 +978,7 @@ impl EmbeddedTxn {
                 "read-only transaction",
             )));
         }
-        let existing = {
-            let tree = self.compute.tree.lock().await;
-            tree.get(key).await
-        };
+        let existing = { self.compute.tree.get(key).await };
         let mut new_value = [0u8; VALUE_SIZE];
         new_value.copy_from_slice(value);
 
@@ -1024,10 +1008,7 @@ impl EmbeddedTxn {
             }
         }
 
-        {
-            let mut tree = self.compute.tree.lock().await;
-            tree.insert(key.to_vec(), row).await?;
-        }
+        self.compute.tree.insert(key.to_vec(), row).await?;
         let key_arr: [u8; KEY_SIZE] = key.try_into().unwrap();
         self.modified.insert(key_arr);
         if let Some(txn_id) = self.undo_txn_id {
@@ -1066,10 +1047,7 @@ impl EmbeddedTxn {
             return Ok(Vec::new());
         }
 
-        let entries = {
-            let tree = self.compute.tree.lock().await;
-            tree.range(start, end).await
-        };
+        let entries = { self.compute.tree.range(start, end).await };
 
         let mut out = Vec::with_capacity(limit.min(entries.len()));
         for (key, _row) in entries {
@@ -1085,9 +1063,8 @@ impl EmbeddedTxn {
 
     pub async fn debug_check_mapping(&mut self, key: &[u8]) -> Result<()> {
         let (row, leaf_entries) = {
-            let tree = self.compute.tree.lock().await;
-            let row = tree.get(key).await;
-            let leaf_entries = tree.debug_leaf_entries(key, 16).await;
+            let row = self.compute.tree.get(key).await;
+            let leaf_entries = self.compute.tree.debug_leaf_entries(key, 16).await;
             (row, leaf_entries)
         };
 
@@ -1123,10 +1100,7 @@ impl EmbeddedTxn {
                 "read-only transaction",
             )));
         }
-        let existing = {
-            let tree = self.compute.tree.lock().await;
-            tree.get(key).await
-        };
+        let existing = { self.compute.tree.get(key).await };
 
         if let Some(old) = existing {
             if (old.flags & FLAG_INTENT) != 0 && self.undo_txn_id != Some(old.intent_txn_id) {
@@ -1158,9 +1132,7 @@ impl EmbeddedTxn {
                     self.intent_base_lsn
                 },
             };
-            let mut tree = self.compute.tree.lock().await;
-            tree.insert(key.to_vec(), row).await?;
-            drop(tree);
+            self.compute.tree.insert(key.to_vec(), row).await?;
             let key_arr: [u8; KEY_SIZE] = key.try_into().unwrap();
             self.modified.insert(key_arr);
             if let Some(txn_id) = self.undo_txn_id {
@@ -1242,14 +1214,12 @@ impl EmbeddedTxn {
         // Pre-stamp modified rows with a dummy commit_lsn so B+Tree writes dirty all pages
         // that will be touched again when stamping the real commit_lsn.
         if !self.modified.is_empty() {
-            let mut tree = self.compute.tree.lock().await;
             for key in &self.modified {
-                if let Some(mut row) = tree.get(key).await {
+                if let Some(mut row) = self.compute.tree.get(key).await {
                     row.commit_lsn = 1;
-                    tree.insert(key.to_vec(), row).await?;
+                    self.compute.tree.insert(key.to_vec(), row).await?;
                 }
             }
-            drop(tree);
         }
 
         // Merge all newly dirtied provider pages into txn-local dirty state.
@@ -1261,8 +1231,7 @@ impl EmbeddedTxn {
         let mut map: BTreeMap<PageId, Page> = self.dirty.clone();
         let mut count_meta = base_meta.clone();
         {
-            let tree = self.compute.tree.lock().await;
-            count_meta.root_page_id = tree.root_page_id();
+            count_meta.root_page_id = self.compute.tree.root_page_id();
             count_meta.next_bptree_page_id = self.compute.provider.next_page_id();
         }
         if let Some(first_pid) = self.undo_segment_first_page_id {
@@ -1297,17 +1266,15 @@ impl EmbeddedTxn {
 
         // Stamp the real commit_lsn and merge the dirty pages generated by those writes.
         if !self.modified.is_empty() {
-            let mut tree = self.compute.tree.lock().await;
             for key in &self.modified {
-                if let Some(mut row) = tree.get(key).await {
+                if let Some(mut row) = self.compute.tree.get(key).await {
                     row.commit_lsn = commit_lsn;
                     row.flags &= !FLAG_INTENT;
                     row.intent_txn_id = 0;
                     row.intent_lsn = 0;
-                    tree.insert(key.to_vec(), row).await?;
+                    self.compute.tree.insert(key.to_vec(), row).await?;
                 }
             }
-            drop(tree);
             for (pid, page) in self.compute.provider.take_dirty() {
                 map.insert(pid, page);
             }
@@ -1315,8 +1282,7 @@ impl EmbeddedTxn {
 
         let mut meta = base_meta.clone();
         {
-            let tree = self.compute.tree.lock().await;
-            meta.root_page_id = tree.root_page_id();
+            meta.root_page_id = self.compute.tree.root_page_id();
             meta.next_bptree_page_id = self.compute.provider.next_page_id();
         }
 
