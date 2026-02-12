@@ -83,7 +83,15 @@ impl ComputeSequencer {
         self.request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub fn reserve_txn(&self, n_writes: usize) -> Result<(u64, u64, u64)> {
+    pub fn allocate_request_id(&self) -> u64 {
+        self.next_request_id()
+    }
+
+    pub fn reserve_txn_with_request_id(
+        &self,
+        n_writes: usize,
+        request_id: u64,
+    ) -> Result<(u64, u64)> {
         const MAX_WRITES_PER_TXN: usize = 256;
         if n_writes == 0 {
             return Err(Error::Io(std::io::Error::new(
@@ -100,11 +108,22 @@ impl ComputeSequencer {
                 ),
             )));
         }
+        if request_id == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "request_id must be non-zero",
+            )));
+        }
 
         let n = n_writes as u64;
         let start_lsn = self.next_lsn.fetch_add(n, Ordering::AcqRel);
         let end_lsn = start_lsn + n;
+        Ok((start_lsn, end_lsn))
+    }
+
+    pub fn reserve_txn(&self, n_writes: usize) -> Result<(u64, u64, u64)> {
         let request_id = self.next_request_id();
+        let (start_lsn, end_lsn) = self.reserve_txn_with_request_id(n_writes, request_id)?;
         Ok((request_id, start_lsn, end_lsn))
     }
 

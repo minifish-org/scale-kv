@@ -8,7 +8,9 @@ use crate::{ActiveReads, ReadGuard};
 use crate::{BTREE_META_PAGE_ID, BtreeMeta};
 use crate::{
     Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, StorageClient, VALUE_SIZE,
-    undo_pg::{self, UndoPtr, UndoRecord},
+    undo_pg::{
+        self, SEGMENT_STATE_COMMITTED, SEGMENT_STATE_PURGED, UndoPtr, UndoRecord, UndoSegmentHeader,
+    },
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -256,6 +258,8 @@ impl EmbeddedCompute {
             next_data_page_id: 1_000_000,
             next_undo_page_id: UNDO_BASE,
             undo_free: Vec::new(),
+            undo_history_head: 0,
+            undo_history_tail: 0,
         };
         tx.write_page(META_PAGE_ID, meta.encode());
 
@@ -285,7 +289,15 @@ impl EmbeddedCompute {
             dirty: BTreeMap::new(),
             ro_cache: BTreeMap::new(),
             modified: Vec::new(),
-            undo_page_id: None,
+            undo_txn_id: if read_only {
+                None
+            } else {
+                Some(self.sequencer.allocate_request_id())
+            },
+            undo_segment_first_page_id: None,
+            undo_segment_last_page_id: None,
+            undo_segment_last_record: None,
+            undo_segment_record_count: 0,
         }
     }
 
@@ -416,13 +428,11 @@ impl EmbeddedCompute {
             tx.commit().await?;
         }
 
-        let _ = self.gc_sweep_undo(gc_lsn).await;
+        let _ = self.gc_purge_undo_segments(gc_lsn).await;
         Ok(scanned)
     }
 
-    async fn gc_sweep_undo(&self, gc_lsn: u64) -> Result<()> {
-        use std::collections::HashSet;
-
+    async fn gc_purge_undo_segments(&self, gc_lsn: u64) -> Result<()> {
         let meta_bytes = if let Some(p) = self.page_cache.get(META_PAGE_ID) {
             p
         } else {
@@ -432,40 +442,67 @@ impl EmbeddedCompute {
         };
         let mut meta = MetaPage::decode(&meta_bytes)?;
 
-        const UNDO_BASE: PageId = 2_000_000;
-
-        // 1) Collect all live undo pages reachable from inline row head pointers.
-        let mut live_undo: HashSet<PageId> = HashSet::new();
-        let start = vec![0u8; KEY_SIZE];
-        let end = vec![0xFFu8; KEY_SIZE];
-        let entries = {
-            let tree = self.tree.lock().await;
-            tree.range(&start, &end).await
-        };
-
-        for (_key, row) in entries {
-            let mut ptr = row.undo_ptr;
-            while let Some(p) = ptr {
-                let _ = live_undo.insert(p.page_id);
-                let upage = self.get_page(p.page_id, gc_lsn).await;
-                let Some(upage) = upage else {
-                    break;
-                };
-                let rec = undo_pg::read_record(&upage, p.slot_id)?;
-                ptr = rec.prev;
+        let mut dirty_pages: BTreeMap<PageId, Page> = BTreeMap::new();
+        loop {
+            let head = meta.undo_history_head;
+            if head == 0 {
+                break;
             }
-        }
 
-        // 2) Free unreachable undo pages.
-        // Note: we only add to freelist; actual reuse happens in append_undo.
-        for pid in UNDO_BASE..meta.next_undo_page_id {
-            if !live_undo.contains(&pid) {
+            let mut head_page = self
+                .get_page(head, gc_lsn)
+                .await
+                .ok_or(Error::InMemoryPageMissing(head))?;
+            let mut head_hdr = undo_pg::read_segment_header(&head_page)?;
+            if head_hdr.state != SEGMENT_STATE_COMMITTED || head_hdr.commit_lsn > gc_lsn {
+                break;
+            }
+
+            let next = head_hdr.history_next;
+            if next == 0 {
+                meta.undo_history_head = 0;
+                meta.undo_history_tail = 0;
+            } else {
+                meta.undo_history_head = next;
+                let mut next_page = self
+                    .get_page(next, gc_lsn)
+                    .await
+                    .ok_or(Error::InMemoryPageMissing(next))?;
+                let mut next_hdr = undo_pg::read_segment_header(&next_page)?;
+                next_hdr.history_prev = 0;
+                undo_pg::write_segment_header(&mut next_page, next_hdr)?;
+                dirty_pages.insert(next, next_page);
+            }
+
+            let mut pid = head_hdr.first_page_id;
+            while pid != 0 {
+                let page = self
+                    .get_page(pid, gc_lsn)
+                    .await
+                    .ok_or(Error::InMemoryPageMissing(pid))?;
+                let next_pid = undo_pg::page_next_id(&page)?;
                 meta.push_free_undo(pid);
+                pid = next_pid;
             }
+
+            head_hdr.state = SEGMENT_STATE_PURGED;
+            head_hdr.history_prev = 0;
+            head_hdr.history_next = 0;
+            undo_pg::write_segment_header(&mut head_page, head_hdr)?;
+            dirty_pages.insert(head, head_page);
         }
 
-        // Persist meta update.
-        let _ = self.write_page(META_PAGE_ID, meta.encode()).await?;
+        if dirty_pages.is_empty() {
+            return Ok(());
+        }
+
+        dirty_pages.insert(META_PAGE_ID, meta.encode());
+        let pages: Vec<(PageId, Page)> = dirty_pages.into_iter().collect();
+        let reserve_n = pages.len().max(1);
+        let (request_id, start_lsn, end_lsn) = self.sequencer.reserve_txn(reserve_n)?;
+        let _ = self
+            .commit_pages_reserved(request_id, start_lsn, end_lsn, pages)
+            .await?;
         Ok(())
     }
 
@@ -515,8 +552,11 @@ pub struct EmbeddedTxn {
     ro_cache: BTreeMap<PageId, Page>,
     modified: Vec<[u8; KEY_SIZE]>,
 
-    // undo page writer (single page buffered)
-    undo_page_id: Option<PageId>,
+    undo_txn_id: Option<u64>,
+    undo_segment_first_page_id: Option<PageId>,
+    undo_segment_last_page_id: Option<PageId>,
+    undo_segment_last_record: Option<UndoPtr>,
+    undo_segment_record_count: u32,
 }
 
 impl Drop for EmbeddedTxn {
@@ -579,8 +619,13 @@ impl EmbeddedTxn {
         if old_value.len() != VALUE_SIZE {
             return Err(Error::InvalidValueSize(old_value.len(), VALUE_SIZE));
         }
+        let txn_id = self.undo_txn_id.ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "read-only transaction",
+            ))
+        })?;
 
-        // Load meta so we can allocate undo pages.
         let meta_bytes = self
             .compute
             .page_cache
@@ -588,26 +633,38 @@ impl EmbeddedTxn {
             .or_else(|| self.dirty.get(&META_PAGE_ID).cloned())
             .ok_or(Error::InMemoryPageMissing(META_PAGE_ID))?;
         let mut meta = MetaPage::decode(&meta_bytes)?;
-
-        let mut current_id = self.undo_page_id;
-        let mut page = match current_id {
-            Some(pid) => self
-                .get_page_for_read(pid)
-                .await
-                .unwrap_or_else(undo_pg::new_undo_page),
-            None => undo_pg::new_undo_page(),
-        };
         if meta.next_undo_page_id < 2_000_000 {
             meta.next_undo_page_id = 2_000_000;
         }
-        if current_id.is_none() {
+
+        let alloc_page_id = |meta: &mut MetaPage| -> PageId {
             if let Some(free) = meta.pop_free_undo() {
-                current_id = Some(free);
+                free
             } else {
-                current_id = Some(meta.next_undo_page_id);
+                let pid = meta.next_undo_page_id;
                 meta.next_undo_page_id += 1;
+                pid
             }
-        }
+        };
+
+        let mut current_id = if let Some(pid) = self.undo_segment_last_page_id {
+            pid
+        } else {
+            let pid = alloc_page_id(&mut meta);
+            let segment_page = undo_pg::new_undo_segment_page(txn_id, pid);
+            self.undo_segment_first_page_id = Some(pid);
+            self.undo_segment_last_page_id = Some(pid);
+            self.write_page(pid, segment_page);
+            pid
+        };
+
+        let mut page = self
+            .dirty
+            .get(&current_id)
+            .cloned()
+            .or_else(|| self.compute.page_cache.get(current_id))
+            .or_else(|| self.ro_cache.get(&current_id).cloned())
+            .ok_or(Error::InMemoryPageMissing(current_id))?;
 
         let mut old_value_arr = [0u8; VALUE_SIZE];
         old_value_arr.copy_from_slice(old_value);
@@ -615,6 +672,8 @@ impl EmbeddedTxn {
             data_page_id,
             data_slot_id,
             prev,
+            txn_id,
+            txn_next: self.undo_segment_last_record,
             old_commit_lsn,
             old_flags,
             old_value: old_value_arr,
@@ -623,33 +682,30 @@ impl EmbeddedTxn {
         let slot = match undo_pg::append_record(&mut page, &rec) {
             Ok(s) => s,
             Err(_) => {
-                // Current undo page full: persist it, allocate a new one.
-                let pid = current_id.unwrap();
-                self.write_page(pid, page);
+                let new_pid = alloc_page_id(&mut meta);
+                undo_pg::set_page_next_id(&mut page, new_pid)?;
+                self.write_page(current_id, page);
 
-                let new_pid = meta.pop_free_undo().unwrap_or_else(|| {
-                    let pid = meta.next_undo_page_id;
-                    meta.next_undo_page_id += 1;
-                    pid
-                });
                 let mut new_page = undo_pg::new_undo_page();
                 let s = undo_pg::append_record(&mut new_page, &rec)?;
-                current_id = Some(new_pid);
+                current_id = new_pid;
                 page = new_page;
                 s
             }
         };
 
-        // Stage undo page + meta.
-        let pid = current_id.unwrap();
-        self.undo_page_id = Some(pid);
-        self.write_page(pid, page);
+        self.undo_segment_last_page_id = Some(current_id);
+        let ptr = UndoPtr {
+            page_id: current_id,
+            slot_id: slot,
+        };
+        self.undo_segment_last_record = Some(ptr);
+        self.undo_segment_record_count = self.undo_segment_record_count.saturating_add(1);
+
+        self.write_page(current_id, page);
         self.write_page(META_PAGE_ID, meta.encode());
 
-        Ok(UndoPtr {
-            page_id: pid,
-            slot_id: slot,
-        })
+        Ok(ptr)
     }
 
     async fn read_visible_value_from_row(&mut self, row: &LeafValue) -> Result<Option<Vec<u8>>> {
@@ -848,45 +904,102 @@ impl EmbeddedTxn {
             }
             return Ok(self.read_lsn);
         }
-        // Also persist meta page updates for next_page_id/root.
-        let tree = self.compute.tree.lock().await;
-        let old_meta_bytes = if let Some(p) = self.dirty.get(&META_PAGE_ID) {
-            p.clone()
-        } else if let Some(p) = self.compute.page_cache.get(META_PAGE_ID) {
-            p
-        } else {
-            // During cold start, meta page may not exist yet; assume next_data_page_id is unchanged.
-            MetaPage {
-                root_page_id: tree.root_page_id(),
-                next_bptree_page_id: self.compute.provider.next_page_id(),
-                next_data_page_id: 1_000_000,
-                next_undo_page_id: 2_000_000,
-                undo_free: Vec::new(),
-            }
-            .encode()
-        };
-        let old_meta = MetaPage::decode(&old_meta_bytes)?;
-        let meta = MetaPage {
-            root_page_id: tree.root_page_id(),
-            next_bptree_page_id: self.compute.provider.next_page_id(),
-            next_data_page_id: old_meta.next_data_page_id,
-            next_undo_page_id: old_meta.next_undo_page_id,
-            undo_free: old_meta.undo_free.clone(),
-        };
-        drop(tree);
-        self.write_page(META_PAGE_ID, meta.encode());
 
         // Pull dirty bptree pages from provider and stage into txn.
         for (pid, page) in self.compute.provider.take_dirty() {
             self.write_page(pid, page);
         }
 
-        let pages_vec: Vec<(PageId, Page)> = std::mem::take(&mut self.dirty).into_iter().collect();
-        let reserve_n = pages_vec.len().max(1);
-        let (request_id, start_lsn, end_lsn) = self.compute.sequencer.reserve_txn(reserve_n)?;
+        let meta = if let Some(p) = self.dirty.get(&META_PAGE_ID) {
+            MetaPage::decode(p)?
+        } else if let Some(p) = self.compute.page_cache.get(META_PAGE_ID) {
+            MetaPage::decode(&p)?
+        } else {
+            MetaPage {
+                root_page_id: 10,
+                next_bptree_page_id: self.compute.provider.next_page_id(),
+                next_data_page_id: 1_000_000,
+                next_undo_page_id: 2_000_000,
+                undo_free: Vec::new(),
+                undo_history_head: 0,
+                undo_history_tail: 0,
+            }
+        };
+
+        if let Some(_first_pid) = self.undo_segment_first_page_id {
+            let old_tail = meta.undo_history_tail;
+            if old_tail != 0 && !self.dirty.contains_key(&old_tail) {
+                let tail_page = self
+                    .compute
+                    .page_cache
+                    .get(old_tail)
+                    .or_else(|| self.ro_cache.get(&old_tail).cloned())
+                    .ok_or(Error::InMemoryPageMissing(old_tail))?;
+                self.write_page(old_tail, tail_page);
+            }
+        }
+
+        let base_meta = meta.clone();
+        let request_id = self
+            .undo_txn_id
+            .unwrap_or_else(|| self.compute.sequencer.allocate_request_id());
+        // Pre-stamp modified rows with a dummy commit_lsn so B+Tree writes dirty all pages
+        // that will be touched again when stamping the real commit_lsn.
+        if !self.modified.is_empty() {
+            let mut tree = self.compute.tree.lock().await;
+            for key in &self.modified {
+                if let Some(mut row) = tree.get(key).await {
+                    row.commit_lsn = 1;
+                    tree.insert(key.to_vec(), row).await?;
+                }
+            }
+            drop(tree);
+        }
+
+        // Merge all newly dirtied provider pages into txn-local dirty state.
+        for (pid, page) in self.compute.provider.take_dirty() {
+            self.dirty.insert(pid, page);
+        }
+
+        // Build a stable final page-id set first, then reserve once.
+        let mut map: BTreeMap<PageId, Page> = self.dirty.clone();
+        let mut count_meta = base_meta.clone();
+        {
+            let tree = self.compute.tree.lock().await;
+            count_meta.root_page_id = tree.root_page_id();
+            count_meta.next_bptree_page_id = self.compute.provider.next_page_id();
+        }
+        if let Some(first_pid) = self.undo_segment_first_page_id {
+            if !map.contains_key(&first_pid) {
+                let head_page = self
+                    .compute
+                    .page_cache
+                    .get(first_pid)
+                    .or_else(|| self.ro_cache.get(&first_pid).cloned())
+                    .ok_or(Error::InMemoryPageMissing(first_pid))?;
+                map.insert(first_pid, head_page);
+            }
+            let old_tail = base_meta.undo_history_tail;
+            if old_tail != 0 && !map.contains_key(&old_tail) {
+                let tail_page = self
+                    .compute
+                    .page_cache
+                    .get(old_tail)
+                    .or_else(|| self.ro_cache.get(&old_tail).cloned())
+                    .ok_or(Error::InMemoryPageMissing(old_tail))?;
+                map.insert(old_tail, tail_page);
+            }
+        }
+        map.insert(META_PAGE_ID, count_meta.encode());
+        let reserve_n = map.len().max(1);
+
+        let (start_lsn, end_lsn) = self
+            .compute
+            .sequencer
+            .reserve_txn_with_request_id(reserve_n, request_id)?;
         let commit_lsn = end_lsn;
 
-        // Stamp commit_lsn into modified inline rows.
+        // Stamp the real commit_lsn and merge the dirty pages generated by those writes.
         if !self.modified.is_empty() {
             let mut tree = self.compute.tree.lock().await;
             for key in &self.modified {
@@ -896,18 +1009,72 @@ impl EmbeddedTxn {
                 }
             }
             drop(tree);
+            for (pid, page) in self.compute.provider.take_dirty() {
+                map.insert(pid, page);
+            }
         }
 
-        let mut map: BTreeMap<PageId, Page> = BTreeMap::new();
-        for (pid, p) in pages_vec {
-            map.insert(pid, p);
+        let mut meta = base_meta.clone();
+        {
+            let tree = self.compute.tree.lock().await;
+            meta.root_page_id = tree.root_page_id();
+            meta.next_bptree_page_id = self.compute.provider.next_page_id();
         }
-        for (pid, page) in self.compute.provider.take_dirty() {
-            map.insert(pid, page);
+
+        if let Some(first_pid) = self.undo_segment_first_page_id {
+            let last_pid = self.undo_segment_last_page_id.unwrap_or(first_pid);
+            let mut head_page = map
+                .get(&first_pid)
+                .cloned()
+                .or_else(|| self.compute.page_cache.get(first_pid))
+                .ok_or(Error::InMemoryPageMissing(first_pid))?;
+
+            let old_tail = base_meta.undo_history_tail;
+            let hdr = UndoSegmentHeader {
+                txn_id: request_id,
+                begin_lsn: start_lsn,
+                commit_lsn,
+                state: SEGMENT_STATE_COMMITTED,
+                first_page_id: first_pid,
+                last_page_id: last_pid,
+                record_count: self.undo_segment_record_count,
+                history_prev: old_tail,
+                history_next: 0,
+            };
+            undo_pg::write_segment_header(&mut head_page, hdr)?;
+            map.insert(first_pid, head_page);
+
+            if old_tail != 0 {
+                let mut tail_page = map
+                    .get(&old_tail)
+                    .cloned()
+                    .or_else(|| self.compute.page_cache.get(old_tail))
+                    .or_else(|| self.ro_cache.get(&old_tail).cloned())
+                    .ok_or(Error::InMemoryPageMissing(old_tail))?;
+                let mut tail_hdr = undo_pg::read_segment_header(&tail_page)?;
+                tail_hdr.history_next = first_pid;
+                undo_pg::write_segment_header(&mut tail_page, tail_hdr)?;
+                map.insert(old_tail, tail_page);
+            } else {
+                meta.undo_history_head = first_pid;
+            }
+            meta.undo_history_tail = first_pid;
+        }
+        map.insert(META_PAGE_ID, meta.encode());
+
+        if map.len() != reserve_n {
+            let _ = self.read_guard.take();
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "reserved page count mismatch: reserved={} final={}",
+                    reserve_n,
+                    map.len()
+                ),
+            )));
         }
 
         let pages: Vec<(PageId, Page)> = map.into_iter().collect();
-        // Commit with reserved range.
         let out = self
             .compute
             .commit_pages_reserved(request_id, start_lsn, end_lsn, pages)

@@ -72,3 +72,49 @@ async fn test_gc_respects_active_read_lsn() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_gc_purges_undo_by_txn_history_without_full_row_scan() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+    let dir = temp_dir();
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone().into())
+                .await
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+
+            for i in 0..64u8 {
+                let key = fixed_key(&[i]);
+                let v = vec![i; VALUE_SIZE];
+                compute.put(&key, &v).await.unwrap();
+            }
+
+            let target = fixed_key(&[0]);
+            for i in 0..48u8 {
+                let v = vec![100u8.wrapping_add(i); VALUE_SIZE];
+                compute.put(&target, &v).await.unwrap();
+            }
+
+            let meta_before_bytes = compute.cached_page(scale_kv::META_PAGE_ID).unwrap();
+            let meta_before = scale_kv::MetaPage::decode(&meta_before_bytes).unwrap();
+            assert!(meta_before.undo_history_head != 0);
+
+            let scanned = compute.gc_once(1).await.unwrap();
+            assert_eq!(scanned, 1);
+
+            let meta_after_bytes = compute.cached_page(scale_kv::META_PAGE_ID).unwrap();
+            let meta_after = scale_kv::MetaPage::decode(&meta_after_bytes).unwrap();
+            assert_eq!(meta_after.undo_history_head, 0);
+            assert_eq!(meta_after.undo_history_tail, 0);
+            assert!(meta_after.undo_free.len() > meta_before.undo_free.len());
+        })
+        .await;
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
