@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, process};
 
-use scale_kv::{EmbeddedCompute, PAGE_SIZE, StorageServer};
+use scale_kv::{EmbeddedCompute, KEY_SIZE, PAGE_SIZE, StorageServer, VALUE_SIZE};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -71,6 +71,69 @@ async fn test_page_redo_commit_and_recover_by_scan() {
 
             let got = compute2.cached_page(page_id).unwrap();
             assert_eq!(got, page);
+        })
+        .await;
+
+    cleanup_dir(&dir);
+}
+
+fn test_key(n: u64) -> Vec<u8> {
+    let mut k = vec![0u8; KEY_SIZE];
+    k[..8].copy_from_slice(&n.to_be_bytes());
+    k
+}
+
+fn test_value(b: u8) -> Vec<u8> {
+    vec![b; VALUE_SIZE]
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_scan_range_snapshot_inclusive_and_limit() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir = temp_dir();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
+                .await
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+
+            let k1 = test_key(1);
+            let k2 = test_key(2);
+            let k3 = test_key(3);
+            let v1 = test_value(1);
+            let v2 = test_value(2);
+            let v2_new = test_value(9);
+            let v3 = test_value(3);
+
+            compute.put(&k1, &v1).await.unwrap();
+            compute.put(&k2, &v2).await.unwrap();
+            compute.put(&k3, &v3).await.unwrap();
+
+            // Capture a read snapshot, then overwrite k2 to force undo-chain visibility.
+            let mut ro = compute.begin_ro_timeout(std::time::Duration::from_secs(10));
+            compute.put(&k2, &v2_new).await.unwrap();
+
+            let snap = ro.scan_range(&k1, &k2, 10).await.unwrap();
+            assert_eq!(snap.len(), 2);
+            assert_eq!(snap[0], (k1.clone(), v1.clone()));
+            assert_eq!(snap[1], (k2.clone(), v2.clone()));
+
+            // End bound is inclusive.
+            let inclusive = compute.scan_range(&k2, &k2, 10).await.unwrap();
+            assert_eq!(inclusive, vec![(k2.clone(), v2_new.clone())]);
+
+            // Limit applies to visible rows.
+            let limited = compute.scan_range(&k1, &k3, 2).await.unwrap();
+            assert_eq!(limited.len(), 2);
+            assert_eq!(limited[0], (k1, v1));
+            assert_eq!(limited[1], (k2, v2_new));
         })
         .await;
 

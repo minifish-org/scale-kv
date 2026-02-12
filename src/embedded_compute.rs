@@ -1,13 +1,13 @@
 use crate::compute_sequencer::ComputeSequencer;
 use crate::meta_page::{META_PAGE_ID, MetaPage};
 use crate::page_bptree::{
-    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, PageBPlusTree, PageCache, SlotRef as PageSlotRef,
+    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, LeafValue, PageBPlusTree, PageCache,
 };
 use crate::txn_page_provider::TxnPageProvider;
 use crate::{ActiveReads, ReadGuard};
 use crate::{BTREE_META_PAGE_ID, BtreeMeta};
 use crate::{
-    Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, StorageClient, VALUE_SIZE, slotted_page,
+    Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, StorageClient, VALUE_SIZE,
     undo_pg::{self, UndoPtr, UndoRecord},
 };
 use std::collections::BTreeMap;
@@ -220,21 +220,14 @@ impl EmbeddedCompute {
             return Ok(());
         }
 
-        // Cold start: create meta + FSM + root page as one txn.
-        // PageId plan (simple):
+        // Cold start: create meta + root page as one txn.
+        // PageId plan:
         // - 0: meta
-        // - 1: fsm meta
-        // - 2.. : fsm level pages
         // - 10.. : bptree pages
-        // - 1_000_000.. : data pages
+        // - 2_000_000.. : undo pages
 
         const BPTREE_ROOT_ID: PageId = 10;
-        const DATA_BASE: PageId = 1_000_000;
         const UNDO_BASE: PageId = 2_000_000;
-        const FSM_LEVEL0_BASE: PageId = 2;
-        const INIT_DATA_LEAVES: u64 = 1024; // tracks first 1024 data pages initially
-
-        // Stash these conventions into the page cache for later use (simple approach: store them in meta in next iteration).
 
         let mut tx = self.begin_rw();
 
@@ -256,18 +249,11 @@ impl EmbeddedCompute {
             .encode(),
         );
 
-        // FSM pages (empty).
-        let (_fsm_meta, fsm_writes) =
-            crate::fsm_pg::init_fsm_pages(DATA_BASE, INIT_DATA_LEAVES, FSM_LEVEL0_BASE);
-        for (pid, page) in fsm_writes {
-            tx.write_page(pid, page);
-        }
-
         // Meta page.
         let meta = MetaPage {
             root_page_id: BPTREE_ROOT_ID,
             next_bptree_page_id: BPTREE_ROOT_ID + 1,
-            next_data_page_id: DATA_BASE,
+            next_data_page_id: 1_000_000,
             next_undo_page_id: UNDO_BASE,
             undo_free: Vec::new(),
         };
@@ -348,6 +334,28 @@ impl EmbeddedCompute {
         tx.get(key).await
     }
 
+    /// Scan the primary key range `[start, end]` (inclusive) at a read-only snapshot.
+    ///
+    /// Returns up to `limit` visible key/value pairs according to this scan's `read_lsn`.
+    pub async fn scan_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if start.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(start.len(), KEY_SIZE));
+        }
+        if end.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(end.len(), KEY_SIZE));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.begin_tx(true, None);
+        tx.scan_range(start, end, limit).await
+    }
+
     pub async fn delete(&self, key: &[u8]) -> Result<u64> {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
@@ -357,123 +365,59 @@ impl EmbeddedCompute {
         tx.commit().await
     }
 
-    /// Run one GC pass over data pages up to `budget_pages` pages.
-    ///
-    /// For now this performs a correctness-first physical delete:
-    /// - If a record is a tombstone and its commit_lsn <= gc_lsn, remove it from the B+Tree and
-    ///   clear its slot entry.
-    /// - Also clears the record's undo_ptr.
-    ///
-    /// NOTE: This does not compact payload space inside a slotted page yet; it only frees the slot
-    /// directory entry for reuse.
+    /// Run one GC pass over primary-key rows up to `budget_pages` entries.
     pub async fn gc_once(&self, budget_pages: usize) -> Result<usize> {
+        if budget_pages == 0 {
+            return Ok(0);
+        }
         let gc_lsn = self.gc_lsn();
+        let tx = self.begin_rw();
+        let start = vec![0u8; KEY_SIZE];
+        let end = vec![0xFFu8; KEY_SIZE];
 
-        // Load meta to discover scan range.
-        let meta_bytes = if let Some(p) = self.page_cache.get(META_PAGE_ID) {
-            p
-        } else {
-            self.get_page(META_PAGE_ID, gc_lsn)
-                .await
-                .ok_or(Error::InMemoryPageMissing(META_PAGE_ID))?
-        };
-        let meta = MetaPage::decode(&meta_bytes)?;
-
-        const DATA_BASE: PageId = 1_000_000;
-        let end = meta.next_data_page_id;
-
-        let mut tx = self.begin_rw();
-
-        // Load FSM meta (best-effort). If missing, we can still GC but won't update FSM hints.
-        let fsm_meta = match tx.get_page_for_read(crate::fsm_pg::FSM_META_PAGE_ID).await {
-            Some(p) => crate::fsm_pg::FsmMeta::decode(&p).ok(),
-            None => None,
+        let entries = {
+            let tree = tx.compute.tree.lock().await;
+            tree.range(&start, &end).await
         };
 
-        let mut pages_scanned = 0usize;
-        for page_id in DATA_BASE..end {
-            if pages_scanned >= budget_pages {
+        let mut scanned = 0usize;
+        let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
+        let mut rows_to_update: Vec<(Vec<u8>, LeafValue)> = Vec::new();
+
+        for (key, mut row) in entries {
+            if scanned >= budget_pages {
                 break;
             }
-            pages_scanned += 1;
-
-            let Some(mut page) = tx.get_page_for_read(page_id).await else {
+            scanned += 1;
+            if row.commit_lsn == 0 || row.commit_lsn > gc_lsn {
                 continue;
-            };
-
-            let slots = slotted_page::slot_count(&page);
-            let mut changed = false;
-
-            for slot_id in 0..slots {
-                let Some(key) = slotted_page::read_key(&page, slot_id) else {
-                    continue;
-                };
-
-                let Some(commit_lsn) = slotted_page::read_commit_lsn(&page, slot_id, &key) else {
-                    continue;
-                };
-                let flags = slotted_page::read_flags(&page, slot_id, &key).unwrap_or(0);
-
-                // Only consider tombstones whose tombstone commit is visible to all active readers.
-                if (flags & 1) != 0 && commit_lsn <= gc_lsn {
-                    // Remove mapping and clear slot.
-                    {
-                        let mut tree = tx.compute.tree.lock().await;
-                        let _ = tree.remove(&key).await;
-                    }
-                    slotted_page::write_undo_ptr(&mut page, slot_id, None);
-                    slotted_page::clear_slot(&mut page, slot_id);
-                    changed = true;
-                } else if commit_lsn <= gc_lsn {
-                    // Visible to all: we can drop undo chain to cap history.
-                    slotted_page::write_undo_ptr(&mut page, slot_id, None);
-                    changed = true;
-                }
             }
 
-            if changed {
-                // Reclaim payload space (slot ids stay stable).
-                let _ = slotted_page::defragment(&mut page);
+            if (row.flags & 1) != 0 {
+                keys_to_remove.push(key);
+                continue;
+            }
 
-                // Update FSM hint based on new free space.
-                if let Some(fsm_meta) = fsm_meta {
-                    if page_id >= fsm_meta.data_base {
-                        let leaf_idx = page_id - fsm_meta.data_base;
-                        if leaf_idx < fsm_meta.leaf_count {
-                            let free = slotted_page::page_free_space(&page);
-                            let class = crate::fsm_pg::class_from_free_bytes(free);
-
-                            // Read helper prefers txn dirty pages.
-                            let get_page = |pid: PageId| {
-                                tx.dirty
-                                    .get(&pid)
-                                    .cloned()
-                                    .or_else(|| tx.compute.page_cache.get(pid))
-                            };
-
-                            if let Ok(writes) =
-                                crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, class)
-                            {
-                                for (pid, p) in writes {
-                                    tx.write_page(pid, p);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                tx.write_page(page_id, page);
+            if row.undo_ptr.is_some() {
+                row.undo_ptr = None;
+                rows_to_update.push((key, row));
             }
         }
 
-        // Commit as a normal txn so GC is logged and durable.
-        tx.commit().await?;
+        if !keys_to_remove.is_empty() || !rows_to_update.is_empty() {
+            let mut tree = tx.compute.tree.lock().await;
+            for key in keys_to_remove {
+                let _ = tree.remove(&key).await;
+            }
+            for (key, row) in rows_to_update {
+                tree.insert(key, row).await?;
+            }
+            drop(tree);
+            tx.commit().await?;
+        }
 
-        // Best-effort undo-page sweep: build a live set from data pages and free unreachable undo pages.
-        // This is O(total_pages) and should be used sparingly (manual only).
         let _ = self.gc_sweep_undo(gc_lsn).await;
-
-        Ok(pages_scanned)
+        Ok(scanned)
     }
 
     async fn gc_sweep_undo(&self, gc_lsn: u64) -> Result<()> {
@@ -488,34 +432,27 @@ impl EmbeddedCompute {
         };
         let mut meta = MetaPage::decode(&meta_bytes)?;
 
-        const DATA_BASE: PageId = 1_000_000;
         const UNDO_BASE: PageId = 2_000_000;
 
-        // 1) Collect all live undo pages reachable from data-page head pointers.
+        // 1) Collect all live undo pages reachable from inline row head pointers.
         let mut live_undo: HashSet<PageId> = HashSet::new();
+        let start = vec![0u8; KEY_SIZE];
+        let end = vec![0xFFu8; KEY_SIZE];
+        let entries = {
+            let tree = self.tree.lock().await;
+            tree.range(&start, &end).await
+        };
 
-        for page_id in DATA_BASE..meta.next_data_page_id {
-            let Some(page) = self.get_page(page_id, gc_lsn).await else {
-                continue;
-            };
-            let slots = slotted_page::slot_count(&page);
-            for slot_id in 0..slots {
-                let Some(key) = slotted_page::read_key(&page, slot_id) else {
-                    continue;
+        for (_key, row) in entries {
+            let mut ptr = row.undo_ptr;
+            while let Some(p) = ptr {
+                let _ = live_undo.insert(p.page_id);
+                let upage = self.get_page(p.page_id, gc_lsn).await;
+                let Some(upage) = upage else {
+                    break;
                 };
-                let mut ptr = slotted_page::read_undo_ptr(&page, slot_id, &key);
-                while let Some(p) = ptr {
-                    if !live_undo.insert(p.page_id) {
-                        // already visited this page id, but still need to progress the chain
-                    }
-                    // read undo record to follow prev
-                    let upage = self.get_page(p.page_id, gc_lsn).await;
-                    let Some(upage) = upage else {
-                        break;
-                    };
-                    let rec = undo_pg::read_record(&upage, p.slot_id)?;
-                    ptr = rec.prev;
-                }
+                let rec = undo_pg::read_record(&upage, p.slot_id)?;
+                ptr = rec.prev;
             }
         }
 
@@ -563,7 +500,7 @@ impl EmbeddedCompute {
     }
 }
 
-/// Buffered transaction that tracks all dirty pages (tree pages + data pages + meta page).
+/// Buffered transaction that tracks dirty pages (tree + meta + undo pages).
 pub struct EmbeddedTxn {
     compute: EmbeddedCompute,
     read_lsn: u64,
@@ -576,7 +513,7 @@ pub struct EmbeddedTxn {
 
     dirty: BTreeMap<PageId, Page>,
     ro_cache: BTreeMap<PageId, Page>,
-    modified: Vec<(PageId, u16, [u8; KEY_SIZE])>,
+    modified: Vec<[u8; KEY_SIZE]>,
 
     // undo page writer (single page buffered)
     undo_page_id: Option<PageId>,
@@ -715,313 +652,16 @@ impl EmbeddedTxn {
         })
     }
 
-    async fn alloc_or_update_data_page(
-        &mut self,
-        existing: Option<PageSlotRef>,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<PageSlotRef> {
-        // Update existing record in-place.
-        if let Some(slot) = existing {
-            let mut page = self
-                .get_page_for_read(slot.page_id)
-                .await
-                .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
-            // Write undo before overwriting.
-            let old_commit = slotted_page::read_commit_lsn(&page, slot.slot_id, key).unwrap_or(0);
-            let old_flags = slotted_page::read_flags(&page, slot.slot_id, key).unwrap_or(0);
-            let old_undo = slotted_page::read_undo_ptr(&page, slot.slot_id, key);
-            let old_value = slotted_page::read_value(&page, slot.slot_id, key)
-                .unwrap_or_else(|| vec![0u8; VALUE_SIZE]);
-
-            let undo_ptr = self
-                .append_undo(
-                    slot.page_id,
-                    slot.slot_id,
-                    old_undo,
-                    old_commit,
-                    old_flags,
-                    &old_value,
-                )
-                .await?;
-
-            if let Some(slot_key) = slotted_page::read_key(&page, slot.slot_id) {
-                if slot_key.as_slice() != key {
-                    let slot_info = slotted_page::debug_slot(&page, slot.slot_id)
-                        .map(|(pos, len)| format!("pos={pos} len={len}"))
-                        .unwrap_or_else(|| "<none>".to_string());
-                    let leaf_keys = {
-                        let tree = self.compute.tree.lock().await;
-                        tree.debug_leaf_keys(key, 8).await
-                    };
-                    let leaf_keys_hex: Vec<String> =
-                        leaf_keys.iter().map(|k| hex::encode(k)).collect();
-
-                    eprintln!(
-                        "[overwrite-debug] key mismatch before overwrite: page_id={} slot_id={} {} key_hex={} slot_key_hex={} leaf_keys_hex={:?}",
-                        slot.page_id,
-                        slot.slot_id,
-                        slot_info,
-                        hex::encode(key),
-                        hex::encode(&slot_key),
-                        leaf_keys_hex
-                    );
-                }
-            }
-
-            slotted_page::overwrite_value(&mut page, slot.slot_id, key, value)?;
-            slotted_page::write_flags(&mut page, slot.slot_id, 0);
-            slotted_page::write_undo_ptr(&mut page, slot.slot_id, Some(undo_ptr));
-            self.modified
-                .push((slot.page_id, slot.slot_id, key.try_into().unwrap()));
-
-            self.write_page(slot.page_id, page);
-            return Ok(slot);
-        }
-
-        // Load meta + FSM meta.
-        // IMPORTANT: within a txn, always prefer dirty pages over shared page_cache.
-        // Otherwise we may re-read stale meta/FSM and reallocate the same page ids.
-        let meta_bytes = self
-            .dirty
-            .get(&META_PAGE_ID)
-            .cloned()
-            .or_else(|| self.compute.page_cache.get(META_PAGE_ID))
-            .ok_or(Error::InMemoryPageMissing(META_PAGE_ID))?;
-        let mut meta = MetaPage::decode(&meta_bytes)?;
-
-        let fsm_meta_bytes = self
-            .dirty
-            .get(&crate::fsm_pg::FSM_META_PAGE_ID)
-            .cloned()
-            .or_else(|| self.compute.page_cache.get(crate::fsm_pg::FSM_META_PAGE_ID))
-            .ok_or(Error::InMemoryPageMissing(crate::fsm_pg::FSM_META_PAGE_ID))?;
-        let fsm_meta = crate::fsm_pg::FsmMeta::decode(&fsm_meta_bytes)?;
-
-        // Required bytes: payload + possible new slot entry.
-        // NOTE: slotted_page payload now includes MVCC header.
-        let required = (KEY_SIZE + VALUE_SIZE + 8 + 8 + 2 + 2) + 4;
-        let need_class = crate::fsm_pg::need_class(required);
-
-        let cache = Arc::clone(&self.compute.page_cache);
-        let get_page = move |pid: PageId| cache.get(pid);
-
-        // Try find a candidate leaf index and insert.
-        for _ in 0..8 {
-            let cand = crate::fsm_pg::find_candidate(&fsm_meta, &get_page, need_class)?;
-            let Some(leaf_idx) = cand else {
-                break;
-            };
-            let page_id = fsm_meta.data_base + leaf_idx;
-            if let Some(mut page) = self.get_page_for_read(page_id).await {
-                match slotted_page::insert_record(&mut page, key, value) {
-                    Ok(slot_id) => {
-                        // Debug assert: the inserted slot must contain this key.
-                        if cfg!(debug_assertions) {
-                            if let Some(slot_key) = slotted_page::read_key(&page, slot_id) {
-                                if slot_key.as_slice() != key {
-                                    let slot_info = slotted_page::debug_slot(&page, slot_id)
-                                        .map(|(pos, len)| format!("pos={pos} len={len}"))
-                                        .unwrap_or_else(|| "<none>".to_string());
-                                    panic!(
-                                        "[data-assert] insert_record key mismatch: page_id={} slot_id={} {} key_hex={} slot_key_hex={}",
-                                        page_id,
-                                        slot_id,
-                                        slot_info,
-                                        hex::encode(key),
-                                        hex::encode(slot_key)
-                                    );
-                                }
-                            } else {
-                                panic!(
-                                    "[data-assert] insert_record slot missing: page_id={} slot_id={} key_hex={}",
-                                    page_id,
-                                    slot_id,
-                                    hex::encode(key)
-                                );
-                            }
-                        }
-
-                        self.write_page(page_id, page.clone());
-                        // New record: remember to stamp commit_lsn.
-                        self.modified
-                            .push((page_id, slot_id, key.try_into().unwrap()));
-
-                        let free = slotted_page::page_free_space(&page);
-                        let class = crate::fsm_pg::class_from_free_bytes(free);
-                        for (pid, p) in
-                            crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, class)?
-                        {
-                            self.write_page(pid, p);
-                        }
-                        return Ok(PageSlotRef { page_id, slot_id });
-                    }
-                    Err(_) => {
-                        // FSM hint was stale; fix it downwards based on current page header.
-                        let free = slotted_page::page_free_space(&page);
-                        let class = crate::fsm_pg::class_from_free_bytes(free);
-                        for (pid, p) in
-                            crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, class)?
-                        {
-                            self.write_page(pid, p);
-                        }
-                        continue;
-                    }
-                }
-            } else {
-                // Page not present yet; treat as empty (class 0).
-                for (pid, p) in crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, 0)? {
-                    self.write_page(pid, p);
-                }
-            }
-        }
-
-        // Allocate a new data page.
-        let page_id = meta.next_data_page_id;
-        if page_id < fsm_meta.data_base {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "next_data_page_id below data_base",
-            )));
-        }
-        let leaf_idx = page_id - fsm_meta.data_base;
-        let mut fsm_meta = fsm_meta;
-        if leaf_idx >= fsm_meta.leaf_count {
-            // Grow FSM to cover this leaf.
-            // Grow exponentially to reduce frequency of FSM expansion.
-            let desired = leaf_idx + 1;
-            let target = fsm_meta.leaf_count.saturating_mul(2).max(desired).max(1024);
-            let (new_meta, grow_writes) = crate::fsm_pg::ensure_capacity(&fsm_meta, target)?;
-            for (pid, p) in grow_writes {
-                self.write_page(pid, p);
-            }
-            fsm_meta = new_meta;
-        }
-
-        let mut page = slotted_page::new_page();
-        let slot_id = slotted_page::insert_record(&mut page, key, value)?;
-
-        if cfg!(debug_assertions) {
-            if let Some(slot_key) = slotted_page::read_key(&page, slot_id) {
-                if slot_key.as_slice() != key {
-                    let slot_info = slotted_page::debug_slot(&page, slot_id)
-                        .map(|(pos, len)| format!("pos={pos} len={len}"))
-                        .unwrap_or_else(|| "<none>".to_string());
-                    panic!(
-                        "[data-assert] new_page insert key mismatch: page_id={} slot_id={} {} key_hex={} slot_key_hex={}",
-                        page_id,
-                        slot_id,
-                        slot_info,
-                        hex::encode(key),
-                        hex::encode(slot_key)
-                    );
-                }
-            } else {
-                panic!(
-                    "[data-assert] new_page insert slot missing: page_id={} slot_id={} key_hex={}",
-                    page_id,
-                    slot_id,
-                    hex::encode(key)
-                );
-            }
-        }
-
-        self.modified
-            .push((page_id, slot_id, key.try_into().unwrap()));
-        self.write_page(page_id, page.clone());
-
-        let free = slotted_page::page_free_space(&page);
-        let class = crate::fsm_pg::class_from_free_bytes(free);
-        for (pid, p) in crate::fsm_pg::update_leaf(&fsm_meta, &get_page, leaf_idx, class)? {
-            self.write_page(pid, p);
-        }
-
-        // Advance next_data_page_id and persist meta.
-        meta.next_data_page_id = page_id + 1;
-        self.write_page(META_PAGE_ID, meta.encode());
-
-        Ok(PageSlotRef { page_id, slot_id })
-    }
-
-    pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.ensure_not_timed_out()?;
-        if self.read_only {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "read-only transaction",
-            )));
-        }
-        // Read existing mapping first.
-        let existing = {
-            let tree = self.compute.tree.lock().await;
-            tree.get(key).await
-        };
-
-        // Write/allocate data page.
-        let slot_ref = self.alloc_or_update_data_page(existing, key, value).await?;
-
-        // Update B+Tree mapping.
-        {
-            let mut tree = self.compute.tree.lock().await;
-            tree.insert(key.to_vec(), slot_ref).await?;
-        }
-
-        if false {
-            // Debug self-check: btree mapping must point to a slot whose key matches.
-            if let Some(page) = self.get_page_for_read(slot_ref.page_id).await {
-                if let Some(slot_key) = slotted_page::read_key(&page, slot_ref.slot_id) {
-                    if slot_key.as_slice() != key {
-                        eprintln!(
-                            "[selfcheck] slot key mismatch: page_id={} slot_id={} key_hex={} slot_key_hex={}",
-                            slot_ref.page_id,
-                            slot_ref.slot_id,
-                            hex::encode(key),
-                            hex::encode(&slot_key)
-                        );
-                    }
-                } else {
-                    eprintln!(
-                        "[selfcheck] slot missing after put: key_hex={} page_id={} slot_id={}",
-                        hex::encode(key),
-                        slot_ref.page_id,
-                        slot_ref.slot_id
-                    );
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.ensure_not_timed_out()?;
-        if key.len() != KEY_SIZE {
-            return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
-        }
-        let slot = {
-            let tree = self.compute.tree.lock().await;
-            tree.get(key).await
-        };
-        let Some(slot) = slot else {
-            return Ok(None);
-        };
-
-        let page = self
-            .get_page_for_read(slot.page_id)
-            .await
-            .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
-
-        let commit_lsn = slotted_page::read_commit_lsn(&page, slot.slot_id, key).unwrap_or(0);
-        let flags = slotted_page::read_flags(&page, slot.slot_id, key).unwrap_or(0);
-        if commit_lsn <= self.read_lsn {
-            if (flags & 1) != 0 {
+    async fn read_visible_value_from_row(&mut self, row: &LeafValue) -> Result<Option<Vec<u8>>> {
+        if row.commit_lsn <= self.read_lsn {
+            if (row.flags & 1) != 0 {
                 return Ok(None);
             }
-            return Ok(slotted_page::read_value(&page, slot.slot_id, key));
+            return Ok(Some(row.value.to_vec()));
         }
 
-        // Not visible: walk undo chain.
-        let mut undo = slotted_page::read_undo_ptr(&page, slot.slot_id, key);
+        // Not visible at this snapshot: walk undo chain to find latest visible version.
+        let mut undo = row.undo_ptr;
         while let Some(ptr) = undo {
             let upage = self
                 .get_page_for_read(ptr.page_id)
@@ -1040,15 +680,106 @@ impl EmbeddedTxn {
         Ok(None)
     }
 
-    pub async fn debug_check_mapping(&mut self, key: &[u8]) -> Result<()> {
-        let (slot, leaf_entries) = {
+    pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.ensure_not_timed_out()?;
+        if self.read_only {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "read-only transaction",
+            )));
+        }
+        let existing = {
             let tree = self.compute.tree.lock().await;
-            let slot = tree.get(key).await;
-            let leaf_entries = tree.debug_leaf_entries(key, 16).await;
-            (slot, leaf_entries)
+            tree.get(key).await
+        };
+        let mut new_value = [0u8; VALUE_SIZE];
+        new_value.copy_from_slice(value);
+
+        let mut row = LeafValue {
+            value: new_value,
+            commit_lsn: 0,
+            undo_ptr: None,
+            flags: 0,
+        };
+        if let Some(old) = existing {
+            row.undo_ptr = Some(
+                self.append_undo(0, 0, old.undo_ptr, old.commit_lsn, old.flags, &old.value)
+                    .await?,
+            );
+        }
+
+        {
+            let mut tree = self.compute.tree.lock().await;
+            tree.insert(key.to_vec(), row).await?;
+        }
+        self.modified.push(key.try_into().unwrap());
+
+        Ok(())
+    }
+
+    pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.ensure_not_timed_out()?;
+        if key.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
+        }
+        let row = {
+            let tree = self.compute.tree.lock().await;
+            tree.get(key).await
+        };
+        let Some(row) = row else {
+            return Ok(None);
         };
 
-        let Some(slot) = slot else {
+        self.read_visible_value_from_row(&row).await
+    }
+
+    /// Scan the primary key range `[start, end]` (inclusive) at this txn snapshot.
+    ///
+    /// Visibility is evaluated using MVCC metadata (`commit_lsn` and undo chain) at `read_lsn`.
+    /// Returns at most `limit` visible rows.
+    pub async fn scan_range(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.ensure_not_timed_out()?;
+        if start.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(start.len(), KEY_SIZE));
+        }
+        if end.len() != KEY_SIZE {
+            return Err(Error::InvalidKeySize(end.len(), KEY_SIZE));
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let entries = {
+            let tree = self.compute.tree.lock().await;
+            tree.range(start, end).await
+        };
+
+        let mut out = Vec::with_capacity(limit.min(entries.len()));
+        for (key, row) in entries {
+            if let Some(value) = self.read_visible_value_from_row(&row).await? {
+                out.push((key, value));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn debug_check_mapping(&mut self, key: &[u8]) -> Result<()> {
+        let (row, leaf_entries) = {
+            let tree = self.compute.tree.lock().await;
+            let row = tree.get(key).await;
+            let leaf_entries = tree.debug_leaf_entries(key, 16).await;
+            (row, leaf_entries)
+        };
+
+        let Some(row) = row else {
             eprintln!(
                 "[verify] missing key in btree: key_hex={}",
                 hex::encode(key)
@@ -1056,36 +787,18 @@ impl EmbeddedTxn {
             return Ok(());
         };
 
-        let page = self
-            .get_page_for_read(slot.page_id)
-            .await
-            .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
-        let slot_key = slotted_page::read_key(&page, slot.slot_id);
-
-        if slot_key.as_deref() != Some(key) {
-            let slot_key_hex = slot_key
-                .as_ref()
-                .map(|k| hex::encode(k))
-                .unwrap_or_else(|| "<none>".to_string());
-            let slot_info = slotted_page::debug_slot(&page, slot.slot_id)
-                .map(|(pos, len)| format!("pos={pos} len={len}"))
-                .unwrap_or_else(|| "<none>".to_string());
-
-            let leaf_entries_hex: Vec<(String, String)> = leaf_entries
-                .into_iter()
-                .map(|(k, v)| (hex::encode(k), hex::encode(v)))
-                .collect();
-
-            eprintln!(
-                "[verify] mapping mismatch: key_hex={} slot_ref=({}, {}) slot_key_hex={} {} leaf_entries_hex={:?}",
-                hex::encode(key),
-                slot.page_id,
-                slot.slot_id,
-                slot_key_hex,
-                slot_info,
-                leaf_entries_hex
-            );
-        }
+        let leaf_entries_hex: Vec<(String, String)> = leaf_entries
+            .into_iter()
+            .map(|(k, v)| (hex::encode(k), hex::encode(v)))
+            .collect();
+        eprintln!(
+            "[verify] inline row: key_hex={} commit_lsn={} flags={} undo={:?} leaf_entries_hex={:?}",
+            hex::encode(key),
+            row.commit_lsn,
+            row.flags,
+            row.undo_ptr,
+            leaf_entries_hex
+        );
 
         Ok(())
     }
@@ -1098,50 +811,25 @@ impl EmbeddedTxn {
                 "read-only transaction",
             )));
         }
-        // Find slotref (if any).
         let existing = {
             let tree = self.compute.tree.lock().await;
             tree.get(key).await
         };
 
-        if let Some(slot) = existing {
-            let mut page = self
-                .get_page_for_read(slot.page_id)
-                .await
-                .ok_or(Error::InMemoryPageMissing(slot.page_id))?;
-
-            // Write undo before tombstoning.
-            let old_commit = slotted_page::read_commit_lsn(&page, slot.slot_id, key).unwrap_or(0);
-            let old_flags = slotted_page::read_flags(&page, slot.slot_id, key).unwrap_or(0);
-            let old_undo = slotted_page::read_undo_ptr(&page, slot.slot_id, key);
-            let old_value = slotted_page::read_value(&page, slot.slot_id, key)
-                .unwrap_or_else(|| vec![0u8; VALUE_SIZE]);
-
+        if let Some(old) = existing {
             let undo_ptr = self
-                .append_undo(
-                    slot.page_id,
-                    slot.slot_id,
-                    old_undo,
-                    old_commit,
-                    old_flags,
-                    &old_value,
-                )
+                .append_undo(0, 0, old.undo_ptr, old.commit_lsn, old.flags, &old.value)
                 .await?;
-
-            // Keep slot allocated; mark tombstone for snapshot reads.
-            slotted_page::mark_tombstone(&mut page, slot.slot_id);
-            slotted_page::write_undo_ptr(&mut page, slot.slot_id, Some(undo_ptr));
-            self.modified
-                .push((slot.page_id, slot.slot_id, key.try_into().unwrap()));
-
-            self.write_page(slot.page_id, page.clone());
-
-            // FSM: no free-space increase until GC/vacuum.
-        }
-
-        {
+            let row = LeafValue {
+                value: old.value,
+                commit_lsn: 0,
+                undo_ptr: Some(undo_ptr),
+                flags: old.flags | 1,
+            };
             let mut tree = self.compute.tree.lock().await;
-            tree.remove(key).await?;
+            tree.insert(key.to_vec(), row).await?;
+            drop(tree);
+            self.modified.push(key.try_into().unwrap());
         }
 
         Ok(())
@@ -1193,24 +881,29 @@ impl EmbeddedTxn {
             self.write_page(pid, page);
         }
 
-        // Reserve LSN range first so we can stamp commit_lsn into modified records.
         let pages_vec: Vec<(PageId, Page)> = std::mem::take(&mut self.dirty).into_iter().collect();
-
-        // Dedup count is computed inside commit_pages; here we pessimistically reserve on raw count.
-        // This is OK (may waste a few LSNs) and keeps logic simple.
-        let (request_id, start_lsn, end_lsn) =
-            self.compute.sequencer.reserve_txn(pages_vec.len())?;
+        let reserve_n = pages_vec.len().max(1);
+        let (request_id, start_lsn, end_lsn) = self.compute.sequencer.reserve_txn(reserve_n)?;
         let commit_lsn = end_lsn;
 
-        // Stamp commit_lsn into modified records.
+        // Stamp commit_lsn into modified inline rows.
+        if !self.modified.is_empty() {
+            let mut tree = self.compute.tree.lock().await;
+            for key in &self.modified {
+                if let Some(mut row) = tree.get(key).await {
+                    row.commit_lsn = commit_lsn;
+                    tree.insert(key.to_vec(), row).await?;
+                }
+            }
+            drop(tree);
+        }
+
         let mut map: BTreeMap<PageId, Page> = BTreeMap::new();
         for (pid, p) in pages_vec {
             map.insert(pid, p);
         }
-        for (pid, slot_id, _k) in &self.modified {
-            if let Some(page) = map.get_mut(pid) {
-                slotted_page::write_commit_lsn(page, *slot_id, commit_lsn);
-            }
+        for (pid, page) in self.compute.provider.take_dirty() {
+            map.insert(pid, page);
         }
 
         let pages: Vec<(PageId, Page)> = map.into_iter().collect();

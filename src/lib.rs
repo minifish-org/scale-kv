@@ -8,8 +8,8 @@ pub use common::*;
 
 pub mod page_bptree;
 pub use page_bptree::{
-    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, InMemoryPageProvider, PageBPlusTree, PageCache,
-    SharedPageProvider, SlotRef as PageSlotRef,
+    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, InMemoryPageProvider, LeafValue, PageBPlusTree,
+    PageCache, SharedPageProvider,
 };
 
 pub mod active_reads;

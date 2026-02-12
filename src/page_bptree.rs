@@ -1,4 +1,4 @@
-use crate::{Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result};
+use crate::{Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, VALUE_SIZE, undo_pg::UndoPtr};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,13 +22,15 @@ const HEADER_SIZE: usize = 48; // padded header
 // 29..(29+HIGH_KEY_SIZE): high_key bytes
 
 const OFFSET_ENTRY_SIZE: usize = 2;
-const SLOT_REF_SIZE: usize = 10;
+pub const LEAF_VALUE_SIZE: usize = VALUE_SIZE + 8 + 8 + 2 + 2;
 const CHILD_ID_SIZE: usize = 8;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SlotRef {
-    pub page_id: PageId,
-    pub slot_id: u16,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafValue {
+    pub value: [u8; VALUE_SIZE],
+    pub commit_lsn: u64,
+    pub undo_ptr: Option<UndoPtr>,
+    pub flags: u16,
 }
 
 /// Trait for page storage backend.
@@ -274,7 +276,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         self.len == 0
     }
 
-    pub async fn get(&self, key: &[u8]) -> Option<SlotRef> {
+    pub async fn get(&self, key: &[u8]) -> Option<LeafValue> {
         let (mut leaf_id, _) = self.find_leaf(key).await;
 
         // High-key correction: if key is above this leaf's range, follow next_leaf.
@@ -297,7 +299,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         None
     }
 
-    pub async fn insert(&mut self, key: Vec<u8>, slot_ref: SlotRef) -> Result<()> {
+    pub async fn insert(&mut self, key: Vec<u8>, leaf_value: LeafValue) -> Result<()> {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
@@ -308,13 +310,13 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
             Some(result) => result,
             None => (false, 0),
         };
-        let encoded = encode_slot_ref(slot_ref);
+        let encoded = encode_leaf_value(&leaf_value);
 
         if found {
             let offset = entry_offset_at(&leaf, pos)
                 .ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
             let value_offset = offset + KEY_SIZE;
-            leaf[value_offset..value_offset + SLOT_REF_SIZE].copy_from_slice(&encoded);
+            leaf[value_offset..value_offset + LEAF_VALUE_SIZE].copy_from_slice(&encoded);
             self.provider.write_page(leaf_id, leaf).await;
 
             return Ok(());
@@ -464,10 +466,10 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         Ok(())
     }
 
-    pub async fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, SlotRef)> {
+    pub async fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, LeafValue)> {
         let mut out = Vec::new();
-        self.range_visit(start, end, |k, slot_ref| {
-            out.push((k.to_vec(), slot_ref));
+        self.range_visit(start, end, |k, leaf_value| {
+            out.push((k.to_vec(), leaf_value));
             true
         })
         .await;
@@ -522,7 +524,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         &self,
         start: &[u8],
         end: &[u8],
-        mut f: impl FnMut(&[u8], SlotRef) -> bool,
+        mut f: impl FnMut(&[u8], LeafValue) -> bool,
     ) {
         let (mut leaf_id, _) = self.find_leaf(start).await;
 
@@ -569,7 +571,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                     Some(value) => value,
                     None => break,
                 };
-                if !f(key, decode_slot_ref(value)) {
+                if !f(key, decode_leaf_value(value)) {
                     return;
                 }
                 idx += 1;
@@ -779,7 +781,7 @@ pub fn new_page(page_type: u8, level: u8) -> Page {
 
 fn entry_value_size(page_type: u8) -> usize {
     match page_type {
-        PAGE_TYPE_LEAF => SLOT_REF_SIZE,
+        PAGE_TYPE_LEAF => LEAF_VALUE_SIZE,
         PAGE_TYPE_INTERNAL => CHILD_ID_SIZE,
         _ => 0,
     }
@@ -1001,7 +1003,7 @@ fn rebuild_page_with_remove(page: &Page, header: PageHeader, remove_pos: usize) 
     Ok(out)
 }
 
-fn find_in_leaf(page: &Page, key: &[u8]) -> Option<SlotRef> {
+fn find_in_leaf(page: &Page, key: &[u8]) -> Option<LeafValue> {
     let header = page_header(page);
     let mut lo = 0usize;
     let mut hi = header.key_count as usize;
@@ -1012,17 +1014,17 @@ fn find_in_leaf(page: &Page, key: &[u8]) -> Option<SlotRef> {
             std::cmp::Ordering::Equal => {
                 let value = entry_value_at(page, mid)?;
                 if matches!(std::env::var("SCALE_KV_BTREE_DEBUG").as_deref(), Ok("1")) {
-                    let sr = decode_slot_ref(value);
+                    let row = decode_leaf_value(value);
                     eprintln!(
-                        "[btree-get] equal mid={} key_hex={} slot_ref=({}, {}) value_hex={}",
+                        "[btree-get] equal mid={} key_hex={} commit_lsn={} flags={} value_hex={}",
                         mid,
                         hex::encode(key),
-                        sr.page_id,
-                        sr.slot_id,
+                        row.commit_lsn,
+                        row.flags,
                         hex::encode(value)
                     );
                 }
-                return Some(decode_slot_ref(value));
+                return Some(decode_leaf_value(value));
             }
             std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,
@@ -1138,17 +1140,45 @@ fn split_internal(page: &Page, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(Vec<u8
     Ok((separator, (left, right)))
 }
 
-fn encode_slot_ref(slot_ref: SlotRef) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(10);
-    buf.extend_from_slice(&slot_ref.page_id.to_le_bytes());
-    buf.extend_from_slice(&slot_ref.slot_id.to_le_bytes());
+fn encode_leaf_value(leaf_value: &LeafValue) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(LEAF_VALUE_SIZE);
+    buf.extend_from_slice(&leaf_value.value);
+    buf.extend_from_slice(&leaf_value.commit_lsn.to_le_bytes());
+    let (undo_pid, undo_sid) = leaf_value
+        .undo_ptr
+        .map(|u| (u.page_id, u.slot_id))
+        .unwrap_or((0, 0));
+    buf.extend_from_slice(&undo_pid.to_le_bytes());
+    buf.extend_from_slice(&undo_sid.to_le_bytes());
+    buf.extend_from_slice(&leaf_value.flags.to_le_bytes());
     buf
 }
 
-fn decode_slot_ref(buf: &[u8]) -> SlotRef {
-    let page_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-    let slot_id = u16::from_le_bytes(buf[8..10].try_into().unwrap());
-    SlotRef { page_id, slot_id }
+fn decode_leaf_value(buf: &[u8]) -> LeafValue {
+    let mut value = [0u8; VALUE_SIZE];
+    value.copy_from_slice(&buf[0..VALUE_SIZE]);
+    let mut off = VALUE_SIZE;
+    let commit_lsn = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+    off += 8;
+    let undo_page_id = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+    off += 8;
+    let undo_slot_id = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap());
+    off += 2;
+    let flags = u16::from_le_bytes(buf[off..off + 2].try_into().unwrap());
+    let undo_ptr = if undo_page_id == 0 {
+        None
+    } else {
+        Some(UndoPtr {
+            page_id: undo_page_id,
+            slot_id: undo_slot_id,
+        })
+    };
+    LeafValue {
+        value,
+        commit_lsn,
+        undo_ptr,
+        flags,
+    }
 }
 
 fn encode_child_id(child: PageId) -> Vec<u8> {
@@ -1161,8 +1191,8 @@ fn decode_child_id(buf: &[u8]) -> PageId {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncPageProvider, InMemoryPageProvider, PageBPlusTree, SlotRef};
-    use crate::KEY_SIZE;
+    use super::{AsyncPageProvider, InMemoryPageProvider, LeafValue, PageBPlusTree};
+    use crate::{KEY_SIZE, VALUE_SIZE};
     use std::sync::atomic::AtomicU64;
 
     fn key_for(i: u32) -> Vec<u8> {
@@ -1178,21 +1208,25 @@ mod tests {
     async fn test_insert_get_remove_len() {
         let mut tree = PageBPlusTree::new();
         let key = key_for(1);
-        let slot = SlotRef {
-            page_id: 1,
-            slot_id: 2,
+        let slot = LeafValue {
+            value: [1u8; VALUE_SIZE],
+            commit_lsn: 11,
+            undo_ptr: None,
+            flags: 0,
         };
-        let updated = SlotRef {
-            page_id: 7,
-            slot_id: 9,
+        let updated = LeafValue {
+            value: [2u8; VALUE_SIZE],
+            commit_lsn: 22,
+            undo_ptr: None,
+            flags: 1,
         };
 
         assert_eq!(tree.get(&key).await, None);
-        tree.insert(key.clone(), slot).await.unwrap();
+        tree.insert(key.clone(), slot.clone()).await.unwrap();
         assert_eq!(tree.get(&key).await, Some(slot));
         assert_eq!(tree.len(), 1);
 
-        tree.insert(key.clone(), updated).await.unwrap();
+        tree.insert(key.clone(), updated.clone()).await.unwrap();
         assert_eq!(tree.get(&key).await, Some(updated));
         assert_eq!(tree.len(), 1);
 
@@ -1206,9 +1240,11 @@ mod tests {
         let mut tree = PageBPlusTree::new();
         for i in 0..120u32 {
             let key = key_for(i);
-            let slot = SlotRef {
-                page_id: i as u64 + 1,
-                slot_id: (i % 512) as u16,
+            let slot = LeafValue {
+                value: [i as u8; VALUE_SIZE],
+                commit_lsn: i as u64,
+                undo_ptr: None,
+                flags: 0,
             };
             tree.insert(key, slot).await.unwrap();
         }
@@ -1228,12 +1264,14 @@ mod tests {
         let mut tree = tree;
 
         let key = key_for(2);
-        let slot = SlotRef {
-            page_id: 100,
-            slot_id: 5,
+        let slot = LeafValue {
+            value: [3u8; VALUE_SIZE],
+            commit_lsn: 100,
+            undo_ptr: None,
+            flags: 0,
         };
 
-        tree.insert(key.clone(), slot).await.unwrap();
+        tree.insert(key.clone(), slot.clone()).await.unwrap();
         assert_eq!(tree.get(&key).await, Some(slot));
         assert_eq!(tree.provider().page_count(), 1);
     }
@@ -1270,12 +1308,14 @@ mod tests {
         let mut tree = tree;
 
         let key = key_for(3);
-        let slot = SlotRef {
-            page_id: 42,
-            slot_id: 7,
+        let slot = LeafValue {
+            value: [7u8; VALUE_SIZE],
+            commit_lsn: 42,
+            undo_ptr: None,
+            flags: 0,
         };
 
-        tree.insert(key.clone(), slot).await.unwrap();
+        tree.insert(key.clone(), slot.clone()).await.unwrap();
         assert_eq!(tree.get(&key).await, Some(slot));
 
         assert!(pages.len() >= 1);

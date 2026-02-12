@@ -1,6 +1,10 @@
-use scale_kv::{EmbeddedCompute, StorageServer, VALUE_SIZE};
+use scale_kv::{EmbeddedCompute, KEY_SIZE, StorageServer, VALUE_SIZE};
 use std::net::SocketAddr;
 use tokio::task::LocalSet;
+
+fn tcp_bind_allowed() -> bool {
+    std::net::TcpListener::bind("127.0.0.1:0").is_ok()
+}
 
 fn temp_dir() -> String {
     let mut p = std::env::temp_dir();
@@ -13,11 +17,17 @@ fn temp_dir() -> String {
 }
 
 fn fixed_key(input: &[u8]) -> Vec<u8> {
-    scale_kv::slotted_page::fixed_key_bytes(input)
+    let mut out = vec![0u8; KEY_SIZE];
+    let n = input.len().min(KEY_SIZE);
+    out[..n].copy_from_slice(&input[..n]);
+    out
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn test_gc_respects_active_read_lsn() {
+    if !tcp_bind_allowed() {
+        return;
+    }
     let dir = temp_dir();
     let local = LocalSet::new();
     local
