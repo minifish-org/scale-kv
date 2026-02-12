@@ -26,7 +26,7 @@ Type: `EmbeddedCompute` (`/Users/yusp/work/scale-kv/src/embedded_compute.rs`)
   Use for long read snapshots / GC watermark pinning.
 - `begin_rw() -> EmbeddedTxn`
 - `put(key, value) -> Result<u64>`
-- `get(key) -> Result<Option<Vec<u8>>>`
+- `get(key) -> Result<Option<Bytes>>`
 - `delete(key) -> Result<u64>`
 - `warmup_scan_all(limit_per_batch) -> Result<usize>`
 - `gc_once(budget_pages) -> Result<usize>`

@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -502,11 +503,11 @@ impl Txn {
         self.read_ts
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.ensure_not_timed_out()?;
         let key = parse_key(key)?;
         if let Some(entry) = self.write_set.get(&key) {
-            return Ok(entry.clone());
+            return Ok(entry.clone().map(Bytes::from));
         }
         let store = self.inner.store.read().unwrap();
         Ok(read_at_ts(&store, &key, self.read_ts))
@@ -534,7 +535,7 @@ impl Txn {
         start_inclusive: &[u8],
         end_exclusive: &[u8],
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Vec<(Vec<u8>, Bytes)>> {
         self.ensure_not_timed_out()?;
         if limit == 0 {
             return Ok(Vec::new());
@@ -575,7 +576,7 @@ impl Txn {
         Ok(merged
             .into_iter()
             .take(limit)
-            .map(|(key, value)| (key.to_vec(), value))
+            .map(|(key, value)| (key.to_vec(), Bytes::from(value)))
             .collect())
     }
 
@@ -632,12 +633,12 @@ fn parse_key(key: &[u8]) -> Result<Key> {
     Ok(out)
 }
 
-fn read_at_ts(store: &BTreeMap<Key, Vec<Version>>, key: &Key, read_ts: u64) -> Option<Value> {
+fn read_at_ts(store: &BTreeMap<Key, Vec<Version>>, key: &Key, read_ts: u64) -> Option<Bytes> {
     let versions = store.get(key)?;
     versions
         .iter()
         .rfind(|v| v.commit_ts <= read_ts)
-        .and_then(|v| v.value.clone())
+        .and_then(|v| v.value.clone().map(Bytes::from))
 }
 
 fn encode_payload(commit_ts: u64, writes: &HashMap<Key, Option<Value>>) -> Result<Vec<u8>> {
@@ -916,7 +917,7 @@ mod tests {
 
         let manager = TxnManager::open_quorum(vec![path.clone()], 1).unwrap();
         let tx = manager.begin_ro_timeout(Duration::from_secs(30));
-        assert_eq!(tx.get(&key(1)).unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(tx.get(&key(1)).unwrap(), Some(Bytes::from_static(b"v1")));
         assert_eq!(tx.get(&key(2)).unwrap(), None);
     }
 

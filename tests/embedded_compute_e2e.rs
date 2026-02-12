@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -88,8 +89,8 @@ fn test_key(n: u64) -> Vec<u8> {
     k
 }
 
-fn test_value(b: u8) -> Vec<u8> {
-    vec![b; VALUE_SIZE]
+fn test_value(b: u8) -> Bytes {
+    Bytes::from(vec![b; VALUE_SIZE])
 }
 
 #[tokio::test(flavor = "current_thread")]

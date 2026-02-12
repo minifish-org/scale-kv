@@ -1,4 +1,5 @@
 use crate::{Error, PAGE_SIZE, Page, PageId, Result, VALUE_SIZE};
+use bytes::Bytes;
 
 pub const UNDO_PAGE_TYPE: u8 = 1;
 pub const UNDO_SEGMENT_PAGE_TYPE: u8 = 2;
@@ -34,6 +35,18 @@ pub struct UndoRecord {
     pub old_commit_lsn: u64,
     pub old_flags: u16,
     pub old_value: [u8; VALUE_SIZE],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoRecordRef {
+    pub data_page_id: PageId,
+    pub data_slot_id: u16,
+    pub prev: Option<UndoPtr>,
+    pub txn_id: u64,
+    pub txn_next: Option<UndoPtr>,
+    pub old_commit_lsn: u64,
+    pub old_flags: u16,
+    pub old_value: Bytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,11 +303,65 @@ pub fn read_record(page: &[u8], slot_id: u16) -> Result<UndoRecord> {
 
     let old_commit_lsn = read_u64(page, off + 44);
     let old_flags = read_u16(page, off + 52);
-
     let mut old_value = [0u8; VALUE_SIZE];
     old_value.copy_from_slice(&page[off + 56..off + 56 + VALUE_SIZE]);
-
     Ok(UndoRecord {
+        data_page_id,
+        data_slot_id,
+        prev,
+        txn_id,
+        txn_next,
+        old_commit_lsn,
+        old_flags,
+        old_value,
+    })
+}
+
+pub fn read_record_ref(page: &Page, slot_id: u16) -> Result<UndoRecordRef> {
+    let hdr_size = page_hdr_size(page)?;
+    let count = read_u16(page, OFF_COUNT);
+    if slot_id >= count {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "undo slot out of range",
+        )));
+    }
+    let off = read_u16(page, hdr_size + slot_id as usize * 2) as usize;
+    if off + UNDO_RECORD_SIZE > PAGE_SIZE {
+        return Err(Error::InvalidPageSize(off + UNDO_RECORD_SIZE, PAGE_SIZE));
+    }
+
+    let data_page_id = read_u64(page, off);
+    let data_slot_id = read_u16(page, off + 8);
+
+    let prev_page_id = read_u64(page, off + 12);
+    let prev_slot_id = read_u16(page, off + 20);
+    let prev = if prev_page_id == 0 {
+        None
+    } else {
+        Some(UndoPtr {
+            page_id: prev_page_id,
+            slot_id: prev_slot_id,
+        })
+    };
+
+    let txn_id = read_u64(page, off + 24);
+
+    let txn_next_page_id = read_u64(page, off + 32);
+    let txn_next_slot_id = read_u16(page, off + 40);
+    let txn_next = if txn_next_page_id == 0 {
+        None
+    } else {
+        Some(UndoPtr {
+            page_id: txn_next_page_id,
+            slot_id: txn_next_slot_id,
+        })
+    };
+
+    let old_commit_lsn = read_u64(page, off + 44);
+    let old_flags = read_u16(page, off + 52);
+    let old_value = page.slice(off + 56..off + 56 + VALUE_SIZE);
+    Ok(UndoRecordRef {
         data_page_id,
         data_slot_id,
         prev,

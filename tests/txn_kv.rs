@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use tempfile::tempdir;
 
 #[cfg(unix)]
@@ -12,9 +13,9 @@ fn key(byte: u8) -> [u8; KEY_SIZE] {
     k
 }
 
-fn value(byte: u8) -> Vec<u8> {
+fn value(byte: u8) -> Bytes {
     let len = VALUE_SIZE.min(8);
-    vec![byte; len]
+    Bytes::from(vec![byte; len])
 }
 
 #[test]

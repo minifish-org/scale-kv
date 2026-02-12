@@ -86,6 +86,12 @@ pub struct LeafValue {
     pub intent_lsn: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafValueRef {
+    pub meta: LeafValueMeta,
+    pub value: Bytes,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LeafValueMeta {
     pub commit_lsn: u64,
@@ -406,7 +412,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         self.len.load(Ordering::Acquire) == 0
     }
 
-    pub async fn get(&self, key: &[u8]) -> Option<LeafValue> {
+    pub async fn get(&self, key: &[u8]) -> Option<LeafValueRef> {
         for _ in 0..MAX_TRAVERSAL_RETRIES {
             let mut leaf_id = self.find_leaf_for_read(key).await?;
             for _ in 0..MAX_RIGHT_LINK_HOPS {
@@ -880,7 +886,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         }
     }
 
-    pub async fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, LeafValue)> {
+    pub async fn range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, LeafValueRef)> {
         let mut out = Vec::new();
         self.range_visit(start, end, |k, leaf_value| {
             out.push((k.to_vec(), leaf_value));
@@ -952,7 +958,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         &self,
         start: &[u8],
         end: &[u8],
-        mut f: impl FnMut(&[u8], LeafValue) -> bool,
+        mut f: impl FnMut(&[u8], LeafValueRef) -> bool,
     ) {
         for _ in 0..MAX_TRAVERSAL_RETRIES {
             let Some(mut leaf_id) = self.find_leaf_for_read(start).await else {
@@ -997,10 +1003,13 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                     if key > end {
                         return;
                     }
-                    let Some(value) = entry_value_at(&page, idx) else {
+                    let Some((value_offset, _)) = entry_value_bounds(&page, idx) else {
                         break;
                     };
-                    if !f(key, decode_leaf_value(value)) {
+                    let Some(row) = decode_leaf_value_ref(&page, value_offset) else {
+                        break;
+                    };
+                    if !f(key, row) {
                         return;
                     }
                     idx += 1;
@@ -1747,6 +1756,11 @@ fn entry_key_at<'a>(page: &'a [u8], index: usize) -> Option<&'a [u8]> {
 }
 
 fn entry_value_at<'a>(page: &'a [u8], index: usize) -> Option<&'a [u8]> {
+    let (key_end, value_end) = entry_value_bounds(page, index)?;
+    Some(&page[key_end..value_end])
+}
+
+fn entry_value_bounds(page: &[u8], index: usize) -> Option<(usize, usize)> {
     let header = page_header(page);
     if index >= header.key_count as usize {
         return None;
@@ -1761,7 +1775,7 @@ fn entry_value_at<'a>(page: &'a [u8], index: usize) -> Option<&'a [u8]> {
     if value_end > PAGE_SIZE {
         return None;
     }
-    Some(&page[key_end..value_end])
+    Some((key_end, value_end))
 }
 
 fn collect_entries(page: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -1942,7 +1956,7 @@ fn rebuild_page_with_remove(page: &[u8], header: PageHeader, remove_pos: usize) 
     Ok(Bytes::from(out))
 }
 
-fn find_in_leaf(page: &[u8], key: &[u8]) -> Option<LeafValue> {
+fn find_in_leaf(page: &Arc<Page>, key: &[u8]) -> Option<LeafValueRef> {
     let header = page_header(page);
     let mut lo = 0usize;
     let mut hi = header.key_count as usize;
@@ -1951,19 +1965,19 @@ fn find_in_leaf(page: &[u8], key: &[u8]) -> Option<LeafValue> {
         let mid_key = entry_key_at(page, mid)?;
         match mid_key.cmp(key) {
             std::cmp::Ordering::Equal => {
-                let value = entry_value_at(page, mid)?;
+                let (value_offset, _) = entry_value_bounds(page, mid)?;
                 if matches!(std::env::var("SCALE_KV_BTREE_DEBUG").as_deref(), Ok("1")) {
-                    let row = decode_leaf_value(value);
+                    let row = decode_leaf_value_ref(page, value_offset)?;
                     eprintln!(
                         "[btree-get] equal mid={} key_hex={} commit_lsn={} flags={} value_hex={}",
                         mid,
                         hex::encode(key),
-                        row.commit_lsn,
-                        row.flags,
-                        hex::encode(value)
+                        row.meta.commit_lsn,
+                        row.meta.flags,
+                        hex::encode(row.value)
                     );
                 }
-                return Some(decode_leaf_value(value));
+                return decode_leaf_value_ref(page, value_offset);
             }
             std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,
@@ -2095,18 +2109,17 @@ fn encode_leaf_value(leaf_value: &LeafValue) -> Vec<u8> {
     buf
 }
 
-fn decode_leaf_value(buf: &[u8]) -> LeafValue {
-    let mut value = [0u8; VALUE_SIZE];
-    value.copy_from_slice(&buf[0..VALUE_SIZE]);
-    let meta = decode_leaf_value_meta(buf);
-    LeafValue {
-        value,
-        commit_lsn: meta.commit_lsn,
-        undo_ptr: meta.undo_ptr,
-        flags: meta.flags,
-        intent_txn_id: meta.intent_txn_id,
-        intent_lsn: meta.intent_lsn,
+fn decode_leaf_value_ref(page: &Arc<Page>, value_offset: usize) -> Option<LeafValueRef> {
+    let value_end = value_offset.checked_add(VALUE_SIZE)?;
+    let meta_end = value_offset.checked_add(LEAF_VALUE_SIZE)?;
+    if meta_end > page.len() || value_end > page.len() {
+        return None;
     }
+    let raw = &page[value_offset..meta_end];
+    Some(LeafValueRef {
+        meta: decode_leaf_value_meta(raw),
+        value: page.slice(value_offset..value_end),
+    })
 }
 
 fn decode_leaf_value_meta(buf: &[u8]) -> LeafValueMeta {
@@ -2149,7 +2162,7 @@ fn decode_child_id(buf: &[u8]) -> PageId {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsyncPageProvider, InMemoryPageProvider, LeafValue, PageBPlusTree};
+    use super::{AsyncPageProvider, InMemoryPageProvider, LeafValue, LeafValueRef, PageBPlusTree};
     use crate::{KEY_SIZE, VALUE_SIZE};
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
@@ -2169,6 +2182,21 @@ mod tests {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         *state
+    }
+
+    fn assert_leaf_matches(got: Option<LeafValueRef>, expected: Option<&LeafValue>) {
+        match (got, expected) {
+            (None, None) => {}
+            (Some(got), Some(expected)) => {
+                assert_eq!(got.value.as_ref(), expected.value.as_slice());
+                assert_eq!(got.meta.commit_lsn, expected.commit_lsn);
+                assert_eq!(got.meta.undo_ptr, expected.undo_ptr);
+                assert_eq!(got.meta.flags, expected.flags);
+                assert_eq!(got.meta.intent_txn_id, expected.intent_txn_id);
+                assert_eq!(got.meta.intent_lsn, expected.intent_lsn);
+            }
+            (left, right) => panic!("leaf mismatch: got={left:?} expected={right:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2192,17 +2220,17 @@ mod tests {
             intent_lsn: 0,
         };
 
-        assert_eq!(tree.get(&key).await, None);
+        assert_leaf_matches(tree.get(&key).await, None);
         tree.insert(key.clone(), slot.clone()).await.unwrap();
-        assert_eq!(tree.get(&key).await, Some(slot));
+        assert_leaf_matches(tree.get(&key).await, Some(&slot));
         assert_eq!(tree.len(), 1);
 
         tree.insert(key.clone(), updated.clone()).await.unwrap();
-        assert_eq!(tree.get(&key).await, Some(updated));
+        assert_leaf_matches(tree.get(&key).await, Some(&updated));
         assert_eq!(tree.len(), 1);
 
         tree.remove(&key).await.unwrap();
-        assert_eq!(tree.get(&key).await, None);
+        assert_leaf_matches(tree.get(&key).await, None);
         assert_eq!(tree.len(), 0);
         tree.validate().await.unwrap();
     }
@@ -2247,7 +2275,7 @@ mod tests {
         };
 
         tree.insert(key.clone(), slot.clone()).await.unwrap();
-        assert_eq!(tree.get(&key).await, Some(slot));
+        assert_leaf_matches(tree.get(&key).await, Some(&slot));
         assert_eq!(tree.provider().page_count(), 1);
     }
 
@@ -2297,7 +2325,7 @@ mod tests {
         };
 
         tree.insert(key.clone(), slot.clone()).await.unwrap();
-        assert_eq!(tree.get(&key).await, Some(slot));
+        assert_leaf_matches(tree.get(&key).await, Some(&slot));
 
         assert!(pages.len() >= 1);
     }

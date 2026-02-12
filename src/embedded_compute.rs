@@ -1,8 +1,8 @@
 use crate::compute_sequencer::ComputeSequencer;
 use crate::meta_page::{META_PAGE_ID, MetaPage};
 use crate::page_bptree::{
-    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, LeafValue, LeafValueMeta, PageBPlusTree,
-    PageCache,
+    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, LeafValue, LeafValueMeta, LeafValueRef,
+    PageBPlusTree, PageCache,
 };
 use crate::txn_page_provider::{CURRENT_TXN_DIRTY, TxnPageProvider};
 use crate::{ActiveReads, ReadGuard};
@@ -13,6 +13,7 @@ use crate::{
         self, SEGMENT_STATE_COMMITTED, SEGMENT_STATE_PURGED, UndoPtr, UndoRecord, UndoSegmentHeader,
     },
 };
+use bytes::Bytes;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
@@ -498,16 +499,16 @@ impl EmbeddedCompute {
             let Some(current) = self.tree.get(key).await else {
                 continue;
             };
-            if (current.flags & FLAG_INTENT) == 0 || current.intent_txn_id != txn_id {
+            if (current.meta.flags & FLAG_INTENT) == 0 || current.meta.intent_txn_id != txn_id {
                 continue;
             }
-            let mut undo_ptr = current.undo_ptr;
+            let mut undo_ptr = current.meta.undo_ptr;
             loop {
                 let Some(ptr) = undo_ptr else {
                     if let Some(latest) = self.tree.get(key).await
-                        && (latest.flags & FLAG_INTENT) != 0
-                        && latest.intent_txn_id == txn_id
-                        && latest.undo_ptr.is_none()
+                        && (latest.meta.flags & FLAG_INTENT) != 0
+                        && latest.meta.intent_txn_id == txn_id
+                        && latest.meta.undo_ptr.is_none()
                     {
                         self.tree.remove(key).await?;
                     }
@@ -517,21 +518,23 @@ impl EmbeddedCompute {
                     .page_cache
                     .get(ptr.page_id)
                     .ok_or(Error::InMemoryPageMissing(ptr.page_id))?;
-                let rec = undo_pg::read_record(&upage, ptr.slot_id)?;
+                let rec = undo_pg::read_record_ref(&upage, ptr.slot_id)?;
                 if (rec.old_flags & FLAG_INTENT) != 0 {
                     undo_ptr = rec.prev;
                     continue;
                 }
                 if rec.old_commit_lsn == 0 && rec.prev.is_none() {
                     if let Some(latest) = self.tree.get(key).await
-                        && (latest.flags & FLAG_INTENT) != 0
-                        && latest.intent_txn_id == txn_id
+                        && (latest.meta.flags & FLAG_INTENT) != 0
+                        && latest.meta.intent_txn_id == txn_id
                     {
                         self.tree.remove(key).await?;
                     }
                 } else {
+                    let mut restored_value = [0u8; VALUE_SIZE];
+                    restored_value.copy_from_slice(&rec.old_value);
                     let restored = LeafValue {
-                        value: rec.old_value,
+                        value: restored_value,
                         commit_lsn: rec.old_commit_lsn,
                         undo_ptr: rec.prev,
                         flags: rec.old_flags & !FLAG_INTENT,
@@ -539,8 +542,8 @@ impl EmbeddedCompute {
                         intent_lsn: 0,
                     };
                     if let Some(latest) = self.tree.get(key).await
-                        && (latest.flags & FLAG_INTENT) != 0
-                        && latest.intent_txn_id == txn_id
+                        && (latest.meta.flags & FLAG_INTENT) != 0
+                        && latest.meta.intent_txn_id == txn_id
                     {
                         self.tree.insert(key.to_vec(), restored).await?;
                     }
@@ -770,7 +773,7 @@ impl EmbeddedCompute {
         tx.commit().await
     }
 
-    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
         }
@@ -795,7 +798,7 @@ impl EmbeddedCompute {
         start: &[u8],
         end: &[u8],
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Vec<(Vec<u8>, Bytes)>> {
         if start.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(start.len(), KEY_SIZE));
         }
@@ -854,23 +857,24 @@ impl EmbeddedCompute {
         let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
         let mut rows_to_update: Vec<(Vec<u8>, LeafValue)> = Vec::new();
 
-        for (key, mut row) in entries {
+        for (key, row) in entries {
             if scanned >= budget_pages {
                 break;
             }
             scanned += 1;
-            if row.commit_lsn == 0 || row.commit_lsn > gc_lsn {
+            if row.meta.commit_lsn == 0 || row.meta.commit_lsn > gc_lsn {
                 continue;
             }
 
-            if (row.flags & FLAG_TOMBSTONE) != 0 {
+            if (row.meta.flags & FLAG_TOMBSTONE) != 0 {
                 keys_to_remove.push(key);
                 continue;
             }
 
-            if row.undo_ptr.is_some() {
-                row.undo_ptr = None;
-                rows_to_update.push((key, row));
+            if row.meta.undo_ptr.is_some() {
+                let mut meta = row.meta;
+                meta.undo_ptr = None;
+                rows_to_update.push((key, EmbeddedTxn::owned_leaf_from_ref(&row, meta)));
             }
         }
 
@@ -1029,6 +1033,19 @@ impl Drop for EmbeddedTxn {
 }
 
 impl EmbeddedTxn {
+    fn owned_leaf_from_ref(row: &LeafValueRef, meta: LeafValueMeta) -> LeafValue {
+        let mut value = [0u8; VALUE_SIZE];
+        value.copy_from_slice(&row.value);
+        LeafValue {
+            value,
+            commit_lsn: meta.commit_lsn,
+            undo_ptr: meta.undo_ptr,
+            flags: meta.flags,
+            intent_txn_id: meta.intent_txn_id,
+            intent_lsn: meta.intent_lsn,
+        }
+    }
+
     async fn with_bptree_dirty<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
         CURRENT_TXN_DIRTY
             .scope(self.bptree_dirty.clone(), fut)
@@ -1041,7 +1058,7 @@ impl EmbeddedTxn {
         }
     }
 
-    async fn tree_get(&self, key: &[u8]) -> Option<LeafValue> {
+    async fn tree_get(&self, key: &[u8]) -> Option<LeafValueRef> {
         self.with_bptree_dirty(self.compute.tree.get(key)).await
     }
 
@@ -1054,7 +1071,7 @@ impl EmbeddedTxn {
         self.with_bptree_dirty(self.compute.tree.remove(key)).await
     }
 
-    async fn tree_range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, LeafValue)> {
+    async fn tree_range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, LeafValueRef)> {
         self.with_bptree_dirty(self.compute.tree.range(start, end))
             .await
     }
@@ -1219,16 +1236,13 @@ impl EmbeddedTxn {
         Ok(ptr)
     }
 
-    async fn read_visible_from_undo(
-        &mut self,
-        mut undo: Option<UndoPtr>,
-    ) -> Result<Option<Vec<u8>>> {
+    async fn read_visible_from_undo(&mut self, mut undo: Option<UndoPtr>) -> Result<Option<Bytes>> {
         while let Some(ptr) = undo {
             let upage = self
                 .get_page_for_read(ptr.page_id)
                 .await
                 .ok_or(Error::InMemoryPageMissing(ptr.page_id))?;
-            let rec = undo_pg::read_record(&upage, ptr.slot_id)?;
+            let rec = undo_pg::read_record_ref(&upage, ptr.slot_id)?;
             if (rec.old_flags & FLAG_INTENT) != 0 {
                 undo = rec.prev;
                 continue;
@@ -1237,7 +1251,7 @@ impl EmbeddedTxn {
                 if (rec.old_flags & FLAG_TOMBSTONE) != 0 {
                     return Ok(None);
                 }
-                return Ok(Some(rec.old_value.to_vec()));
+                return Ok(Some(rec.old_value));
             }
             undo = rec.prev;
         }
@@ -1250,7 +1264,7 @@ impl EmbeddedTxn {
                 .get_page_for_read(ptr.page_id)
                 .await
                 .ok_or(Error::InMemoryPageMissing(ptr.page_id))?;
-            let rec = undo_pg::read_record(&upage, ptr.slot_id)?;
+            let rec = undo_pg::read_record_ref(&upage, ptr.slot_id)?;
             if (rec.old_flags & FLAG_INTENT) != 0 {
                 undo = rec.prev;
                 continue;
@@ -1263,7 +1277,7 @@ impl EmbeddedTxn {
         Ok(false)
     }
 
-    async fn read_visible_value_from_row(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    async fn read_visible_value_from_row(&mut self, key: &[u8]) -> Result<Option<Bytes>> {
         let intent_wait_grace = Duration::from_millis(50);
         loop {
             self.ensure_not_timed_out()?;
@@ -1273,31 +1287,31 @@ impl EmbeddedTxn {
                 return Ok(None);
             };
 
-            if (row.flags & FLAG_INTENT) != 0 {
-                if self.undo_txn_id == Some(row.intent_txn_id) {
-                    if (row.flags & FLAG_TOMBSTONE) != 0 {
+            if (row.meta.flags & FLAG_INTENT) != 0 {
+                if self.undo_txn_id == Some(row.meta.intent_txn_id) {
+                    if (row.meta.flags & FLAG_TOMBSTONE) != 0 {
                         return Ok(None);
                     }
-                    return Ok(Some(row.value.to_vec()));
+                    return Ok(Some(row.value));
                 }
-                if row.intent_lsn > self.read_lsn {
-                    return self.read_visible_from_undo(row.undo_ptr).await;
+                if row.meta.intent_lsn > self.read_lsn {
+                    return self.read_visible_from_undo(row.meta.undo_ptr).await;
                 }
                 self.compute
-                    .wait_on_pending_txn(row.intent_txn_id, intent_wait_grace)
+                    .wait_on_pending_txn(row.meta.intent_txn_id, intent_wait_grace)
                     .await?;
                 continue;
             }
 
-            if row.commit_lsn <= self.read_lsn {
-                if (row.flags & FLAG_TOMBSTONE) != 0 {
+            if row.meta.commit_lsn <= self.read_lsn {
+                if (row.meta.flags & FLAG_TOMBSTONE) != 0 {
                     return Ok(None);
                 }
-                return Ok(Some(row.value.to_vec()));
+                return Ok(Some(row.value));
             }
 
             // Not visible at this snapshot: walk undo chain to find latest visible version.
-            return self.read_visible_from_undo(row.undo_ptr).await;
+            return self.read_visible_from_undo(row.meta.undo_ptr).await;
         }
     }
 
@@ -1311,25 +1325,25 @@ impl EmbeddedTxn {
                 return Ok(false);
             };
 
-            if (row.flags & FLAG_INTENT) != 0 {
-                if self.undo_txn_id == Some(row.intent_txn_id) {
-                    return Ok((row.flags & FLAG_TOMBSTONE) == 0);
+            if (row.meta.flags & FLAG_INTENT) != 0 {
+                if self.undo_txn_id == Some(row.meta.intent_txn_id) {
+                    return Ok((row.meta.flags & FLAG_TOMBSTONE) == 0);
                 }
-                if row.intent_lsn > self.read_lsn {
-                    return self.read_visible_exists_from_undo(row.undo_ptr).await;
+                if row.meta.intent_lsn > self.read_lsn {
+                    return self.read_visible_exists_from_undo(row.meta.undo_ptr).await;
                 }
                 self.compute
-                    .wait_on_pending_txn(row.intent_txn_id, intent_wait_grace)
+                    .wait_on_pending_txn(row.meta.intent_txn_id, intent_wait_grace)
                     .await?;
                 continue;
             }
 
-            if row.commit_lsn <= self.read_lsn {
-                return Ok((row.flags & FLAG_TOMBSTONE) == 0);
+            if row.meta.commit_lsn <= self.read_lsn {
+                return Ok((row.meta.flags & FLAG_TOMBSTONE) == 0);
             }
 
             // Not visible at this snapshot: walk undo chain to find latest visible version.
-            return self.read_visible_exists_from_undo(row.undo_ptr).await;
+            return self.read_visible_exists_from_undo(row.meta.undo_ptr).await;
         }
     }
 
@@ -1359,30 +1373,30 @@ impl EmbeddedTxn {
     async fn read_visible_value_from_scan_entry(
         &mut self,
         key: &[u8],
-        row: LeafValue,
-    ) -> Result<Option<Vec<u8>>> {
-        if (row.flags & FLAG_INTENT) != 0 {
-            if self.undo_txn_id == Some(row.intent_txn_id) {
-                if (row.flags & FLAG_TOMBSTONE) != 0 {
+        row: LeafValueRef,
+    ) -> Result<Option<Bytes>> {
+        if (row.meta.flags & FLAG_INTENT) != 0 {
+            if self.undo_txn_id == Some(row.meta.intent_txn_id) {
+                if (row.meta.flags & FLAG_TOMBSTONE) != 0 {
                     return Ok(None);
                 }
-                return Ok(Some(Vec::from(row.value)));
+                return Ok(Some(row.value));
             }
-            if row.intent_lsn > self.read_lsn {
-                return self.read_visible_from_undo(row.undo_ptr).await;
+            if row.meta.intent_lsn > self.read_lsn {
+                return self.read_visible_from_undo(row.meta.undo_ptr).await;
             }
             self.compute
-                .wait_on_pending_txn(row.intent_txn_id, Duration::from_millis(50))
+                .wait_on_pending_txn(row.meta.intent_txn_id, Duration::from_millis(50))
                 .await?;
             return self.read_visible_value_from_row(key).await;
         }
-        if row.commit_lsn <= self.read_lsn {
-            if (row.flags & FLAG_TOMBSTONE) != 0 {
+        if row.meta.commit_lsn <= self.read_lsn {
+            if (row.meta.flags & FLAG_TOMBSTONE) != 0 {
                 return Ok(None);
             }
-            return Ok(Some(Vec::from(row.value)));
+            return Ok(Some(row.value));
         }
-        self.read_visible_from_undo(row.undo_ptr).await
+        self.read_visible_from_undo(row.meta.undo_ptr).await
     }
 
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -1406,19 +1420,33 @@ impl EmbeddedTxn {
             intent_lsn: self.intent_base_lsn,
         };
         if let Some(old) = existing {
-            if (old.flags & FLAG_INTENT) != 0 && self.undo_txn_id == Some(old.intent_txn_id) {
-                row.undo_ptr = old.undo_ptr;
-                row.intent_lsn = old.intent_lsn;
+            if (old.meta.flags & FLAG_INTENT) != 0
+                && self.undo_txn_id == Some(old.meta.intent_txn_id)
+            {
+                row.undo_ptr = old.meta.undo_ptr;
+                row.intent_lsn = old.meta.intent_lsn;
             } else {
-                if (old.flags & FLAG_INTENT) != 0 && self.undo_txn_id != Some(old.intent_txn_id) {
+                if (old.meta.flags & FLAG_INTENT) != 0
+                    && self.undo_txn_id != Some(old.meta.intent_txn_id)
+                {
                     return Err(Error::Io(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
-                        format!("encountered foreign intent txn_id={}", old.intent_txn_id),
+                        format!(
+                            "encountered foreign intent txn_id={}",
+                            old.meta.intent_txn_id
+                        ),
                     )));
                 }
                 row.undo_ptr = Some(
-                    self.append_undo(0, 0, old.undo_ptr, old.commit_lsn, old.flags, &old.value)
-                        .await?,
+                    self.append_undo(
+                        0,
+                        0,
+                        old.meta.undo_ptr,
+                        old.meta.commit_lsn,
+                        old.meta.flags,
+                        &old.value,
+                    )
+                    .await?,
                 );
             }
         }
@@ -1433,7 +1461,7 @@ impl EmbeddedTxn {
         Ok(())
     }
 
-    pub async fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub async fn get(&mut self, key: &[u8]) -> Result<Option<Bytes>> {
         self.ensure_not_timed_out()?;
         if key.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(key.len(), KEY_SIZE));
@@ -1458,7 +1486,7 @@ impl EmbeddedTxn {
         start: &[u8],
         end: &[u8],
         limit: usize,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    ) -> Result<Vec<(Vec<u8>, Bytes)>> {
         self.ensure_not_timed_out()?;
         if start.len() != KEY_SIZE {
             return Err(Error::InvalidKeySize(start.len(), KEY_SIZE));
@@ -1538,9 +1566,9 @@ impl EmbeddedTxn {
         eprintln!(
             "[verify] inline row: key_hex={} commit_lsn={} flags={} undo={:?} leaf_entries_hex={:?}",
             hex::encode(key),
-            row.commit_lsn,
-            row.flags,
-            row.undo_ptr,
+            row.meta.commit_lsn,
+            row.meta.flags,
+            row.meta.undo_ptr,
             leaf_entries_hex
         );
 
@@ -1558,31 +1586,48 @@ impl EmbeddedTxn {
         let existing = self.tree_get(key).await;
 
         if let Some(old) = existing {
-            if (old.flags & FLAG_INTENT) != 0 && self.undo_txn_id != Some(old.intent_txn_id) {
+            if (old.meta.flags & FLAG_INTENT) != 0
+                && self.undo_txn_id != Some(old.meta.intent_txn_id)
+            {
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
-                    format!("encountered foreign intent txn_id={}", old.intent_txn_id),
+                    format!(
+                        "encountered foreign intent txn_id={}",
+                        old.meta.intent_txn_id
+                    ),
                 )));
             }
-            let undo_ptr =
-                if (old.flags & FLAG_INTENT) != 0 && self.undo_txn_id == Some(old.intent_txn_id) {
-                    old.undo_ptr
-                } else {
-                    Some(
-                        self.append_undo(0, 0, old.undo_ptr, old.commit_lsn, old.flags, &old.value)
-                            .await?,
+            let undo_ptr = if (old.meta.flags & FLAG_INTENT) != 0
+                && self.undo_txn_id == Some(old.meta.intent_txn_id)
+            {
+                old.meta.undo_ptr
+            } else {
+                Some(
+                    self.append_undo(
+                        0,
+                        0,
+                        old.meta.undo_ptr,
+                        old.meta.commit_lsn,
+                        old.meta.flags,
+                        &old.value,
                     )
-                };
+                    .await?,
+                )
+            };
             let row = LeafValue {
-                value: old.value,
+                value: {
+                    let mut v = [0u8; VALUE_SIZE];
+                    v.copy_from_slice(&old.value);
+                    v
+                },
                 commit_lsn: 0,
                 undo_ptr,
                 flags: FLAG_TOMBSTONE | FLAG_INTENT,
                 intent_txn_id: self.undo_txn_id.unwrap_or(0),
-                intent_lsn: if (old.flags & FLAG_INTENT) != 0
-                    && self.undo_txn_id == Some(old.intent_txn_id)
+                intent_lsn: if (old.meta.flags & FLAG_INTENT) != 0
+                    && self.undo_txn_id == Some(old.meta.intent_txn_id)
                 {
-                    old.intent_lsn
+                    old.meta.intent_lsn
                 } else {
                     self.intent_base_lsn
                 },
@@ -1665,16 +1710,18 @@ impl EmbeddedTxn {
         // that will be touched again when stamping the real commit_lsn.
         if !self.modified.is_empty() {
             for key in &self.modified {
-                if let Some(mut row) = self.tree_get(key).await {
-                    if (row.flags & FLAG_INTENT) == 0 || row.intent_txn_id != request_id {
+                if let Some(row) = self.tree_get(key).await {
+                    if (row.meta.flags & FLAG_INTENT) == 0 || row.meta.intent_txn_id != request_id {
                         let _ = self.read_guard.take();
                         return Err(Error::Io(std::io::Error::new(
                             std::io::ErrorKind::WouldBlock,
                             "intent ownership changed before commit",
                         )));
                     }
-                    row.commit_lsn = 1;
-                    self.tree_insert(key.to_vec(), row).await?;
+                    let mut meta = row.meta;
+                    meta.commit_lsn = 1;
+                    self.tree_insert(key.to_vec(), Self::owned_leaf_from_ref(&row, meta))
+                        .await?;
                 } else {
                     let _ = self.read_guard.take();
                     return Err(Error::Io(std::io::Error::new(
@@ -1726,19 +1773,21 @@ impl EmbeddedTxn {
         // Stamp the real commit_lsn and merge the dirty pages generated by those writes.
         if !self.modified.is_empty() {
             for key in &self.modified {
-                if let Some(mut row) = self.tree_get(key).await {
-                    if (row.flags & FLAG_INTENT) == 0 || row.intent_txn_id != request_id {
+                if let Some(row) = self.tree_get(key).await {
+                    if (row.meta.flags & FLAG_INTENT) == 0 || row.meta.intent_txn_id != request_id {
                         let _ = self.read_guard.take();
                         return Err(Error::Io(std::io::Error::new(
                             std::io::ErrorKind::WouldBlock,
                             "intent ownership changed before commit",
                         )));
                     }
-                    row.commit_lsn = commit_lsn;
-                    row.flags &= !FLAG_INTENT;
-                    row.intent_txn_id = 0;
-                    row.intent_lsn = 0;
-                    self.tree_insert(key.to_vec(), row).await?;
+                    let mut meta = row.meta;
+                    meta.commit_lsn = commit_lsn;
+                    meta.flags &= !FLAG_INTENT;
+                    meta.intent_txn_id = 0;
+                    meta.intent_lsn = 0;
+                    self.tree_insert(key.to_vec(), Self::owned_leaf_from_ref(&row, meta))
+                        .await?;
                 }
             }
             for (pid, page) in self.bptree_dirty.borrow().iter() {
