@@ -48,12 +48,22 @@ impl TxnPageProvider {
 
 impl AsyncPageProvider for TxnPageProvider {
     async fn read_page(&self, page_id: PageId) -> Option<Page> {
-        if let Some(p) = self.pages.get(page_id) {
-            return Some(p);
+        if let Some(p) = self.pages.get_arc(page_id) {
+            return Some(p.as_ref().clone());
         }
         // Demand paging on miss.
         let p = (self.fetcher)(page_id).await?;
-        self.pages.insert(page_id, p.clone());
+        let p = Arc::new(p);
+        self.pages.insert_arc(page_id, Arc::clone(&p));
+        Some(p.as_ref().clone())
+    }
+
+    async fn read_page_arc(&self, page_id: PageId) -> Option<Arc<Page>> {
+        if let Some(p) = self.pages.get_arc(page_id) {
+            return Some(p);
+        }
+        let p = Arc::new((self.fetcher)(page_id).await?);
+        self.pages.insert_arc(page_id, Arc::clone(&p));
         Some(p)
     }
 

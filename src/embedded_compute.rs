@@ -1,7 +1,8 @@
 use crate::compute_sequencer::ComputeSequencer;
 use crate::meta_page::{META_PAGE_ID, MetaPage};
 use crate::page_bptree::{
-    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, LeafValue, PageBPlusTree, PageCache,
+    AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, LeafValue, LeafValueMeta, PageBPlusTree,
+    PageCache,
 };
 use crate::txn_page_provider::{CURRENT_TXN_DIRTY, TxnPageProvider};
 use crate::{ActiveReads, ReadGuard};
@@ -1009,7 +1010,7 @@ pub struct EmbeddedTxn {
     // Limitation: writes from different txns still share `page_cache` images.
     // This fixes commit accounting by isolating dirty tracking, not page-level isolation.
     bptree_dirty: Rc<RefCell<BTreeMap<PageId, Page>>>,
-    ro_cache: BTreeMap<PageId, Page>,
+    ro_cache: BTreeMap<PageId, Arc<Page>>,
     modified: BTreeSet<[u8; KEY_SIZE]>,
 
     undo_txn_id: Option<u64>,
@@ -1058,6 +1059,11 @@ impl EmbeddedTxn {
             .await
     }
 
+    async fn tree_range_meta(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, LeafValueMeta)> {
+        self.with_bptree_dirty(self.compute.tree.range_meta(start, end))
+            .await
+    }
+
     async fn tree_debug_leaf_entries(&self, key: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.with_bptree_dirty(self.compute.tree.debug_leaf_entries(key, limit))
             .await
@@ -1088,20 +1094,21 @@ impl EmbeddedTxn {
         self.compute.page_cache.insert(page_id, page);
     }
 
-    async fn get_page_for_read(&mut self, page_id: PageId) -> Option<Page> {
-        if let Some(p) = self.dirty.get(&page_id).cloned() {
-            return Some(p);
+    async fn get_page_for_read(&mut self, page_id: PageId) -> Option<Arc<Page>> {
+        if let Some(p) = self.dirty.get(&page_id) {
+            return Some(Arc::new(p.clone()));
         }
-        if let Some(p) = self.ro_cache.get(&page_id).cloned() {
-            return Some(p);
+        if let Some(p) = self.ro_cache.get(&page_id) {
+            return Some(Arc::clone(p));
         }
-        if let Some(p) = self.compute.page_cache.get(page_id) {
-            self.ro_cache.insert(page_id, p.clone());
+        if let Some(p) = self.compute.page_cache.get_arc(page_id) {
+            self.ro_cache.insert(page_id, Arc::clone(&p));
             return Some(p);
         }
         let p = (self.compute.page_fetcher)(page_id, self.read_lsn).await?;
-        self.compute.page_cache.insert(page_id, p.clone());
-        self.ro_cache.insert(page_id, p.clone());
+        let p = Arc::new(p);
+        self.compute.page_cache.insert_arc(page_id, Arc::clone(&p));
+        self.ro_cache.insert(page_id, Arc::clone(&p));
         Some(p)
     }
 
@@ -1160,8 +1167,13 @@ impl EmbeddedTxn {
             .dirty
             .get(&current_id)
             .cloned()
-            .or_else(|| self.compute.page_cache.get(current_id))
-            .or_else(|| self.ro_cache.get(&current_id).cloned())
+            .or_else(|| {
+                self.compute
+                    .page_cache
+                    .get_arc(current_id)
+                    .map(|p| p.as_ref().clone())
+            })
+            .or_else(|| self.ro_cache.get(&current_id).map(|p| p.as_ref().clone()))
             .ok_or(Error::InMemoryPageMissing(current_id))?
             .to_vec();
 
@@ -1321,6 +1333,58 @@ impl EmbeddedTxn {
         }
     }
 
+    async fn read_visible_exists_from_scan_entry(
+        &mut self,
+        key: &[u8],
+        row: LeafValueMeta,
+    ) -> Result<bool> {
+        if (row.flags & FLAG_INTENT) != 0 {
+            if self.undo_txn_id == Some(row.intent_txn_id) {
+                return Ok((row.flags & FLAG_TOMBSTONE) == 0);
+            }
+            if row.intent_lsn > self.read_lsn {
+                return self.read_visible_exists_from_undo(row.undo_ptr).await;
+            }
+            self.compute
+                .wait_on_pending_txn(row.intent_txn_id, Duration::from_millis(50))
+                .await?;
+            return self.read_visible_exists_from_row(key).await;
+        }
+        if row.commit_lsn <= self.read_lsn {
+            return Ok((row.flags & FLAG_TOMBSTONE) == 0);
+        }
+        self.read_visible_exists_from_undo(row.undo_ptr).await
+    }
+
+    async fn read_visible_value_from_scan_entry(
+        &mut self,
+        key: &[u8],
+        row: LeafValue,
+    ) -> Result<Option<Vec<u8>>> {
+        if (row.flags & FLAG_INTENT) != 0 {
+            if self.undo_txn_id == Some(row.intent_txn_id) {
+                if (row.flags & FLAG_TOMBSTONE) != 0 {
+                    return Ok(None);
+                }
+                return Ok(Some(Vec::from(row.value)));
+            }
+            if row.intent_lsn > self.read_lsn {
+                return self.read_visible_from_undo(row.undo_ptr).await;
+            }
+            self.compute
+                .wait_on_pending_txn(row.intent_txn_id, Duration::from_millis(50))
+                .await?;
+            return self.read_visible_value_from_row(key).await;
+        }
+        if row.commit_lsn <= self.read_lsn {
+            if (row.flags & FLAG_TOMBSTONE) != 0 {
+                return Ok(None);
+            }
+            return Ok(Some(Vec::from(row.value)));
+        }
+        self.read_visible_from_undo(row.undo_ptr).await
+    }
+
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.ensure_not_timed_out()?;
         if self.read_only {
@@ -1409,8 +1473,8 @@ impl EmbeddedTxn {
         let entries = self.tree_range(start, end).await;
 
         let mut out = Vec::with_capacity(limit.min(entries.len()));
-        for (key, _row) in entries {
-            if let Some(value) = self.read_visible_value_from_row(&key).await? {
+        for (key, row) in entries {
+            if let Some(value) = self.read_visible_value_from_scan_entry(&key, row).await? {
                 out.push((key, value));
                 if out.len() >= limit {
                     break;
@@ -1438,11 +1502,11 @@ impl EmbeddedTxn {
             return Ok(0);
         }
 
-        let entries = self.tree_range(start, end).await;
+        let entries = self.tree_range_meta(start, end).await;
 
         let mut visible = 0usize;
-        for (key, _row) in entries {
-            if self.read_visible_exists_from_row(&key).await? {
+        for (key, row) in entries {
+            if self.read_visible_exists_from_scan_entry(&key, row).await? {
                 visible += 1;
                 if visible >= limit {
                     break;
@@ -1587,7 +1651,7 @@ impl EmbeddedTxn {
                     .compute
                     .page_cache
                     .get(old_tail)
-                    .or_else(|| self.ro_cache.get(&old_tail).cloned())
+                    .or_else(|| self.ro_cache.get(&old_tail).map(|p| p.as_ref().clone()))
                     .ok_or(Error::InMemoryPageMissing(old_tail))?;
                 self.write_page(old_tail, tail_page);
             }
@@ -1635,7 +1699,7 @@ impl EmbeddedTxn {
                     .compute
                     .page_cache
                     .get(first_pid)
-                    .or_else(|| self.ro_cache.get(&first_pid).cloned())
+                    .or_else(|| self.ro_cache.get(&first_pid).map(|p| p.as_ref().clone()))
                     .ok_or(Error::InMemoryPageMissing(first_pid))?;
                 map.insert(first_pid, head_page);
             }
@@ -1645,7 +1709,7 @@ impl EmbeddedTxn {
                     .compute
                     .page_cache
                     .get(old_tail)
-                    .or_else(|| self.ro_cache.get(&old_tail).cloned())
+                    .or_else(|| self.ro_cache.get(&old_tail).map(|p| p.as_ref().clone()))
                     .ok_or(Error::InMemoryPageMissing(old_tail))?;
                 map.insert(old_tail, tail_page);
             }
@@ -1717,7 +1781,7 @@ impl EmbeddedTxn {
                     .get(&old_tail)
                     .cloned()
                     .or_else(|| self.compute.page_cache.get(old_tail))
-                    .or_else(|| self.ro_cache.get(&old_tail).cloned())
+                    .or_else(|| self.ro_cache.get(&old_tail).map(|p| p.as_ref().clone()))
                     .ok_or(Error::InMemoryPageMissing(old_tail))?
                     .to_vec();
                 let mut tail_hdr = undo_pg::read_segment_header(&tail_page)?;

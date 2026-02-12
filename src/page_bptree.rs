@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use hex;
 
@@ -28,54 +28,66 @@ const OFFSET_ENTRY_SIZE: usize = 2;
 pub const LEAF_VALUE_SIZE: usize = VALUE_SIZE + 8 + 8 + 2 + 2 + 8 + 8;
 const CHILD_ID_SIZE: usize = 8;
 const DEFAULT_LATCH_SHARDS: usize = 256;
+const DEFAULT_LATCH_STRIPES: usize = 32 * 1024;
+const LATCH_STRIPE_PERMITS: u32 = 1024;
 const MAX_TRAVERSAL_RETRIES: usize = 8;
 const MAX_RIGHT_LINK_HOPS: usize = 256;
 const MAX_SCAN_LEAF_HOPS: usize = 8192;
 
-pub type PageReadLatchGuard = OwnedRwLockReadGuard<()>;
-pub type PageWriteLatchGuard = OwnedRwLockWriteGuard<()>;
+pub type PageReadLatchGuard = OwnedSemaphorePermit;
+pub type PageWriteLatchGuard = OwnedSemaphorePermit;
 
 #[derive(Debug)]
 pub struct PageLatchTable {
-    shards: Vec<std::sync::Mutex<HashMap<PageId, Arc<RwLock<()>>>>>,
+    stripes: Vec<Arc<Semaphore>>,
 }
 
 impl PageLatchTable {
     pub fn new(shards: usize) -> Self {
-        let count = shards.max(1);
+        let count = shards.max(1).max(DEFAULT_LATCH_STRIPES);
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
-            out.push(std::sync::Mutex::new(HashMap::new()));
+            out.push(Arc::new(Semaphore::new(LATCH_STRIPE_PERMITS as usize)));
         }
-        Self { shards: out }
+        Self { stripes: out }
     }
 
     fn shard(&self, page_id: PageId) -> usize {
-        (page_id as usize) % self.shards.len()
+        (page_id as usize) % self.stripes.len()
     }
 
-    fn latch_for(&self, page_id: PageId) -> Arc<RwLock<()>> {
+    fn latch_for(&self, page_id: PageId) -> Arc<Semaphore> {
         let idx = self.shard(page_id);
-        let mut shard = self.shards[idx].lock().unwrap();
-        Arc::clone(
-            shard
-                .entry(page_id)
-                .or_insert_with(|| Arc::new(RwLock::new(()))),
-        )
+        Arc::clone(&self.stripes[idx])
     }
 
     pub async fn acquire_read(&self, page_id: PageId) -> PageReadLatchGuard {
-        self.latch_for(page_id).read_owned().await
+        self.latch_for(page_id)
+            .acquire_owned()
+            .await
+            .expect("page latch semaphore closed")
     }
 
     pub async fn acquire_write(&self, page_id: PageId) -> PageWriteLatchGuard {
-        self.latch_for(page_id).write_owned().await
+        self.latch_for(page_id)
+            .acquire_many_owned(LATCH_STRIPE_PERMITS)
+            .await
+            .expect("page latch semaphore closed")
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeafValue {
     pub value: [u8; VALUE_SIZE],
+    pub commit_lsn: u64,
+    pub undo_ptr: Option<UndoPtr>,
+    pub flags: u16,
+    pub intent_txn_id: u64,
+    pub intent_lsn: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeafValueMeta {
     pub commit_lsn: u64,
     pub undo_ptr: Option<UndoPtr>,
     pub flags: u16,
@@ -91,6 +103,9 @@ pub struct LeafValue {
 pub trait AsyncPageProvider {
     /// Read a page by ID. Returns None if page doesn't exist.
     async fn read_page(&self, page_id: PageId) -> Option<Page>;
+    async fn read_page_arc(&self, page_id: PageId) -> Option<Arc<Page>> {
+        self.read_page(page_id).await.map(Arc::new)
+    }
 
     /// Write a page. Creates if not exists, updates if exists.
     async fn write_page(&self, page_id: PageId, page: Page);
@@ -153,6 +168,10 @@ impl AsyncPageProvider for InMemoryPageProvider {
         self.pages.borrow().get(&page_id).cloned()
     }
 
+    async fn read_page_arc(&self, page_id: PageId) -> Option<Arc<Page>> {
+        self.pages.borrow().get(&page_id).cloned().map(Arc::new)
+    }
+
     async fn write_page(&self, page_id: PageId, page: Page) {
         self.pages.borrow_mut().insert(page_id, page);
     }
@@ -177,7 +196,7 @@ impl AsyncPageProvider for InMemoryPageProvider {
 pub const DEFAULT_PAGE_CACHE_SHARDS: usize = 64;
 
 pub struct PageCache {
-    shards: Vec<std::sync::Mutex<lru::LruCache<PageId, Page>>>,
+    shards: Vec<std::sync::Mutex<lru::LruCache<PageId, Arc<Page>>>>,
     latches: Arc<PageLatchTable>,
 }
 
@@ -210,11 +229,19 @@ impl PageCache {
     }
 
     pub fn get(&self, page_id: PageId) -> Option<Page> {
+        self.get_arc(page_id).map(|p| p.as_ref().clone())
+    }
+
+    pub fn get_arc(&self, page_id: PageId) -> Option<Arc<Page>> {
         let idx = self.shard(page_id);
         self.shards[idx].lock().unwrap().get(&page_id).cloned()
     }
 
     pub fn insert(&self, page_id: PageId, page: Page) {
+        self.insert_arc(page_id, Arc::new(page));
+    }
+
+    pub fn insert_arc(&self, page_id: PageId, page: Arc<Page>) {
         let idx = self.shard(page_id);
         self.shards[idx].lock().unwrap().put(page_id, page);
     }
@@ -275,6 +302,10 @@ impl SharedPageProvider {
 impl AsyncPageProvider for SharedPageProvider {
     async fn read_page(&self, page_id: PageId) -> Option<Page> {
         self.pages.get(page_id)
+    }
+
+    async fn read_page_arc(&self, page_id: PageId) -> Option<Arc<Page>> {
+        self.pages.get_arc(page_id)
     }
 
     async fn write_page(&self, page_id: PageId, page: Page) {
@@ -380,7 +411,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
             let mut leaf_id = self.find_leaf_for_read(key).await?;
             for _ in 0..MAX_RIGHT_LINK_HOPS {
                 let _leaf_guard = self.provider.acquire_read_latch(leaf_id).await;
-                let page = self.provider.read_page(leaf_id).await?;
+                let page = self.provider.read_page_arc(leaf_id).await?;
                 let header = page_header(&page);
                 if header.page_type != PAGE_TYPE_LEAF {
                     break;
@@ -859,6 +890,16 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         out
     }
 
+    pub async fn range_meta(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, LeafValueMeta)> {
+        let mut out = Vec::new();
+        self.range_visit_meta(start, end, |k, leaf_value| {
+            out.push((k.to_vec(), leaf_value));
+            true
+        })
+        .await;
+        out
+    }
+
     pub async fn debug_leaf_keys(&self, key: &[u8], limit: usize) -> Vec<Vec<u8>> {
         let Some(leaf_id) = self.find_leaf_for_read(key).await else {
             return Vec::new();
@@ -924,7 +965,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                     break;
                 }
                 let _leaf_guard = self.provider.acquire_read_latch(leaf_id).await;
-                let page = match self.provider.read_page(leaf_id).await {
+                let page = match self.provider.read_page_arc(leaf_id).await {
                     Some(page) => page,
                     None => break,
                 };
@@ -976,12 +1017,81 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         }
     }
 
+    pub async fn range_visit_meta(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        mut f: impl FnMut(&[u8], LeafValueMeta) -> bool,
+    ) {
+        for _ in 0..MAX_TRAVERSAL_RETRIES {
+            let Some(mut leaf_id) = self.find_leaf_for_read(start).await else {
+                return;
+            };
+            let mut first = true;
+            let mut visited = HashSet::new();
+            for _ in 0..MAX_SCAN_LEAF_HOPS {
+                if !visited.insert(leaf_id) {
+                    break;
+                }
+                let _leaf_guard = self.provider.acquire_read_latch(leaf_id).await;
+                let page = match self.provider.read_page_arc(leaf_id).await {
+                    Some(page) => page,
+                    None => break,
+                };
+                let header = leaf_page_header(&page);
+                if header.page_type != PAGE_TYPE_LEAF {
+                    break;
+                }
+                if let Some(hk) = header.high_key
+                    && start > hk.as_slice()
+                    && let Some(next) = header.next_leaf
+                {
+                    if next == leaf_id {
+                        break;
+                    }
+                    leaf_id = next;
+                    continue;
+                }
+                let mut idx = if first {
+                    lower_bound_in_leaf(&page, start)
+                } else {
+                    0
+                };
+                first = false;
+                let key_count = header.key_count as usize;
+                while idx < key_count {
+                    let Some(key) = entry_key_at(&page, idx) else {
+                        break;
+                    };
+                    if key > end {
+                        return;
+                    }
+                    let Some(value) = entry_value_at(&page, idx) else {
+                        break;
+                    };
+                    if !f(key, decode_leaf_value_meta(value)) {
+                        return;
+                    }
+                    idx += 1;
+                }
+
+                let Some(next) = header.next_leaf else {
+                    return;
+                };
+                if next == leaf_id {
+                    break;
+                }
+                leaf_id = next;
+            }
+        }
+    }
+
     async fn find_leaf_for_read(&self, key: &[u8]) -> Option<PageId> {
         for _ in 0..MAX_TRAVERSAL_RETRIES {
             let mut current = self.provider.root_page_id();
             let mut current_guard = self.provider.acquire_read_latch(current).await;
             for _ in 0..MAX_SCAN_LEAF_HOPS {
-                let page = match self.provider.read_page(current).await {
+                let page = match self.provider.read_page_arc(current).await {
                     Some(p) => p,
                     None => break,
                 };
@@ -1988,6 +2098,18 @@ fn encode_leaf_value(leaf_value: &LeafValue) -> Vec<u8> {
 fn decode_leaf_value(buf: &[u8]) -> LeafValue {
     let mut value = [0u8; VALUE_SIZE];
     value.copy_from_slice(&buf[0..VALUE_SIZE]);
+    let meta = decode_leaf_value_meta(buf);
+    LeafValue {
+        value,
+        commit_lsn: meta.commit_lsn,
+        undo_ptr: meta.undo_ptr,
+        flags: meta.flags,
+        intent_txn_id: meta.intent_txn_id,
+        intent_lsn: meta.intent_lsn,
+    }
+}
+
+fn decode_leaf_value_meta(buf: &[u8]) -> LeafValueMeta {
     let mut off = VALUE_SIZE;
     let commit_lsn = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
     off += 8;
@@ -2008,8 +2130,7 @@ fn decode_leaf_value(buf: &[u8]) -> LeafValue {
             slot_id: undo_slot_id,
         })
     };
-    LeafValue {
-        value,
+    LeafValueMeta {
         commit_lsn,
         undo_ptr,
         flags,
