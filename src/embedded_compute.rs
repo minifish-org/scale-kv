@@ -1845,11 +1845,15 @@ impl EmbeddedTxn {
         map.insert(META_PAGE_ID, meta.encode());
 
         if map.len() != reserve_n {
+            // This can happen under concurrent writers when stamping commit_lsn causes the
+            // B+Tree to touch additional pages (e.g. due to concurrent splits/structure changes).
+            // We currently do not have a safe page-after-image merge protocol for that case.
+            // Treat it as a retryable conflict instead of crashing the commit.
             let _ = self.read_guard.take();
             return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+                std::io::ErrorKind::WouldBlock,
                 format!(
-                    "reserved page count mismatch: reserved={} final={}",
+                    "commit page set changed: reserved={} final={}",
                     reserve_n,
                     map.len()
                 ),
