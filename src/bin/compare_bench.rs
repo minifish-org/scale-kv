@@ -41,6 +41,7 @@ struct Config {
     scan_len: usize,
     no_materialize: bool,
     warmup_secs: u64,
+    update_only: bool,
     seed: u64,
 }
 
@@ -147,6 +148,7 @@ fn parse_config() -> anyhow::Result<Config> {
         scan_len: 64,
         no_materialize: false,
         warmup_secs: 0,
+        update_only: false,
         seed: rand::random::<u64>(),
     };
 
@@ -253,6 +255,9 @@ fn parse_config() -> anyhow::Result<Config> {
                     .parse::<u64>()
                     .context("invalid --warmup-secs")?;
             }
+            "--update-only" => {
+                cfg.update_only = true;
+            }
             "--seed" => {
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     i += 1;
@@ -283,6 +288,13 @@ fn parse_config() -> anyhow::Result<Config> {
     if cfg.preload_keys > cfg.keyspace {
         cfg.preload_keys = cfg.keyspace;
     }
+    if cfg.update_only {
+        // For update-only put workload, we need to preload keys first and then only overwrite
+        // existing keys (no inserts) to avoid structural churn (splits) dominating the results.
+        cfg.preload = true;
+        cfg.allow_misses = false;
+    }
+
     if !cfg.preload_only && !cfg.allow_misses && cfg.preload_keys == 0 {
         bail!("--preload-keys must be > 0 unless --allow-misses or --preload-only is set");
     }
@@ -307,7 +319,8 @@ fn parse_config() -> anyhow::Result<Config> {
 
 fn print_help() {
     println!(
-        "Usage: compare_bench [--backend scale-kv|scale-kv-mem|redb] [--mode put|get|scan] [--clients N] [--duration-secs S] [--warmup-secs W] [--keyspace K] \\\n[--preload-keys N] [--preload] [--skip-preload] [--preload-only] [--allow-misses] [--value-size BYTES] [--txn-ops N] [--scan-len N] [--no-materialize] [--seed [SEED]]\n\nExamples:\n  compare_bench --backend scale-kv --mode get\n  compare_bench --backend scale-kv --mode get --no-materialize\n  compare_bench --backend scale-kv-mem --mode scan --no-materialize\n  compare_bench --backend redb --mode get"
+        "Usage: compare_bench [--backend scale-kv|scale-kv-mem|redb] [--mode put|get|scan] [--clients N] [--duration-secs S] [--warmup-secs W] [--keyspace K] \\\n[--preload-keys N] [--preload] [--skip-preload] [--preload-only] [--allow-misses] [--value-size BYTES] [--txn-ops N] [--scan-len N] [--no-materialize] [--update-only] [--seed [SEED]]\n\nExamples:\n  compare_bench --backend scale-kv --mode get\n  compare_bench --backend scale-kv --mode get --no-materialize\n  compare_bench --backend scale-kv --mode put --update-only
+  compare_bench --backend scale-kv-mem --mode scan --no-materialize\n  compare_bench --backend redb --mode get"
     );
 }
 
@@ -793,7 +806,7 @@ async fn run(cfg: Config, local: &LocalSet) -> anyhow::Result<()> {
     if cfg.preload_only {
         println!("backend={}", backend_name(cfg.backend));
         println!(
-            "config mode={} clients={} duration_secs={} keyspace={} preload_keys={} preload={} preload_only={} allow_misses={} value_size={} txn_ops={} scan_len={} no_materialize={} seed={}",
+            "config mode={} clients={} duration_secs={} keyspace={} preload_keys={} preload={} preload_only={} allow_misses={} value_size={} txn_ops={} scan_len={} no_materialize={} update_only={} seed={}",
             mode_name(cfg.mode),
             cfg.clients,
             cfg.duration_secs,
@@ -806,6 +819,7 @@ async fn run(cfg: Config, local: &LocalSet) -> anyhow::Result<()> {
             cfg.txn_ops,
             cfg.scan_len,
             cfg.no_materialize,
+            cfg.update_only,
             cfg.seed,
         );
         println!("workload_keyspace={}", workload_keyspace);
@@ -838,7 +852,7 @@ async fn run(cfg: Config, local: &LocalSet) -> anyhow::Result<()> {
 
     println!("backend={}", backend_name(cfg.backend));
     println!(
-        "config mode={} clients={} duration_secs={} keyspace={} preload_keys={} preload={} preload_only={} allow_misses={} value_size={} txn_ops={} scan_len={} no_materialize={} seed={}",
+        "config mode={} clients={} duration_secs={} keyspace={} preload_keys={} preload={} preload_only={} allow_misses={} value_size={} txn_ops={} scan_len={} no_materialize={} update_only={} seed={}",
         mode_name(cfg.mode),
         cfg.clients,
         cfg.duration_secs,
@@ -851,6 +865,7 @@ async fn run(cfg: Config, local: &LocalSet) -> anyhow::Result<()> {
         cfg.txn_ops,
         cfg.scan_len,
         cfg.no_materialize,
+        cfg.update_only,
         cfg.seed,
     );
     println!("workload_keyspace={}", workload_keyspace);
