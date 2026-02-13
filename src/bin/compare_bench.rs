@@ -40,6 +40,7 @@ struct Config {
     txn_ops: usize,
     scan_len: usize,
     no_materialize: bool,
+    warmup_secs: u64,
     seed: u64,
 }
 
@@ -145,6 +146,7 @@ fn parse_config() -> anyhow::Result<Config> {
         txn_ops: 16,
         scan_len: 64,
         no_materialize: false,
+        warmup_secs: 0,
         seed: rand::random::<u64>(),
     };
 
@@ -243,6 +245,14 @@ fn parse_config() -> anyhow::Result<Config> {
             "--no-materialize" => {
                 cfg.no_materialize = true;
             }
+            "--warmup-secs" => {
+                i += 1;
+                cfg.warmup_secs = args
+                    .get(i)
+                    .context("missing value for --warmup-secs")?
+                    .parse::<u64>()
+                    .context("invalid --warmup-secs")?;
+            }
             "--seed" => {
                 if i + 1 < args.len() && !args[i + 1].starts_with("--") {
                     i += 1;
@@ -297,7 +307,7 @@ fn parse_config() -> anyhow::Result<Config> {
 
 fn print_help() {
     println!(
-        "Usage: compare_bench [--backend scale-kv|scale-kv-mem|redb] [--mode put|get|scan] [--clients N] [--duration-secs S] [--keyspace K] \\\n[--preload-keys N] [--preload] [--skip-preload] [--preload-only] [--allow-misses] [--value-size BYTES] [--txn-ops N] [--scan-len N] [--no-materialize] [--seed [SEED]]\n\nExamples:\n  compare_bench --backend scale-kv --mode get\n  compare_bench --backend scale-kv --mode get --no-materialize\n  compare_bench --backend scale-kv-mem --mode scan --no-materialize\n  compare_bench --backend redb --mode get"
+        "Usage: compare_bench [--backend scale-kv|scale-kv-mem|redb] [--mode put|get|scan] [--clients N] [--duration-secs S] [--warmup-secs W] [--keyspace K] \\\n[--preload-keys N] [--preload] [--skip-preload] [--preload-only] [--allow-misses] [--value-size BYTES] [--txn-ops N] [--scan-len N] [--no-materialize] [--seed [SEED]]\n\nExamples:\n  compare_bench --backend scale-kv --mode get\n  compare_bench --backend scale-kv --mode get --no-materialize\n  compare_bench --backend scale-kv-mem --mode scan --no-materialize\n  compare_bench --backend redb --mode get"
     );
 }
 
@@ -802,6 +812,13 @@ async fn run(cfg: Config, local: &LocalSet) -> anyhow::Result<()> {
         println!("preload_seconds={:.3}", preload_elapsed.as_secs_f64());
         println!("preload_only=true");
         return Ok(());
+    }
+
+    // Optional warmup (hot cache). Runs the same workload but discards stats.
+    if cfg.warmup_secs > 0 {
+        let mut warm = cfg.clone();
+        warm.duration_secs = cfg.warmup_secs;
+        let _ = run_workers(backend.clone(), &warm).await?;
     }
 
     let run_start = Instant::now();
