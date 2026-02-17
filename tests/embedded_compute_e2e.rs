@@ -93,6 +93,12 @@ fn test_value(b: u8) -> Bytes {
     Bytes::from(vec![b; VALUE_SIZE])
 }
 
+fn test_value_with_tag(fill: u8, tag: [u8; 2]) -> Bytes {
+    let mut v = vec![fill; VALUE_SIZE];
+    v[0..2].copy_from_slice(&tag);
+    Bytes::from(v)
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn test_scan_range_snapshot_inclusive_and_limit() {
     if !tcp_bind_allowed() {
@@ -140,6 +146,185 @@ async fn test_scan_range_snapshot_inclusive_and_limit() {
             assert_eq!(limited.len(), 2);
             assert_eq!(limited[0], (k1, v1));
             assert_eq!(limited[1], (k2, v2_new));
+        })
+        .await;
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_secondary_btree_index_create_and_query_eq() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir = temp_dir();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
+                .await
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+
+            compute
+                .create_btree_secondary_index("tag", 0, 2)
+                .await
+                .unwrap();
+            let defs = compute.list_secondary_indexes();
+            assert_eq!(defs.len(), 1);
+            assert_eq!(defs[0].name, "tag");
+
+            let k1 = test_key(101);
+            let k2 = test_key(102);
+            let v1 = test_value_with_tag(1, *b"aa");
+            let v2 = test_value_with_tag(2, *b"bb");
+            compute.put(&k1, &v1).await.unwrap();
+            compute.put(&k2, &v2).await.unwrap();
+
+            let r1 = compute.scan_secondary_index_eq("tag", b"aa", 10).await.unwrap();
+            assert_eq!(r1.len(), 1);
+            assert_eq!(r1[0], (k1.clone(), v1.clone()));
+
+            let r2 = compute.scan_secondary_index_eq("tag", b"bb", 10).await.unwrap();
+            assert_eq!(r2.len(), 1);
+            assert_eq!(r2[0], (k2.clone(), v2.clone()));
+
+            assert!(compute.drop_secondary_index("tag").await.unwrap());
+            assert!(!compute.drop_secondary_index("tag").await.unwrap());
+        })
+        .await;
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_secondary_btree_index_snapshot_visibility() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir = temp_dir();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
+                .await
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+
+            compute
+                .create_btree_secondary_index("tag", 0, 2)
+                .await
+                .unwrap();
+
+            let key = test_key(201);
+            let v_old = test_value_with_tag(3, *b"aa");
+            let v_new = test_value_with_tag(4, *b"bb");
+            compute.put(&key, &v_old).await.unwrap();
+
+            let mut ro = compute.begin_ro_timeout(Duration::from_secs(10));
+            compute.put(&key, &v_new).await.unwrap();
+
+            let snap_old = ro.scan_secondary_index_eq("tag", b"aa", 10).await.unwrap();
+            assert_eq!(snap_old, vec![(key.clone(), v_old.clone())]);
+
+            let now_old = compute
+                .scan_secondary_index_eq("tag", b"aa", 10)
+                .await
+                .unwrap();
+            assert!(now_old.is_empty());
+
+            let now_new = compute
+                .scan_secondary_index_eq("tag", b"bb", 10)
+                .await
+                .unwrap();
+            assert_eq!(now_new, vec![(key.clone(), v_new.clone())]);
+        })
+        .await;
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_secondary_btree_index_backfill_existing_rows() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir = temp_dir();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
+                .await
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+
+            let k1 = test_key(301);
+            let k2 = test_key(302);
+            let v1 = test_value_with_tag(5, *b"aa");
+            let v2 = test_value_with_tag(6, *b"aa");
+            compute.put(&k1, &v1).await.unwrap();
+            compute.put(&k2, &v2).await.unwrap();
+
+            compute
+                .create_btree_secondary_index("tag", 0, 2)
+                .await
+                .unwrap();
+            let got = compute.scan_secondary_index_eq("tag", b"aa", 10).await.unwrap();
+            assert_eq!(got.len(), 2);
+            assert_eq!(got[0], (k1.clone(), v1.clone()));
+            assert_eq!(got[1], (k2.clone(), v2.clone()));
+        })
+        .await;
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_secondary_index_catalog_persist_and_recover() {
+    if !tcp_bind_allowed() {
+        return;
+    }
+
+    let dir = temp_dir();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let server = StorageServer::start_with_dir(addr, dir.clone())
+                .await
+                .unwrap();
+            let addrs = vec![server.addr().to_string()];
+
+            let compute1 = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+            let key = test_key(401);
+            let val = test_value_with_tag(8, *b"eu");
+            compute1.put(&key, &val).await.unwrap();
+            compute1
+                .create_btree_secondary_index("region", 0, 2)
+                .await
+                .unwrap();
+            let defs = compute1.list_secondary_indexes();
+            assert_eq!(defs.len(), 1);
+            assert_eq!(defs[0].name, "region");
+
+            let compute2 = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
+            let defs2 = compute2.list_secondary_indexes();
+            assert_eq!(defs2.len(), 1);
+            assert_eq!(defs2[0].name, "region");
+            let got = compute2
+                .scan_secondary_index_eq("region", b"eu", 10)
+                .await
+                .unwrap();
+            assert_eq!(got, vec![(key.clone(), val.clone())]);
         })
         .await;
 

@@ -4,6 +4,18 @@ use crate::page_bptree::{
     AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, LeafValue, LeafValueMeta, LeafValueRef,
     PageBPlusTree, PageCache,
 };
+use crate::secondary_index::{
+    SecondaryIndexDefinition, SecondaryIndexManager, SecondaryIndexMutation,
+};
+use crate::secondary_index_meta::{
+    SECONDARY_INDEX_META_PAGE_ID, SecondaryIndexCatalog, decode_secondary_index_catalog,
+    encode_secondary_index_catalog,
+};
+use crate::secondary_posting_log::{
+    SecondaryPostingLogState, append_record as append_posting_record,
+    decode_records as decode_posting_records, new_log_page, read_next_page_id,
+    write_next_page_id as write_posting_next_page_id,
+};
 use crate::txn_page_provider::{CURRENT_TXN_DIRTY, TxnPageProvider};
 use crate::{ActiveReads, ReadGuard};
 use crate::{BTREE_META_PAGE_ID, BtreeMeta};
@@ -204,6 +216,8 @@ pub struct EmbeddedCompute {
         Arc<dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>>,
     provider: Arc<TxnPageProvider>,
     tree: Arc<PageBPlusTree<TxnPageProvider>>,
+    secondary_indexes: Arc<SecondaryIndexManager>,
+    secondary_posting_log: Arc<Mutex<SecondaryPostingLogState>>,
     txn_registry: Arc<Mutex<HashMap<u64, PendingTxn>>>,
     default_rw_txn_timeout: Duration,
     txn_reaper_interval: Duration,
@@ -308,6 +322,8 @@ impl EmbeddedCompute {
             page_fetcher,
             provider,
             tree,
+            secondary_indexes: Arc::new(SecondaryIndexManager::default()),
+            secondary_posting_log: Arc::new(Mutex::new(SecondaryPostingLogState::default())),
             txn_registry: Arc::new(Mutex::new(HashMap::new())),
             default_rw_txn_timeout: Self::read_duration_env_ms("SCALE_KV_RW_TXN_TIMEOUT_MS", 5_000),
             txn_reaper_interval: Self::read_duration_env_ms("SCALE_KV_TXN_REAPER_MS", 100),
@@ -374,6 +390,8 @@ impl EmbeddedCompute {
             page_fetcher,
             provider,
             tree,
+            secondary_indexes: Arc::new(SecondaryIndexManager::default()),
+            secondary_posting_log: Arc::new(Mutex::new(SecondaryPostingLogState::default())),
             txn_registry: Arc::new(Mutex::new(HashMap::new())),
             default_rw_txn_timeout: Self::read_duration_env_ms("SCALE_KV_RW_TXN_TIMEOUT_MS", 5_000),
             txn_reaper_interval: Self::read_duration_env_ms("SCALE_KV_TXN_REAPER_MS", 100),
@@ -622,6 +640,168 @@ impl EmbeddedCompute {
         Ok(self.warmed_pages())
     }
 
+    async fn persist_secondary_index_catalog(&self) -> Result<()> {
+        let defs = self.secondary_indexes.list_indexes();
+        let posting_log = { self.secondary_posting_log.lock().await.clone() };
+        let page = encode_secondary_index_catalog(&SecondaryIndexCatalog { defs, posting_log })?;
+        let _ = self
+            .write_pages_direct(vec![(SECONDARY_INDEX_META_PAGE_ID, page)])
+            .await?;
+        Ok(())
+    }
+
+    async fn load_secondary_index_catalog(&self) -> Result<()> {
+        let Some(page) = self
+            .get_page(SECONDARY_INDEX_META_PAGE_ID, self.durable_lsn())
+            .await
+        else {
+            self.secondary_indexes.replace_definitions(Vec::new())?;
+            *self.secondary_posting_log.lock().await = SecondaryPostingLogState::default();
+            return Ok(());
+        };
+        let catalog = decode_secondary_index_catalog(&page)?;
+        self.secondary_indexes
+            .replace_definitions(catalog.defs.clone())?;
+        *self.secondary_posting_log.lock().await = catalog.posting_log;
+        Ok(())
+    }
+
+    async fn append_secondary_posting_log(
+        &self,
+        commit_lsn: u64,
+        mutations: &[SecondaryIndexMutation],
+    ) -> Result<()> {
+        if mutations.is_empty() {
+            return Ok(());
+        }
+
+        let mut state = self.secondary_posting_log.lock().await;
+        let mut writes: BTreeMap<PageId, Vec<u8>> = BTreeMap::new();
+        let mut tail_page_id = state.tail_page_id;
+        let mut tail_page = if tail_page_id == 0 {
+            let new_id = state.next_page_id;
+            state.next_page_id = state.next_page_id.saturating_add(1);
+            state.head_page_id = new_id;
+            state.tail_page_id = new_id;
+            tail_page_id = new_id;
+            new_log_page().to_vec()
+        } else if let Some(existing) = self.page_cache.get(tail_page_id) {
+            existing.to_vec()
+        } else {
+            self.get_page(tail_page_id, self.durable_lsn())
+                .await
+                .ok_or(Error::InMemoryPageMissing(tail_page_id))?
+                .to_vec()
+        };
+
+        for m in mutations {
+            if append_posting_record(&mut tail_page, commit_lsn, m)? {
+                continue;
+            }
+
+            let new_id = state.next_page_id;
+            state.next_page_id = state.next_page_id.saturating_add(1);
+            write_posting_next_page_id(&mut tail_page, new_id)?;
+            writes.insert(tail_page_id, tail_page);
+
+            tail_page = new_log_page().to_vec();
+            if !append_posting_record(&mut tail_page, commit_lsn, m)? {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "posting mutation record too large",
+                )));
+            }
+            tail_page_id = new_id;
+            state.tail_page_id = new_id;
+        }
+
+        writes.insert(tail_page_id, tail_page);
+        let mut page_writes = writes
+            .into_iter()
+            .map(|(pid, p)| (pid, Page::from(p)))
+            .collect::<Vec<_>>();
+        let defs = self.secondary_indexes.list_indexes();
+        let page = encode_secondary_index_catalog(&SecondaryIndexCatalog {
+            defs,
+            posting_log: state.clone(),
+        })?;
+        page_writes.push((SECONDARY_INDEX_META_PAGE_ID, page));
+        let _ = self.write_pages_direct(page_writes).await?;
+        Ok(())
+    }
+
+    async fn replay_secondary_posting_log(&self) -> Result<usize> {
+        let state = self.secondary_posting_log.lock().await.clone();
+        if state.head_page_id == 0 {
+            return Ok(0);
+        }
+
+        let mut count = 0usize;
+        let mut page_id = state.head_page_id;
+        while page_id != 0 {
+            let page = self
+                .get_page(page_id, self.durable_lsn())
+                .await
+                .ok_or(Error::InMemoryPageMissing(page_id))?;
+            let records = decode_posting_records(&page)?;
+            for (lsn, m) in records {
+                self.secondary_indexes.apply_commit(lsn, &[m]);
+                count += 1;
+            }
+            page_id = read_next_page_id(&page)?;
+        }
+        Ok(count)
+    }
+
+    async fn backfill_secondary_index(&self, index_name: &str) -> Result<usize> {
+        let mut tx = self.begin_tx(true, None);
+        let start = vec![0u8; KEY_SIZE];
+        let end = vec![0xFFu8; KEY_SIZE];
+        let entries = tx.tree_range(&start, &end).await;
+
+        let mut out_count = 0usize;
+        let commit_lsn = self.durable_lsn();
+        let mut chunk: Vec<SecondaryIndexMutation> = Vec::with_capacity(1024);
+
+        for (key, row) in entries {
+            if let Some(value) = tx.read_visible_value_from_scan_entry(&key, row).await? {
+                let key_arr: [u8; KEY_SIZE] = key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::InvalidKeySize(key.len(), KEY_SIZE))?;
+                let mut value_arr = [0u8; VALUE_SIZE];
+                value_arr.copy_from_slice(&value);
+                let muts = self
+                    .secondary_indexes
+                    .plan_mutations(key_arr, None, Some(&value_arr))?;
+                for m in muts {
+                    if m.index_name == index_name {
+                        chunk.push(m);
+                    }
+                }
+                out_count += 1;
+                if chunk.len() >= 1024 {
+                    self.secondary_indexes.apply_commit(commit_lsn, &chunk);
+                    self.append_secondary_posting_log(commit_lsn, &chunk).await?;
+                    chunk.clear();
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            self.secondary_indexes.apply_commit(commit_lsn, &chunk);
+            self.append_secondary_posting_log(commit_lsn, &chunk).await?;
+        }
+        Ok(out_count)
+    }
+
+    async fn backfill_all_secondary_indexes(&self) -> Result<()> {
+        let defs = self.secondary_indexes.list_indexes();
+        for d in defs {
+            self.backfill_secondary_index(&d.name).await?;
+        }
+        Ok(())
+    }
+
     async fn recover_or_init(&self) -> Result<()> {
         // Warmup first (best-effort). If storage is empty, we'll init below.
         let _ = self.warmup_scan_all(256).await;
@@ -644,6 +824,11 @@ impl EmbeddedCompute {
             } else {
                 // Fallback: root in global meta.
                 self.provider.set_root_page_id(meta.root_page_id);
+            }
+            self.load_secondary_index_catalog().await?;
+            let replayed = self.replay_secondary_posting_log().await?;
+            if replayed == 0 {
+                self.backfill_all_secondary_indexes().await?;
             }
             return Ok(());
         }
@@ -689,6 +874,8 @@ impl EmbeddedCompute {
         tx.write_page(META_PAGE_ID, meta.encode());
 
         tx.commit().await?;
+        self.secondary_indexes.replace_definitions(Vec::new())?;
+        self.persist_secondary_index_catalog().await?;
         Ok(())
     }
 
@@ -712,6 +899,7 @@ impl EmbeddedCompute {
             bptree_dirty: Rc::new(RefCell::new(BTreeMap::new())),
             ro_cache: BTreeMap::new(),
             modified: BTreeSet::new(),
+            secondary_mutations: Vec::new(),
             undo_txn_id: if read_only {
                 None
             } else {
@@ -757,6 +945,56 @@ impl EmbeddedCompute {
         let mut tx = self.begin_rw().await;
         tx.write_page(page_id, page);
         tx.commit().await
+    }
+
+    /// Create a secondary B+Tree index over a fixed byte range in VALUE and backfill existing rows.
+    pub async fn create_btree_secondary_index(
+        &self,
+        name: &str,
+        value_offset: usize,
+        value_len: usize,
+    ) -> Result<()> {
+        self.secondary_indexes
+            .create_btree_index(name, value_offset, value_len)?;
+        if let Err(err) = self.persist_secondary_index_catalog().await {
+            let _ = self.secondary_indexes.drop_index(name);
+            return Err(err);
+        }
+        if let Err(err) = self.backfill_secondary_index(name).await {
+            let _ = self.secondary_indexes.drop_index(name);
+            let _ = self.persist_secondary_index_catalog().await;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Drop a previously created secondary index. Returns whether an index was removed.
+    pub async fn drop_secondary_index(&self, name: &str) -> Result<bool> {
+        let dropped = self.secondary_indexes.drop_index(name);
+        if dropped {
+            self.persist_secondary_index_catalog().await?;
+        }
+        Ok(dropped)
+    }
+
+    /// List all configured secondary indexes.
+    pub fn list_secondary_indexes(&self) -> Vec<SecondaryIndexDefinition> {
+        self.secondary_indexes.list_indexes()
+    }
+
+    /// Query one secondary index with exact-match semantics at a read-only snapshot.
+    pub async fn scan_secondary_index_eq(
+        &self,
+        index_name: &str,
+        secondary_key: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.begin_tx(true, None);
+        tx.scan_secondary_index_eq(index_name, secondary_key, limit)
+            .await
     }
 
     /// Put a fixed-size value (VALUE_SIZE) for a fixed-size key (KEY_SIZE).
@@ -997,6 +1235,16 @@ impl EmbeddedCompute {
         }
         Ok(commit_lsn)
     }
+
+    async fn write_pages_direct(&self, pages: Vec<(PageId, Page)>) -> Result<u64> {
+        if pages.is_empty() {
+            return Ok(self.durable_lsn());
+        }
+        let reserve_n = pages.len().max(1);
+        let (request_id, start_lsn, end_lsn) = self.sequencer.reserve_txn(reserve_n)?;
+        self.commit_pages_reserved(request_id, start_lsn, end_lsn, pages)
+            .await
+    }
 }
 
 /// Buffered transaction that tracks dirty pages (tree + meta + undo pages).
@@ -1016,6 +1264,7 @@ pub struct EmbeddedTxn {
     bptree_dirty: Rc<RefCell<BTreeMap<PageId, Page>>>,
     ro_cache: BTreeMap<PageId, Arc<Page>>,
     modified: BTreeSet<[u8; KEY_SIZE]>,
+    secondary_mutations: Vec<SecondaryIndexMutation>,
 
     undo_txn_id: Option<u64>,
     intent_base_lsn: u64,
@@ -1044,6 +1293,12 @@ impl EmbeddedTxn {
             intent_txn_id: meta.intent_txn_id,
             intent_lsn: meta.intent_lsn,
         }
+    }
+
+    fn value_array_from_ref(row: &LeafValueRef) -> [u8; VALUE_SIZE] {
+        let mut value = [0u8; VALUE_SIZE];
+        value.copy_from_slice(&row.value);
+        value
     }
 
     async fn with_bptree_dirty<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
@@ -1084,6 +1339,67 @@ impl EmbeddedTxn {
     async fn tree_debug_leaf_entries(&self, key: &[u8], limit: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.with_bptree_dirty(self.compute.tree.debug_leaf_entries(key, limit))
             .await
+    }
+
+    async fn build_secondary_log_pages(
+        &self,
+        commit_lsn: u64,
+        start_state: &SecondaryPostingLogState,
+    ) -> Result<(BTreeMap<PageId, Page>, SecondaryPostingLogState)> {
+        if self.secondary_mutations.is_empty() {
+            return Ok((BTreeMap::new(), start_state.clone()));
+        }
+
+        let mut state = start_state.clone();
+        let mut pages: BTreeMap<PageId, Page> = BTreeMap::new();
+        let mut tail_page_id = state.tail_page_id;
+        let mut tail_page = if tail_page_id == 0 {
+            let new_id = state.next_page_id;
+            state.next_page_id = state.next_page_id.saturating_add(1);
+            state.head_page_id = new_id;
+            state.tail_page_id = new_id;
+            tail_page_id = new_id;
+            new_log_page().to_vec()
+        } else if let Some(p) = self.dirty.get(&tail_page_id).cloned() {
+            p.to_vec()
+        } else if let Some(p) = self.ro_cache.get(&tail_page_id).map(|p| p.as_ref().clone()) {
+            p.to_vec()
+        } else if let Some(p) = self.compute.page_cache.get(tail_page_id) {
+            p.to_vec()
+        } else if let Some(p) = self.compute.get_page(tail_page_id, self.read_lsn).await {
+            p.to_vec()
+        } else {
+            return Err(Error::InMemoryPageMissing(tail_page_id));
+        };
+
+        for m in &self.secondary_mutations {
+            if append_posting_record(&mut tail_page, commit_lsn, m)? {
+                continue;
+            }
+            let new_id = state.next_page_id;
+            state.next_page_id = state.next_page_id.saturating_add(1);
+            write_posting_next_page_id(&mut tail_page, new_id)?;
+            pages.insert(tail_page_id, Page::from(tail_page));
+
+            tail_page = new_log_page().to_vec();
+            if !append_posting_record(&mut tail_page, commit_lsn, m)? {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "posting mutation record too large",
+                )));
+            }
+            tail_page_id = new_id;
+            state.tail_page_id = new_id;
+        }
+
+        pages.insert(tail_page_id, Page::from(tail_page));
+        let defs = self.compute.secondary_indexes.list_indexes();
+        let catalog_page = encode_secondary_index_catalog(&SecondaryIndexCatalog {
+            defs,
+            posting_log: state.clone(),
+        })?;
+        pages.insert(SECONDARY_INDEX_META_PAGE_ID, catalog_page);
+        Ok((pages, state))
     }
 
     fn registry_deadline(&self, default_timeout: Duration) -> Instant {
@@ -1408,8 +1724,15 @@ impl EmbeddedTxn {
             )));
         }
         let existing = self.tree_get(key).await;
+        let old_value = existing.as_ref().map(Self::value_array_from_ref);
         let mut new_value = [0u8; VALUE_SIZE];
         new_value.copy_from_slice(value);
+        let key_arr: [u8; KEY_SIZE] = key.try_into().unwrap();
+        let planned_mutations = self.compute.secondary_indexes.plan_mutations(
+            key_arr,
+            old_value.as_ref(),
+            Some(&new_value),
+        )?;
 
         let mut row = LeafValue {
             value: new_value,
@@ -1452,8 +1775,8 @@ impl EmbeddedTxn {
         }
 
         self.tree_insert(key.to_vec(), row).await?;
-        let key_arr: [u8; KEY_SIZE] = key.try_into().unwrap();
         self.modified.insert(key_arr);
+        self.secondary_mutations.extend(planned_mutations);
         if let Some(txn_id) = self.undo_txn_id {
             self.compute.record_txn_write(txn_id, key_arr).await;
         }
@@ -1544,6 +1867,35 @@ impl EmbeddedTxn {
         Ok(visible)
     }
 
+    pub async fn scan_secondary_index_eq(
+        &mut self,
+        index_name: &str,
+        secondary_key: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.ensure_not_timed_out()?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let pks = self.compute.secondary_indexes.query_equal(
+            index_name,
+            secondary_key,
+            self.read_lsn,
+            limit,
+        )?;
+        let mut out = Vec::with_capacity(pks.len());
+        for pk in pks {
+            let key = pk.to_vec();
+            if let Some(value) = self.read_visible_value_from_row(&key).await? {
+                out.push((key, value));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn debug_check_mapping(&mut self, key: &[u8]) -> Result<()> {
         let (row, leaf_entries) = {
             let row = self.tree_get(key).await;
@@ -1586,6 +1938,13 @@ impl EmbeddedTxn {
         let existing = self.tree_get(key).await;
 
         if let Some(old) = existing {
+            let key_arr: [u8; KEY_SIZE] = key.try_into().unwrap();
+            let old_value = Self::value_array_from_ref(&old);
+            let planned_mutations = self.compute.secondary_indexes.plan_mutations(
+                key_arr,
+                Some(&old_value),
+                None,
+            )?;
             if (old.meta.flags & FLAG_INTENT) != 0
                 && self.undo_txn_id != Some(old.meta.intent_txn_id)
             {
@@ -1633,8 +1992,8 @@ impl EmbeddedTxn {
                 },
             };
             self.tree_insert(key.to_vec(), row).await?;
-            let key_arr: [u8; KEY_SIZE] = key.try_into().unwrap();
             self.modified.insert(key_arr);
+            self.secondary_mutations.extend(planned_mutations);
             if let Some(txn_id) = self.undo_txn_id {
                 self.compute.record_txn_write(txn_id, key_arr).await;
             }
@@ -1762,7 +2121,21 @@ impl EmbeddedTxn {
             }
         }
         map.insert(META_PAGE_ID, count_meta.encode());
-        let reserve_n = map.len().max(1);
+
+        let mut posting_state_guard_opt = None;
+        let mut posting_state_before_opt = None;
+        let reserve_n = if self.secondary_mutations.is_empty() {
+            map.len().max(1)
+        } else {
+            let guard = self.compute.secondary_posting_log.lock().await;
+            let posting_state_before = guard.clone();
+            let (secondary_pages_probe, _secondary_state_probe) = self
+                .build_secondary_log_pages(0, &posting_state_before)
+                .await?;
+            posting_state_before_opt = Some(posting_state_before);
+            posting_state_guard_opt = Some(guard);
+            map.len().saturating_add(secondary_pages_probe.len()).max(1)
+        };
 
         let (start_lsn, end_lsn) = self
             .compute
@@ -1844,11 +2217,21 @@ impl EmbeddedTxn {
         }
         map.insert(META_PAGE_ID, meta.encode());
 
+        let mut secondary_state_after_opt = None;
+        if !self.secondary_mutations.is_empty() {
+            let posting_state_before = posting_state_before_opt
+                .as_ref()
+                .expect("secondary posting state before missing");
+            let (secondary_pages, secondary_state_after) = self
+                .build_secondary_log_pages(commit_lsn, posting_state_before)
+                .await?;
+            for (pid, page) in secondary_pages {
+                map.insert(pid, page);
+            }
+            secondary_state_after_opt = Some(secondary_state_after);
+        }
+
         if map.len() != reserve_n {
-            // This can happen under concurrent writers when stamping commit_lsn causes the
-            // B+Tree to touch additional pages (e.g. due to concurrent splits/structure changes).
-            // We currently do not have a safe page-after-image merge protocol for that case.
-            // Treat it as a retryable conflict instead of crashing the commit.
             let _ = self.read_guard.take();
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -1867,7 +2250,22 @@ impl EmbeddedTxn {
             .await;
 
         if out.is_ok() {
+            self.compute
+                .secondary_indexes
+                .apply_commit(commit_lsn, &self.secondary_mutations);
+            if let Some(mut posting_state_guard) = posting_state_guard_opt {
+                if let Some(secondary_state_after) = secondary_state_after_opt {
+                    *posting_state_guard = secondary_state_after;
+                }
+                drop(posting_state_guard);
+            }
             let _ = self.compute.remove_pending_txn(request_id).await;
+        } else {
+            if let Some(mut posting_state_guard) = posting_state_guard_opt
+                && let Some(posting_state_before) = posting_state_before_opt
+            {
+                *posting_state_guard = posting_state_before;
+            }
         }
 
         // Mark snapshot inactive before returning.

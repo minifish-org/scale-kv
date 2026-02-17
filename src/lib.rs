@@ -46,6 +46,12 @@ pub mod storage_capnp;
 pub mod quorum_client;
 pub use quorum_client::StorageQuorumClient;
 
+pub mod secondary_index;
+pub use secondary_index::{SecondaryIndexDefinition, SecondaryIndexKind};
+pub mod secondary_index_meta;
+pub use secondary_index_meta::SECONDARY_INDEX_META_PAGE_ID;
+pub mod secondary_posting_log;
+
 pub mod compute_sequencer;
 pub use compute_sequencer::ComputeSequencer;
 
