@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, RwLock, oneshot};
 
 #[path = "node_bootstrap.rs"]
 mod node_bootstrap;
@@ -245,7 +245,7 @@ impl StorageMaintenanceConfig {
 pub struct StorageNode {
     dir: PathBuf,
     page_store: Arc<PageStore>,
-    page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
+    page_index: Arc<RwLock<HashSet<PageId>>>,
     wal_sender: Mutex<Option<Sender<WalWriteRequest>>>,
     wal_replay_rx: Mutex<Option<Receiver<WalBatch>>>,
     durable_lsn: Arc<std::sync::atomic::AtomicU64>,
@@ -255,7 +255,7 @@ pub struct StorageNode {
     applied_notify: Arc<tokio::sync::Notify>,
 
     // MVCC store for txnGet/appendTxnBatch. Key is raw bytes.
-    mvcc: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
+    mvcc: Arc<RwLock<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
     // requestId -> commitLsn (end_lsn) for idempotent retry
     request_index: Arc<tokio::sync::RwLock<HashMap<u64, u64>>>,
     // Active read snapshots for MVCC GC watermark.
@@ -313,8 +313,8 @@ struct ReplayBuffer {
 struct PageStoreReplay {
     page_store: Arc<PageStore>,
     dir: PathBuf,
-    last_applied_lsn: std::sync::Mutex<u64>,
-    page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
+    last_applied_lsn: std::sync::atomic::AtomicU64,
+    page_index: Arc<RwLock<HashSet<PageId>>>,
     applied_lsn: Arc<std::sync::atomic::AtomicU64>,
     applied_notify: Arc<tokio::sync::Notify>,
 }
@@ -324,7 +324,7 @@ impl PageStoreReplay {
         page_store: Arc<PageStore>,
         dir: PathBuf,
         last_applied_lsn: u64,
-        page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
+        page_index: Arc<RwLock<HashSet<PageId>>>,
         applied_lsn: Arc<std::sync::atomic::AtomicU64>,
         applied_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
@@ -332,16 +332,16 @@ impl PageStoreReplay {
         Self {
             page_store,
             dir,
-            last_applied_lsn: std::sync::Mutex::new(last_applied_lsn),
+            last_applied_lsn: std::sync::atomic::AtomicU64::new(last_applied_lsn),
             page_index,
             applied_lsn,
             applied_notify,
         }
     }
 
-    fn write_page(&self, page_id: PageId, page: &[u8], lsn: u64) -> Result<()> {
+    async fn write_page(&self, page_id: PageId, page: &[u8], lsn: u64) -> Result<()> {
         self.page_store.put(page_id, page, lsn)?;
-        self.page_index.lock().unwrap().insert(page_id);
+        self.page_index.write().await.insert(page_id);
         Ok(())
     }
 
@@ -350,20 +350,14 @@ impl PageStoreReplay {
     }
 
     fn last_applied(&self) -> u64 {
-        *self.last_applied_lsn.lock().unwrap()
+        self.last_applied_lsn.load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn update_last_applied(&self, lsn: u64) {
-        let should_write = {
-            let mut last_applied = self.last_applied_lsn.lock().unwrap();
-            if lsn > *last_applied {
-                *last_applied = lsn;
-                true
-            } else {
-                false
-            }
-        };
-        if should_write {
+        let prev = self
+            .last_applied_lsn
+            .fetch_max(lsn, std::sync::atomic::Ordering::AcqRel);
+        if lsn > prev {
             self.applied_lsn
                 .store(lsn, std::sync::atomic::Ordering::Release);
             self.applied_notify.notify_waiters();
@@ -380,7 +374,7 @@ impl PageStoreReplay {
             .unwrap_or_else(|| Page::from(vec![0u8; PAGE_SIZE]));
         let mut page = page.to_vec();
         apply_wal_record(&mut page, &record)?;
-        self.write_page(page_id, &page, lsn)?;
+        self.write_page(page_id, &page, lsn).await?;
         self.update_last_applied(lsn).await;
         Ok(())
     }
@@ -447,8 +441,8 @@ impl StorageNode {
         let last_applied_lsn = wal_state.last_applied_lsn.max(checkpoint_lsn);
 
         let page_store = Arc::new(page_store);
-        let page_index = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        let mvcc = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let page_index = Arc::new(RwLock::new(HashSet::new()));
+        let mvcc = Arc::new(RwLock::new(BTreeMap::new()));
         let request_index = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let active_reads = Arc::new(ActiveReads::new());
         let metrics = Arc::new(StorageMetricsInner::default());
@@ -468,7 +462,7 @@ impl StorageNode {
             .last_applied_lsn
             .max(last_applied_lsn);
         let rebuilt_index = build_page_index(&page_store).await;
-        *page_index.lock().unwrap() = rebuilt_index;
+        *page_index.write().await = rebuilt_index;
 
         // Initialize durable_lsn from the last applied point.
         // We treat `durable_lsn` as the right boundary (exclusive): all records with lsn < durable_lsn are durable.
@@ -580,7 +574,7 @@ impl StorageNode {
     pub async fn metrics_snapshot(&self) -> StorageMetricsSnapshot {
         let (wal_segments, wal_bytes) = wal_usage(&self.dir).await.unwrap_or((0, 0));
         let (mvcc_keys, mvcc_versions) = {
-            let store = self.mvcc.lock().unwrap();
+            let store = self.mvcc.read().await;
             let keys = store.len();
             let versions = store.values().map(std::vec::Vec::len).sum::<usize>();
             (keys, versions)
@@ -634,7 +628,7 @@ impl StorageNode {
         }
     }
 
-    pub fn mvcc_get(&self, handle: &mut MvccReadHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub async fn mvcc_get(&self, handle: &mut MvccReadHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if handle.is_timed_out() {
             handle.close();
             return Err(crate::Error::TxnTimeout);
@@ -645,7 +639,7 @@ impl StorageNode {
                 "mvcc read handle aborted or closed",
             )));
         }
-        Ok(mvcc_get_at(&self.mvcc, key, handle.read_lsn).unwrap_or(None))
+        Ok(mvcc_get_at(&self.mvcc, key, handle.read_lsn).await.unwrap_or(None))
     }
 
     async fn wal_usage_exceeds(&self, incoming_bytes: u64) -> Result<Option<(usize, u64)>> {
@@ -738,8 +732,8 @@ impl StorageNode {
         Ok(())
     }
 
-    pub fn txn_get(&self, key: &[u8], read_lsn: u64) -> Option<Option<Vec<u8>>> {
-        mvcc_get_at(&self.mvcc, key, read_lsn)
+    pub async fn txn_get(&self, key: &[u8], read_lsn: u64) -> Option<Option<Vec<u8>>> {
+        mvcc_get_at(&self.mvcc, key, read_lsn).await
     }
 
     /// Fetch a raw page (latest) and a best-effort page LSN.
@@ -897,41 +891,41 @@ impl StorageNode {
         checkpoint_with_metrics(&self.page_store, &self.metrics).await
     }
 
-    pub fn len(&self) -> usize {
-        self.page_index.lock().unwrap().len()
+    pub async fn len(&self) -> usize {
+        self.page_index.read().await.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.page_index.lock().unwrap().is_empty()
+    pub async fn is_empty(&self) -> bool {
+        self.page_index.read().await.is_empty()
     }
 
-    pub fn put(&self, key: PageId, value: &[u8]) {
+    pub async fn put(&self, key: PageId, value: &[u8]) {
         let _ = self.page_store.put_direct(key, value);
-        self.page_index.lock().unwrap().insert(key);
+        self.page_index.write().await.insert(key);
     }
 
     pub async fn get(&self, key: PageId) -> Option<Value> {
-        if !self.page_index.lock().unwrap().contains(&key) {
+        if !self.page_index.read().await.contains(&key) {
             return None;
         }
         self.page_store.get(key).await.map(|p| p.to_vec())
     }
 
-    pub fn delete(&self, key: PageId) {
+    pub async fn delete(&self, key: PageId) {
         let zero_page = vec![0u8; PAGE_SIZE];
         let _ = self.page_store.put_direct(key, &zero_page);
-        self.page_index.lock().unwrap().remove(&key);
+        self.page_index.write().await.remove(&key);
     }
 
     pub async fn contains(&self, key: PageId) -> bool {
-        if !self.page_index.lock().unwrap().contains(&key) {
+        if !self.page_index.read().await.contains(&key) {
             return false;
         }
         self.page_store.contains(key).await
     }
 
-    pub fn keys(&self) -> Vec<PageId> {
-        self.page_index.lock().unwrap().iter().copied().collect()
+    pub async fn keys(&self) -> Vec<PageId> {
+        self.page_index.read().await.iter().copied().collect()
     }
 
     pub async fn compact(&self) -> Result<()> {

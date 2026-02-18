@@ -20,7 +20,7 @@ async fn test_put_and_get() {
     let dir = temp_dir();
     let node = StorageNode::open(dir.path()).await.unwrap();
     let page = make_page(1);
-    node.put(1, &page);
+    node.put(1, &page).await;
     let result = node.get(1).await.unwrap();
     assert_eq!(result[0], 1);
     assert_eq!(result[PAGE_SIZE - 1], 1);
@@ -41,8 +41,8 @@ async fn test_overwrite() {
     let node = StorageNode::open(dir.path()).await.unwrap();
     let page1 = make_page(1);
     let page2 = make_page(2);
-    node.put(1, &page1);
-    node.put(1, &page2);
+    node.put(1, &page1).await;
+    node.put(1, &page2).await;
     let result = node.get(1).await.unwrap();
     assert_eq!(result[0], 2);
     drop(node);
@@ -53,8 +53,8 @@ async fn test_delete() {
     let dir = temp_dir();
     let node = StorageNode::open(dir.path()).await.unwrap();
     let page = make_page(1);
-    node.put(1, &page);
-    node.delete(1);
+    node.put(1, &page).await;
+    node.delete(1).await;
     assert_eq!(node.get(1).await, None);
     drop(node);
 }
@@ -63,12 +63,12 @@ async fn test_delete() {
 async fn test_len() {
     let dir = temp_dir();
     let node = StorageNode::open(dir.path()).await.unwrap();
-    assert_eq!(node.len(), 0);
+    assert_eq!(node.len().await, 0);
     let page1 = make_page(1);
     let page2 = make_page(2);
-    node.put(1, &page1);
-    node.put(2, &page2);
-    assert_eq!(node.len(), 2);
+    node.put(1, &page1).await;
+    node.put(2, &page2).await;
+    assert_eq!(node.len().await, 2);
     drop(node);
 }
 
@@ -77,7 +77,7 @@ async fn test_contains() {
     let dir = temp_dir();
     let node = StorageNode::open(dir.path()).await.unwrap();
     let page = make_page(1);
-    node.put(1, &page);
+    node.put(1, &page).await;
     assert!(node.contains(1).await);
     assert!(!node.contains(999).await);
     drop(node);
@@ -90,8 +90,8 @@ async fn test_reopen_persists() {
     let page2 = make_page(2);
     {
         let node = StorageNode::open(dir.path()).await.unwrap();
-        node.put(1, &page1);
-        node.put(2, &page2);
+        node.put(1, &page1).await;
+        node.put(2, &page2).await;
         node.checkpoint().await.unwrap();
     }
     let node = StorageNode::open(dir.path()).await.unwrap();
@@ -107,8 +107,8 @@ async fn test_checkpoint_persists_data() {
     let page2 = make_page(2);
     {
         let node = StorageNode::open(dir.path()).await.unwrap();
-        node.put(1, &page1);
-        node.put(2, &page2);
+        node.put(1, &page1).await;
+        node.put(2, &page2).await;
         node.checkpoint().await.unwrap();
     }
     {
@@ -123,7 +123,7 @@ async fn test_compact_is_checkpoint() {
     let dir = temp_dir();
     let page = make_page(1);
     let node = StorageNode::open(dir.path()).await.unwrap();
-    node.put(1, &page);
+    node.put(1, &page).await;
     node.compact().await.unwrap();
     drop(node);
 
@@ -291,7 +291,7 @@ async fn test_replay_page_records_applies_updates() {
         Arc::clone(&page_store),
         dir.path().to_path_buf(),
         0,
-        Arc::new(std::sync::Mutex::new(HashSet::new())),
+        Arc::new(tokio::sync::RwLock::new(HashSet::new())),
         Arc::new(std::sync::atomic::AtomicU64::new(0)),
         Arc::new(tokio::sync::Notify::new()),
     );
@@ -381,10 +381,10 @@ fn test_mvcc_gc_keeps_last_visible_base_version() {
     assert_eq!(versions[1].commit_lsn, 30);
 }
 
-#[test]
-fn test_mvcc_apply_batch_requires_commit_marker() {
-    let mvcc: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>> =
-        Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+#[tokio::test]
+async fn test_mvcc_apply_batch_requires_commit_marker() {
+    let mvcc: Arc<tokio::sync::RwLock<BTreeMap<Vec<u8>, Vec<MvccVersion>>>> =
+        Arc::new(tokio::sync::RwLock::new(BTreeMap::new()));
     let batch = WalBatch {
         request_id: 0,
         start_lsn: 10,
@@ -398,16 +398,16 @@ fn test_mvcc_apply_batch_requires_commit_marker() {
             value: b"v".to_vec(),
         }],
     };
-    apply_txn_batch_to_mvcc(&mvcc, &batch);
-    assert!(mvcc.lock().unwrap().is_empty());
+    apply_txn_batch_to_mvcc(&mvcc, &batch).await;
+    assert!(mvcc.read().await.is_empty());
 }
 
-#[test]
-fn test_mvcc_get_at_snapshot_boundaries() {
-    let mvcc: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>> =
-        Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+#[tokio::test]
+async fn test_mvcc_get_at_snapshot_boundaries() {
+    let mvcc: Arc<tokio::sync::RwLock<BTreeMap<Vec<u8>, Vec<MvccVersion>>>> =
+        Arc::new(tokio::sync::RwLock::new(BTreeMap::new()));
     {
-        let mut store = mvcc.lock().unwrap();
+        let mut store = mvcc.write().await;
         store.insert(
             b"k".to_vec(),
             vec![
@@ -423,9 +423,9 @@ fn test_mvcc_get_at_snapshot_boundaries() {
         );
     }
 
-    assert_eq!(mvcc_get_at(&mvcc, b"k", 9), None);
-    assert_eq!(mvcc_get_at(&mvcc, b"k", 10), Some(Some(b"v1".to_vec())));
-    assert_eq!(mvcc_get_at(&mvcc, b"k", 25), Some(None));
+    assert_eq!(mvcc_get_at(&mvcc, b"k", 9).await, None);
+    assert_eq!(mvcc_get_at(&mvcc, b"k", 10).await, Some(Some(b"v1".to_vec())));
+    assert_eq!(mvcc_get_at(&mvcc, b"k", 25).await, Some(None));
 }
 
 #[test]
@@ -502,7 +502,7 @@ async fn test_mvcc_read_handle_admin_abort() {
     let node = StorageNode::open(dir.path()).await.unwrap();
 
     {
-        let mut mvcc = node.mvcc.lock().unwrap();
+        let mut mvcc = node.mvcc.write().await;
         mvcc.insert(
             b"k".to_vec(),
             vec![MvccVersion {
@@ -516,12 +516,12 @@ async fn test_mvcc_read_handle_admin_abort() {
     let id = handle.id().unwrap();
     assert!(node.list_active_reads().iter().any(|r| r.id == id));
     assert_eq!(
-        node.mvcc_get(&mut handle, b"k").unwrap(),
+        node.mvcc_get(&mut handle, b"k").await.unwrap(),
         Some(b"v".to_vec())
     );
 
     assert!(node.abort_active_read(id));
-    let err = node.mvcc_get(&mut handle, b"k").unwrap_err();
+    let err = node.mvcc_get(&mut handle, b"k").await.unwrap_err();
     assert!(format!("{err}").contains("aborted"));
 
     drop(handle);
@@ -533,7 +533,7 @@ async fn test_mvcc_read_handle_timeout() {
     let node = StorageNode::open(dir.path()).await.unwrap();
 
     {
-        let mut mvcc = node.mvcc.lock().unwrap();
+        let mut mvcc = node.mvcc.write().await;
         mvcc.insert(
             b"k".to_vec(),
             vec![MvccVersion {
@@ -545,7 +545,7 @@ async fn test_mvcc_read_handle_timeout() {
 
     let mut handle = node.begin_mvcc_ro_with_timeout(Some(Duration::from_millis(1)));
     tokio::time::sleep(Duration::from_millis(5)).await;
-    let err = node.mvcc_get(&mut handle, b"k").unwrap_err();
+    let err = node.mvcc_get(&mut handle, b"k").await.unwrap_err();
     assert!(matches!(err, crate::Error::TxnTimeout));
     assert!(!handle.is_active());
 }
@@ -556,7 +556,7 @@ async fn test_wal_truncation_keeps_current_segment() {
     let node = StorageNode::open(dir.path()).await.unwrap();
 
     let page = make_page(1);
-    node.put(1, &page);
+    node.put(1, &page).await;
     node.checkpoint().await.unwrap();
 
     let segments_before = list_wal_segments(dir.path()).await.unwrap();
@@ -649,7 +649,7 @@ async fn test_checkpoint_and_truncate() {
     let node = StorageNode::open(dir.path()).await.unwrap();
 
     let page = make_page(1);
-    node.put(1, &page);
+    node.put(1, &page).await;
 
     let deleted = node.checkpoint_and_truncate().await.unwrap();
     assert_eq!(deleted, 0);
@@ -746,7 +746,7 @@ async fn test_metrics_snapshot_exposes_core_fields() {
     let node = StorageNode::open(dir.path()).await.unwrap();
 
     let page = make_page(7);
-    node.put(7, &page);
+    node.put(7, &page).await;
     let _ = node.get(7).await;
     let _ = node.get(9999).await;
     let _ = node.checkpoint().await;
@@ -782,7 +782,7 @@ async fn test_checkpoint_sync_failure_is_reported_and_recovers() {
     let node = StorageNode::open(dir.path()).await.unwrap();
 
     let page = make_page(4);
-    node.put(4, &page);
+    node.put(4, &page).await;
 
     node.page_store().inject_fail_next_checkpoint_sync();
     let err = node.checkpoint().await.unwrap_err();

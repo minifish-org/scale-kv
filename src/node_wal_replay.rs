@@ -16,7 +16,7 @@ use tokio::sync::mpsc::Receiver;
 pub(super) async fn wal_replay_loop(
     replay: PageStoreReplay,
     mut rx: Receiver<super::WalBatch>,
-    mvcc: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
+    mvcc: Arc<tokio::sync::RwLock<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
     request_index: Arc<tokio::sync::RwLock<HashMap<u64, u64>>>,
     active_reads: Arc<ActiveReads>,
     durable_lsn: Arc<std::sync::atomic::AtomicU64>,
@@ -35,7 +35,7 @@ pub(super) async fn wal_replay_loop(
         }
 
         // Apply txn MVCC records if this batch ends with a commit marker.
-        apply_txn_batch_to_mvcc(&mvcc, &batch);
+        apply_txn_batch_to_mvcc(&mvcc, &batch).await;
 
         let mut last_seen = replay.last_applied();
         for record in batch.records.into_iter() {
@@ -87,7 +87,7 @@ pub(super) async fn wal_replay_loop(
             let watermark = active_reads.min_read_lsn().unwrap_or(durable).min(durable);
             let started = Instant::now();
             let (keys_touched, versions_removed) = {
-                let mut store = mvcc.lock().unwrap();
+                let mut store = mvcc.write().await;
                 gc_mvcc_versions(&mut store, watermark)
             };
             let ms = started.elapsed().as_millis() as u64;
@@ -136,7 +136,7 @@ pub(super) async fn replay_page_records(
         }
         apply_wal_record(&mut page, &record)?;
     }
-    replay.write_page(page_id, &page, max_lsn)?;
+    replay.write_page(page_id, &page, max_lsn).await?;
     replay.update_last_applied(max_lsn).await;
     Ok(())
 }
@@ -145,8 +145,8 @@ pub(super) async fn replay_wal_segments_to_store(
     dir: &std::path::Path,
     page_store: Arc<PageStore>,
     last_applied_lsn: u64,
-    page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
-    mvcc: &Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
+    page_index: Arc<tokio::sync::RwLock<HashSet<PageId>>>,
+    mvcc: &Arc<tokio::sync::RwLock<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
     request_index: &Arc<tokio::sync::RwLock<HashMap<u64, u64>>>,
 ) -> Result<()> {
     let mut segments = list_wal_segments(dir).await?;
@@ -177,7 +177,7 @@ pub(super) async fn replay_wal_segments_to_store(
                     .await
                     .insert(batch.request_id, batch.end_lsn);
             }
-            apply_txn_batch_to_mvcc(mvcc, &batch);
+            apply_txn_batch_to_mvcc(mvcc, &batch).await;
 
             for record in batch.records {
                 if record.lsn <= replay.last_applied() {

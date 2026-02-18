@@ -45,7 +45,7 @@ pub(super) async fn maybe_checkpoint_with_config(
     config: &CheckpointConfig,
     metrics: &Arc<StorageMetricsInner>,
 ) -> Result<bool> {
-    if page_store.should_checkpoint(config) {
+    if page_store.should_checkpoint(config).await {
         checkpoint_with_metrics(page_store, metrics).await?;
         Ok(true)
     } else {

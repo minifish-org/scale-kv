@@ -160,7 +160,7 @@ async fn test_secondary_btree_index_create_and_query_eq() {
                 .create_btree_secondary_index("tag", 0, 2)
                 .await
                 .unwrap();
-            let defs = compute.list_secondary_indexes();
+            let defs = compute.list_secondary_indexes().await;
             assert_eq!(defs.len(), 1);
             assert_eq!(defs[0].name, "tag");
 
@@ -302,12 +302,12 @@ async fn test_secondary_index_catalog_persist_and_recover() {
                 .create_btree_secondary_index("region", 0, 2)
                 .await
                 .unwrap();
-            let defs = compute1.list_secondary_indexes();
+            let defs = compute1.list_secondary_indexes().await;
             assert_eq!(defs.len(), 1);
             assert_eq!(defs[0].name, "region");
 
             let compute2 = EmbeddedCompute::connect(&addrs, 1, &local).await.unwrap();
-            let defs2 = compute2.list_secondary_indexes();
+            let defs2 = compute2.list_secondary_indexes().await;
             assert_eq!(defs2.len(), 1);
             assert_eq!(defs2[0].name, "region");
             let got = compute2

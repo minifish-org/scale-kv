@@ -202,7 +202,7 @@ impl AsyncPageProvider for InMemoryPageProvider {
 pub const DEFAULT_PAGE_CACHE_SHARDS: usize = 64;
 
 pub struct PageCache {
-    shards: Vec<std::sync::Mutex<lru::LruCache<PageId, Arc<Page>>>>,
+    shards: Vec<parking_lot::Mutex<lru::LruCache<PageId, Arc<Page>>>>,
     latches: Arc<PageLatchTable>,
 }
 
@@ -222,7 +222,7 @@ impl PageCache {
 
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
-            out.push(std::sync::Mutex::new(lru::LruCache::new(per)));
+            out.push(parking_lot::Mutex::new(lru::LruCache::new(per)));
         }
         Self {
             shards: out,
@@ -240,7 +240,7 @@ impl PageCache {
 
     pub fn get_arc(&self, page_id: PageId) -> Option<Arc<Page>> {
         let idx = self.shard(page_id);
-        self.shards[idx].lock().unwrap().get(&page_id).cloned()
+        self.shards[idx].lock().get(&page_id).cloned()
     }
 
     pub fn insert(&self, page_id: PageId, page: Page) {
@@ -249,23 +249,23 @@ impl PageCache {
 
     pub fn insert_arc(&self, page_id: PageId, page: Arc<Page>) {
         let idx = self.shard(page_id);
-        self.shards[idx].lock().unwrap().put(page_id, page);
+        self.shards[idx].lock().put(page_id, page);
     }
 
     pub fn contains(&self, page_id: PageId) -> bool {
         let idx = self.shard(page_id);
-        self.shards[idx].lock().unwrap().contains(&page_id)
+        self.shards[idx].lock().contains(&page_id)
     }
 
     pub fn remove(&self, page_id: PageId) {
         let idx = self.shard(page_id);
-        let _ = self.shards[idx].lock().unwrap().pop(&page_id);
+        let _ = self.shards[idx].lock().pop(&page_id);
     }
 
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.lock().unwrap().len())
+            .map(|shard| shard.lock().len())
             .sum()
     }
 
@@ -350,11 +350,10 @@ impl PageBPlusTree<InMemoryPageProvider> {
     pub fn new() -> Self {
         let provider = InMemoryPageProvider::new();
         let root_id = provider.alloc_page_id();
-        futures::executor::block_on(async {
-            provider
-                .write_page(root_id, new_page(PAGE_TYPE_LEAF, 0))
-                .await;
-        });
+        provider
+            .pages
+            .borrow_mut()
+            .insert(root_id, new_page(PAGE_TYPE_LEAF, 0));
         provider.set_root_page_id(root_id);
         Self {
             provider,
@@ -380,13 +379,11 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     }
 
     /// Create a new B+Tree, initializing the root page in the provider.
-    pub fn new_with_provider(provider: P) -> Self {
+    pub async fn new_with_provider(provider: P) -> Self {
         let root_id = provider.alloc_page_id();
-        futures::executor::block_on(async {
-            provider
-                .write_page(root_id, new_page(PAGE_TYPE_LEAF, 0))
-                .await;
-        });
+        provider
+            .write_page(root_id, new_page(PAGE_TYPE_LEAF, 0))
+            .await;
         provider.set_root_page_id(root_id);
         Self {
             provider,

@@ -191,7 +191,7 @@ pub struct PageStore {
     cache_misses: AtomicU64,
     #[cfg(test)]
     fail_next_checkpoint_sync: AtomicBool,
-    last_checkpoint: std::sync::Mutex<Instant>,
+    last_checkpoint: Mutex<Instant>,
     shutdown: AtomicBool,
 }
 
@@ -220,7 +220,7 @@ impl PageStore {
             cache_misses: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_checkpoint_sync: AtomicBool::new(false),
-            last_checkpoint: std::sync::Mutex::new(Instant::now()),
+            last_checkpoint: Mutex::new(Instant::now()),
             shutdown: AtomicBool::new(false),
         })
     }
@@ -396,14 +396,14 @@ impl PageStore {
             write_checkpoint_state(&self.dir, max_lsn).await?;
         }
 
-        *self.last_checkpoint.lock().unwrap() = Instant::now();
+        *self.last_checkpoint.lock().await = Instant::now();
 
         Ok(())
     }
 
-    pub fn should_checkpoint(&self, config: &CheckpointConfig) -> bool {
+    pub async fn should_checkpoint(&self, config: &CheckpointConfig) -> bool {
         let stats = self.buffer_stats();
-        let elapsed = self.last_checkpoint.lock().unwrap().elapsed();
+        let elapsed = self.last_checkpoint.lock().await.elapsed();
 
         stats.dirty_count > config.max_dirty_pages
             || stats.dirty_bytes > config.max_dirty_bytes
@@ -411,7 +411,7 @@ impl PageStore {
     }
 
     pub async fn maybe_checkpoint(&self, config: &CheckpointConfig) -> Result<bool> {
-        if self.should_checkpoint(config) {
+        if self.should_checkpoint(config).await {
             self.checkpoint().await?;
             Ok(true)
         } else {

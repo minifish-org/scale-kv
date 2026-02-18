@@ -215,13 +215,13 @@ async fn test_should_checkpoint_by_dirty_count() {
         let page = make_page(i);
         store.put(i as u64, &page, i as u64 + 1).unwrap();
     }
-    assert!(!store.should_checkpoint(&config));
+    assert!(!store.should_checkpoint(&config).await);
 
     for i in 4..6 {
         let page = make_page(i);
         store.put(i as u64, &page, i as u64 + 1).unwrap();
     }
-    assert!(store.should_checkpoint(&config));
+    assert!(store.should_checkpoint(&config).await);
 }
 
 #[tokio::test]
@@ -236,15 +236,15 @@ async fn test_should_checkpoint_by_dirty_bytes() {
 
     let page = make_page(1);
     store.put(1, &page, 1).unwrap();
-    assert!(!store.should_checkpoint(&config));
+    assert!(!store.should_checkpoint(&config).await);
 
     let page = make_page(2);
     store.put(2, &page, 2).unwrap();
-    assert!(!store.should_checkpoint(&config));
+    assert!(!store.should_checkpoint(&config).await);
 
     let page = make_page(3);
     store.put(3, &page, 3).unwrap();
-    assert!(store.should_checkpoint(&config));
+    assert!(store.should_checkpoint(&config).await);
 }
 
 #[tokio::test]
@@ -259,10 +259,10 @@ async fn test_should_checkpoint_by_interval() {
 
     let page = make_page(1);
     store.put(1, &page, 1).unwrap();
-    assert!(!store.should_checkpoint(&config));
+    assert!(!store.should_checkpoint(&config).await);
 
     tokio::time::sleep(Duration::from_millis(60)).await;
-    assert!(store.should_checkpoint(&config));
+    assert!(store.should_checkpoint(&config).await);
 }
 
 #[tokio::test]

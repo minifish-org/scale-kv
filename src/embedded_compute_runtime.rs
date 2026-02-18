@@ -5,27 +5,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 
 #[derive(Default)]
 pub(crate) struct InProcessPageStore {
-    pages: std::sync::Mutex<HashMap<PageId, Page>>,
+    pages: RwLock<HashMap<PageId, Page>>,
 }
 
 impl InProcessPageStore {
-    pub(crate) fn get(&self, page_id: PageId) -> Option<Page> {
-        self.pages
-            .lock()
-            .expect("inprocess page store lock poisoned")
-            .get(&page_id)
-            .cloned()
+    pub(crate) async fn get(&self, page_id: PageId) -> Option<Page> {
+        self.pages.read().await.get(&page_id).cloned()
     }
 
-    pub(crate) fn put_pages(&self, pages: Vec<(PageId, Page)>) {
-        let mut guard = self
-            .pages
-            .lock()
-            .expect("inprocess page store lock poisoned");
+    pub(crate) async fn put_pages(&self, pages: Vec<(PageId, Page)>) {
+        let mut guard = self.pages.write().await;
         for (page_id, page) in pages {
             guard.insert(page_id, page);
         }
@@ -101,7 +94,7 @@ impl InProcessSequencer {
         end_lsn: u64,
         pages: Vec<(PageId, Page)>,
     ) -> Result<u64> {
-        self.page_store.put_pages(pages);
+        self.page_store.put_pages(pages).await;
         self.durable_lsn.fetch_max(end_lsn, Ordering::AcqRel);
         Ok(end_lsn)
     }

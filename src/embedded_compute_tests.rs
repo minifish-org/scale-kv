@@ -42,7 +42,8 @@ fn test_inprocess_sequencer_validation_and_commit() {
     });
 
     assert_eq!(seq.durable_lsn(), end_lsn);
-    assert_eq!(store.get(42), Some(page));
+    let got = rt.block_on(store.get(42));
+    assert_eq!(got, Some(page));
 }
 
 #[tokio::test(flavor = "current_thread")]

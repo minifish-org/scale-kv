@@ -2,7 +2,7 @@ use super::*;
 
 impl EmbeddedCompute {
     pub(super) async fn persist_secondary_index_catalog(&self) -> Result<()> {
-        let defs = self.secondary_indexes.list_indexes();
+        let defs = self.secondary_indexes.list_indexes().await;
         let posting_log = { self.secondary_posting_log.lock().await.clone() };
         let page = encode_secondary_index_catalog(&SecondaryIndexCatalog { defs, posting_log })?;
         let _ = self
@@ -16,13 +16,14 @@ impl EmbeddedCompute {
             .get_page(SECONDARY_INDEX_META_PAGE_ID, self.durable_lsn())
             .await
         else {
-            self.secondary_indexes.replace_definitions(Vec::new())?;
+            self.secondary_indexes.replace_definitions(Vec::new()).await?;
             *self.secondary_posting_log.lock().await = SecondaryPostingLogState::default();
             return Ok(());
         };
         let catalog = decode_secondary_index_catalog(&page)?;
         self.secondary_indexes
-            .replace_definitions(catalog.defs.clone())?;
+            .replace_definitions(catalog.defs.clone())
+            .await?;
         *self.secondary_posting_log.lock().await = catalog.posting_log;
         Ok(())
     }
@@ -81,7 +82,7 @@ impl EmbeddedCompute {
             .into_iter()
             .map(|(pid, p)| (pid, Page::from(p)))
             .collect::<Vec<_>>();
-        let defs = self.secondary_indexes.list_indexes();
+        let defs = self.secondary_indexes.list_indexes().await;
         let page = encode_secondary_index_catalog(&SecondaryIndexCatalog {
             defs,
             posting_log: state.clone(),
@@ -106,7 +107,7 @@ impl EmbeddedCompute {
                 .ok_or(Error::InMemoryPageMissing(page_id))?;
             let records = decode_posting_records(&page)?;
             for (lsn, m) in records {
-                self.secondary_indexes.apply_commit(lsn, &[m]);
+                self.secondary_indexes.apply_commit(lsn, &[m]).await;
                 count += 1;
             }
             page_id = read_next_page_id(&page)?;
@@ -134,7 +135,8 @@ impl EmbeddedCompute {
                 value_arr.copy_from_slice(&value);
                 let muts =
                     self.secondary_indexes
-                        .plan_mutations(key_arr, None, Some(&value_arr))?;
+                        .plan_mutations(key_arr, None, Some(&value_arr))
+                        .await?;
                 for m in muts {
                     if m.index_name == index_name {
                         chunk.push(m);
@@ -142,7 +144,7 @@ impl EmbeddedCompute {
                 }
                 out_count += 1;
                 if chunk.len() >= 1024 {
-                    self.secondary_indexes.apply_commit(commit_lsn, &chunk);
+                    self.secondary_indexes.apply_commit(commit_lsn, &chunk).await;
                     self.append_secondary_posting_log(commit_lsn, &chunk)
                         .await?;
                     chunk.clear();
@@ -150,7 +152,7 @@ impl EmbeddedCompute {
             }
         }
         if !chunk.is_empty() {
-            self.secondary_indexes.apply_commit(commit_lsn, &chunk);
+            self.secondary_indexes.apply_commit(commit_lsn, &chunk).await;
             self.append_secondary_posting_log(commit_lsn, &chunk)
                 .await?;
         }
@@ -158,7 +160,7 @@ impl EmbeddedCompute {
     }
 
     pub(super) async fn backfill_all_secondary_indexes(&self) -> Result<()> {
-        let defs = self.secondary_indexes.list_indexes();
+        let defs = self.secondary_indexes.list_indexes().await;
         for d in defs {
             self.backfill_secondary_index(&d.name).await?;
         }
@@ -237,7 +239,7 @@ impl EmbeddedCompute {
         tx.write_page(META_PAGE_ID, meta.encode());
 
         tx.commit().await?;
-        self.secondary_indexes.replace_definitions(Vec::new())?;
+        self.secondary_indexes.replace_definitions(Vec::new()).await?;
         self.persist_secondary_index_catalog().await?;
         Ok(())
     }

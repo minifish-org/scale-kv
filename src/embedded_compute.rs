@@ -200,7 +200,7 @@ impl EmbeddedCompute {
             dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>,
         > = Arc::new(move |pid, _need| {
             let page_store = Arc::clone(&page_store);
-            Box::pin(async move { page_store.get(pid) })
+            Box::pin(async move { page_store.get(pid).await })
         });
 
         let next_page_id = Arc::new(AtomicU64::new(1));
@@ -556,13 +556,14 @@ impl EmbeddedCompute {
         value_len: usize,
     ) -> Result<()> {
         self.secondary_indexes
-            .create_btree_index(name, value_offset, value_len)?;
+            .create_btree_index(name, value_offset, value_len)
+            .await?;
         if let Err(err) = self.persist_secondary_index_catalog().await {
-            let _ = self.secondary_indexes.drop_index(name);
+            let _ = self.secondary_indexes.drop_index(name).await;
             return Err(err);
         }
         if let Err(err) = self.backfill_secondary_index(name).await {
-            let _ = self.secondary_indexes.drop_index(name);
+            let _ = self.secondary_indexes.drop_index(name).await;
             let _ = self.persist_secondary_index_catalog().await;
             return Err(err);
         }
@@ -571,7 +572,7 @@ impl EmbeddedCompute {
 
     /// Drop a previously created secondary index. Returns whether an index was removed.
     pub async fn drop_secondary_index(&self, name: &str) -> Result<bool> {
-        let dropped = self.secondary_indexes.drop_index(name);
+        let dropped = self.secondary_indexes.drop_index(name).await;
         if dropped {
             self.persist_secondary_index_catalog().await?;
         }
@@ -579,8 +580,8 @@ impl EmbeddedCompute {
     }
 
     /// List all configured secondary indexes.
-    pub fn list_secondary_indexes(&self) -> Vec<SecondaryIndexDefinition> {
-        self.secondary_indexes.list_indexes()
+    pub async fn list_secondary_indexes(&self) -> Vec<SecondaryIndexDefinition> {
+        self.secondary_indexes.list_indexes().await
     }
 
     /// Query one secondary index with exact-match semantics at a read-only snapshot.
@@ -994,7 +995,7 @@ impl EmbeddedTxn {
         }
 
         pages.insert(tail_page_id, Page::from(tail_page));
-        let defs = self.compute.secondary_indexes.list_indexes();
+        let defs = self.compute.secondary_indexes.list_indexes().await;
         let catalog_page = encode_secondary_index_catalog(&SecondaryIndexCatalog {
             defs,
             posting_log: state.clone(),
@@ -1170,7 +1171,7 @@ impl EmbeddedTxn {
             key_arr,
             old_value.as_ref(),
             Some(&new_value),
-        )?;
+        ).await?;
 
         let mut row = LeafValue {
             value: new_value,
@@ -1320,7 +1321,7 @@ impl EmbeddedTxn {
             secondary_key,
             self.read_lsn,
             limit,
-        )?;
+        ).await?;
         let mut out = Vec::with_capacity(pks.len());
         for pk in pks {
             let key = pk.to_vec();
@@ -1378,10 +1379,11 @@ impl EmbeddedTxn {
         if let Some(old) = existing {
             let key_arr: [u8; KEY_SIZE] = key.try_into().unwrap();
             let old_value = Self::value_array_from_ref(&old);
-            let planned_mutations =
-                self.compute
-                    .secondary_indexes
-                    .plan_mutations(key_arr, Some(&old_value), None)?;
+            let planned_mutations = self
+                .compute
+                .secondary_indexes
+                .plan_mutations(key_arr, Some(&old_value), None)
+                .await?;
             if (old.meta.flags & FLAG_INTENT) != 0
                 && self.undo_txn_id != Some(old.meta.intent_txn_id)
             {
@@ -1689,7 +1691,8 @@ impl EmbeddedTxn {
         if out.is_ok() {
             self.compute
                 .secondary_indexes
-                .apply_commit(commit_lsn, &self.secondary_mutations);
+                .apply_commit(commit_lsn, &self.secondary_mutations)
+                .await;
             if let Some(mut posting_state_guard) = posting_state_guard_opt {
                 if let Some(secondary_state_after) = secondary_state_after_opt {
                     *posting_state_guard = secondary_state_after;

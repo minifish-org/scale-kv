@@ -98,7 +98,7 @@ async fn test_range_across_splits() {
 #[tokio::test(flavor = "current_thread")]
 async fn test_with_custom_provider() {
     let provider = InMemoryPageProvider::new();
-    let tree = PageBPlusTree::new_with_provider(provider);
+    let tree = PageBPlusTree::new_with_provider(provider).await;
 
     let key = key_for(2);
     let slot = LeafValue {
@@ -148,7 +148,7 @@ async fn test_shared_page_provider() {
     let next_page_id = Arc::new(AtomicU64::new(1));
 
     let provider = SharedPageProvider::new(pages.clone(), next_page_id.clone());
-    let tree = PageBPlusTree::new_with_provider(provider);
+    let tree = PageBPlusTree::new_with_provider(provider).await;
 
     let key = key_for(3);
     let slot = LeafValue {
@@ -176,7 +176,7 @@ async fn test_concurrent_inserts_split_safety() {
     let provider = SharedPageProvider::new(Arc::clone(&pages), Arc::clone(&next_page_id));
 
     // Initialize root once; other tree handles share provider state and latch table.
-    let _tree = PageBPlusTree::new_with_provider(provider.clone());
+    let _tree = PageBPlusTree::new_with_provider(provider.clone()).await;
 
     let workers = 6u32;
     let per_worker = 180u32;
@@ -240,7 +240,7 @@ async fn test_concurrent_mixed_workload_delete_rebalance_safety() {
     let pages = Arc::new(PageCache::new_with_capacity(16, 1024));
     let next_page_id = Arc::new(AtomicU64::new(1));
     let provider = SharedPageProvider::new(Arc::clone(&pages), Arc::clone(&next_page_id));
-    let _tree = PageBPlusTree::new_with_provider(provider.clone());
+    let _tree = PageBPlusTree::new_with_provider(provider.clone()).await;
 
     let workers = 8u32;
     let ops_per_worker = 500u32;
@@ -374,6 +374,6 @@ async fn test_page_cache_and_provider_default_paths() {
     provider.set_root_page_id(33);
     assert_eq!(provider.root_page_id(), 33);
 
-    let _tree = PageBPlusTree::new_with_provider(provider.clone());
+    let _tree = PageBPlusTree::new_with_provider(provider.clone()).await;
     assert!(provider.root_page_id() > 0);
 }

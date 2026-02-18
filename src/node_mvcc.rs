@@ -2,8 +2,8 @@ use super::{MvccVersion, WAL_OP_TXN_COMMIT, WAL_OP_TXN_DEL, WAL_OP_TXN_PUT, WalB
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub(super) fn apply_txn_batch_to_mvcc(
-    mvcc: &Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
+pub(super) async fn apply_txn_batch_to_mvcc(
+    mvcc: &Arc<tokio::sync::RwLock<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
     batch: &WalBatch,
 ) {
     if batch.records.is_empty() {
@@ -15,7 +15,7 @@ pub(super) fn apply_txn_batch_to_mvcc(
     }
     let commit_lsn = batch.end_lsn;
 
-    let mut store = mvcc.lock().unwrap();
+    let mut store = mvcc.write().await;
     for record in &batch.records {
         match record.op {
             WAL_OP_TXN_PUT => {
@@ -42,12 +42,12 @@ pub(super) fn apply_txn_batch_to_mvcc(
     }
 }
 
-pub(super) fn mvcc_get_at(
-    mvcc: &Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
+pub(super) async fn mvcc_get_at(
+    mvcc: &Arc<tokio::sync::RwLock<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
     key: &[u8],
     read_lsn: u64,
 ) -> Option<Option<Vec<u8>>> {
-    let store = mvcc.lock().unwrap();
+    let store = mvcc.read().await;
     let versions = store.get(key)?;
     versions
         .iter()

@@ -1,6 +1,6 @@
 use crate::{Error, KEY_SIZE, VALUE_SIZE};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::RwLock;
+use tokio::sync::RwLock;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SecondaryIndexKind {
@@ -47,7 +47,7 @@ pub struct SecondaryIndexManager {
 }
 
 impl SecondaryIndexManager {
-    pub fn replace_definitions(&self, defs: Vec<SecondaryIndexDefinition>) -> crate::Result<()> {
+    pub async fn replace_definitions(&self, defs: Vec<SecondaryIndexDefinition>) -> crate::Result<()> {
         let mut new_map: HashMap<String, SecondaryIndexState> = HashMap::new();
         for def in defs {
             if def.name.is_empty() {
@@ -84,12 +84,12 @@ impl SecondaryIndexManager {
                 },
             );
         }
-        let mut guard = self.indexes.write().expect("secondary index lock poisoned");
+        let mut guard = self.indexes.write().await;
         *guard = new_map;
         Ok(())
     }
 
-    pub fn create_btree_index(
+    pub async fn create_btree_index(
         &self,
         name: &str,
         value_offset: usize,
@@ -124,7 +124,7 @@ impl SecondaryIndexManager {
                 value_len,
             },
         };
-        let mut guard = self.indexes.write().expect("secondary index lock poisoned");
+        let mut guard = self.indexes.write().await;
         if guard.contains_key(name) {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -141,28 +141,24 @@ impl SecondaryIndexManager {
         Ok(())
     }
 
-    pub fn drop_index(&self, name: &str) -> bool {
-        self.indexes
-            .write()
-            .expect("secondary index lock poisoned")
-            .remove(name)
-            .is_some()
+    pub async fn drop_index(&self, name: &str) -> bool {
+        self.indexes.write().await.remove(name).is_some()
     }
 
-    pub fn list_indexes(&self) -> Vec<SecondaryIndexDefinition> {
-        let guard = self.indexes.read().expect("secondary index lock poisoned");
+    pub async fn list_indexes(&self) -> Vec<SecondaryIndexDefinition> {
+        let guard = self.indexes.read().await;
         let mut out = guard.values().map(|s| s.def.clone()).collect::<Vec<_>>();
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
-    pub fn plan_mutations(
+    pub async fn plan_mutations(
         &self,
         primary_key: [u8; KEY_SIZE],
         old_value: Option<&[u8; VALUE_SIZE]>,
         new_value: Option<&[u8; VALUE_SIZE]>,
     ) -> crate::Result<Vec<SecondaryIndexMutation>> {
-        let guard = self.indexes.read().expect("secondary index lock poisoned");
+        let guard = self.indexes.read().await;
         let mut out = Vec::new();
         for state in guard.values() {
             match state.def.kind {
@@ -199,12 +195,12 @@ impl SecondaryIndexManager {
         Ok(out)
     }
 
-    pub fn apply_commit(&self, commit_lsn: u64, mutations: &[SecondaryIndexMutation]) {
+    pub async fn apply_commit(&self, commit_lsn: u64, mutations: &[SecondaryIndexMutation]) {
         if mutations.is_empty() {
             return;
         }
 
-        let mut guard = self.indexes.write().expect("secondary index lock poisoned");
+        let mut guard = self.indexes.write().await;
         for m in mutations {
             let Some(state) = guard.get_mut(&m.index_name) else {
                 continue;
@@ -230,7 +226,7 @@ impl SecondaryIndexManager {
         }
     }
 
-    pub fn query_equal(
+    pub async fn query_equal(
         &self,
         index_name: &str,
         secondary_key: &[u8],
@@ -240,7 +236,7 @@ impl SecondaryIndexManager {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let guard = self.indexes.read().expect("secondary index lock poisoned");
+        let guard = self.indexes.read().await;
         let Some(state) = guard.get(index_name) else {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -279,10 +275,10 @@ fn visible_membership(versions: &[PostingVersion], read_lsn: u64) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_snapshot_visibility_on_membership_history() {
+    #[tokio::test]
+    async fn test_snapshot_visibility_on_membership_history() {
         let m = SecondaryIndexManager::default();
-        m.create_btree_index("tag", 0, 2).unwrap();
+        m.create_btree_index("tag", 0, 2).await.unwrap();
         let pk = [7u8; KEY_SIZE];
 
         let mut v1 = [0u8; VALUE_SIZE];
@@ -290,25 +286,25 @@ mod tests {
         let mut v2 = [0u8; VALUE_SIZE];
         v2[0..2].copy_from_slice(b"bb");
 
-        let muts = m.plan_mutations(pk, None, Some(&v1)).unwrap();
-        m.apply_commit(10, &muts);
-        let muts = m.plan_mutations(pk, Some(&v1), Some(&v2)).unwrap();
-        m.apply_commit(20, &muts);
+        let muts = m.plan_mutations(pk, None, Some(&v1)).await.unwrap();
+        m.apply_commit(10, &muts).await;
+        let muts = m.plan_mutations(pk, Some(&v1), Some(&v2)).await.unwrap();
+        m.apply_commit(20, &muts).await;
 
-        let q10 = m.query_equal("tag", b"aa", 10, 10).unwrap();
+        let q10 = m.query_equal("tag", b"aa", 10, 10).await.unwrap();
         assert_eq!(q10, vec![pk]);
-        let q15 = m.query_equal("tag", b"aa", 15, 10).unwrap();
+        let q15 = m.query_equal("tag", b"aa", 15, 10).await.unwrap();
         assert_eq!(q15, vec![pk]);
-        let q20 = m.query_equal("tag", b"aa", 20, 10).unwrap();
+        let q20 = m.query_equal("tag", b"aa", 20, 10).await.unwrap();
         assert!(q20.is_empty());
-        let q20b = m.query_equal("tag", b"bb", 20, 10).unwrap();
+        let q20b = m.query_equal("tag", b"bb", 20, 10).await.unwrap();
         assert_eq!(q20b, vec![pk]);
     }
 
-    #[test]
-    fn test_same_commit_last_mutation_wins() {
+    #[tokio::test]
+    async fn test_same_commit_last_mutation_wins() {
         let m = SecondaryIndexManager::default();
-        m.create_btree_index("tag", 0, 1).unwrap();
+        m.create_btree_index("tag", 0, 1).await.unwrap();
         let pk = [1u8; KEY_SIZE];
         m.apply_commit(
             42,
@@ -326,37 +322,38 @@ mod tests {
                     present: false,
                 },
             ],
-        );
-        let q = m.query_equal("tag", &[1], 42, 10).unwrap();
+        )
+        .await;
+        let q = m.query_equal("tag", &[1], 42, 10).await.unwrap();
         assert!(q.is_empty());
     }
 
-    #[test]
-    fn test_plan_mutations_noop_when_key_unchanged() {
+    #[tokio::test]
+    async fn test_plan_mutations_noop_when_key_unchanged() {
         let m = SecondaryIndexManager::default();
-        m.create_btree_index("ix", 4, 4).unwrap();
+        m.create_btree_index("ix", 4, 4).await.unwrap();
         let pk = [2u8; KEY_SIZE];
         let mut v = [0u8; VALUE_SIZE];
         v[4..8].copy_from_slice(&[1, 2, 3, 4]);
-        let muts = m.plan_mutations(pk, Some(&v), Some(&v)).unwrap();
+        let muts = m.plan_mutations(pk, Some(&v), Some(&v)).await.unwrap();
         assert!(muts.is_empty());
     }
 
-    #[test]
-    fn test_create_and_drop_index() {
+    #[tokio::test]
+    async fn test_create_and_drop_index() {
         let m = SecondaryIndexManager::default();
-        m.create_btree_index("ix", 0, 1).unwrap();
-        let defs = m.list_indexes();
+        m.create_btree_index("ix", 0, 1).await.unwrap();
+        let defs = m.list_indexes().await;
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "ix");
-        assert!(m.drop_index("ix"));
-        assert!(!m.drop_index("ix"));
+        assert!(m.drop_index("ix").await);
+        assert!(!m.drop_index("ix").await);
     }
 
-    #[test]
-    fn test_query_returns_not_found_for_missing_index() {
+    #[tokio::test]
+    async fn test_query_returns_not_found_for_missing_index() {
         let m = SecondaryIndexManager::default();
-        let err = m.query_equal("missing", b"x", 1, 10).unwrap_err();
+        let err = m.query_equal("missing", b"x", 1, 10).await.unwrap_err();
         match err {
             Error::Io(ioe) => assert_eq!(ioe.kind(), std::io::ErrorKind::NotFound),
             other => panic!("unexpected error: {:?}", other),
