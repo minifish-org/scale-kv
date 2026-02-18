@@ -1,4 +1,7 @@
 use crate::compute_sequencer::ComputeSequencer;
+use crate::embedded_compute_runtime::{
+    InProcessPageStore, InProcessSequencer, PendingTxn, Sequencer,
+};
 use crate::meta_page::{META_PAGE_ID, MetaPage};
 use crate::page_bptree::{
     AsyncPageProvider, DEFAULT_PAGE_CACHE_SHARDS, LeafValue, LeafValueMeta, LeafValueRef,
@@ -30,175 +33,18 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use tokio::task::LocalSet;
+
+#[path = "embedded_compute_recovery.rs"]
+mod embedded_compute_recovery;
+#[path = "embedded_compute_visibility.rs"]
+mod embedded_compute_visibility;
 
 const FLAG_TOMBSTONE: u16 = 1;
 const FLAG_INTENT: u16 = 2;
-
-#[derive(Default)]
-pub struct InProcessPageStore {
-    pages: std::sync::Mutex<HashMap<PageId, Page>>,
-}
-
-impl InProcessPageStore {
-    pub fn get(&self, page_id: PageId) -> Option<Page> {
-        self.pages
-            .lock()
-            .expect("inprocess page store lock poisoned")
-            .get(&page_id)
-            .cloned()
-    }
-
-    pub fn put_pages(&self, pages: Vec<(PageId, Page)>) {
-        let mut guard = self
-            .pages
-            .lock()
-            .expect("inprocess page store lock poisoned");
-        for (page_id, page) in pages {
-            guard.insert(page_id, page);
-        }
-    }
-}
-
-pub struct InProcessSequencer {
-    page_store: Arc<InProcessPageStore>,
-    next_lsn: AtomicU64,
-    request_id: AtomicU64,
-    durable_lsn: AtomicU64,
-}
-
-impl InProcessSequencer {
-    pub fn new(page_store: Arc<InProcessPageStore>) -> Self {
-        let seed = {
-            let r = rand::random::<u64>();
-            if r == 0 { 1 } else { r }
-        };
-        Self {
-            page_store,
-            next_lsn: AtomicU64::new(0),
-            request_id: AtomicU64::new(seed),
-            durable_lsn: AtomicU64::new(0),
-        }
-    }
-
-    pub fn durable_lsn(&self) -> u64 {
-        self.durable_lsn.load(Ordering::Acquire)
-    }
-
-    pub fn begin_ro(&self) -> u64 {
-        self.durable_lsn()
-    }
-
-    pub fn allocate_request_id(&self) -> u64 {
-        self.request_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    pub fn reserve_txn_with_request_id(
-        &self,
-        n_writes: usize,
-        request_id: u64,
-    ) -> Result<(u64, u64)> {
-        if n_writes == 0 {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "txn batch must be non-empty",
-            )));
-        }
-        if request_id == 0 {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "request_id must be non-zero",
-            )));
-        }
-        let n = n_writes as u64;
-        let start_lsn = self.next_lsn.fetch_add(n, Ordering::AcqRel);
-        let end_lsn = start_lsn + n;
-        Ok((start_lsn, end_lsn))
-    }
-
-    pub fn reserve_txn(&self, n_writes: usize) -> Result<(u64, u64, u64)> {
-        let request_id = self.allocate_request_id();
-        let (start_lsn, end_lsn) = self.reserve_txn_with_request_id(n_writes, request_id)?;
-        Ok((request_id, start_lsn, end_lsn))
-    }
-
-    pub async fn commit_pages_reserved(
-        &self,
-        _request_id: u64,
-        _start_lsn: u64,
-        end_lsn: u64,
-        pages: Vec<(PageId, Page)>,
-    ) -> Result<u64> {
-        self.page_store.put_pages(pages);
-        self.durable_lsn.fetch_max(end_lsn, Ordering::AcqRel);
-        Ok(end_lsn)
-    }
-}
-
-#[derive(Clone)]
-enum Sequencer {
-    Network(Arc<ComputeSequencer>),
-    InProcess(Arc<InProcessSequencer>),
-}
-
-impl Sequencer {
-    fn begin_ro(&self) -> u64 {
-        match self {
-            Self::Network(s) => s.begin_ro(),
-            Self::InProcess(s) => s.begin_ro(),
-        }
-    }
-
-    fn durable_lsn(&self) -> u64 {
-        match self {
-            Self::Network(s) => s.durable_lsn(),
-            Self::InProcess(s) => s.durable_lsn(),
-        }
-    }
-
-    fn allocate_request_id(&self) -> u64 {
-        match self {
-            Self::Network(s) => s.allocate_request_id(),
-            Self::InProcess(s) => s.allocate_request_id(),
-        }
-    }
-
-    fn reserve_txn_with_request_id(&self, n_writes: usize, request_id: u64) -> Result<(u64, u64)> {
-        match self {
-            Self::Network(s) => s.reserve_txn_with_request_id(n_writes, request_id),
-            Self::InProcess(s) => s.reserve_txn_with_request_id(n_writes, request_id),
-        }
-    }
-
-    fn reserve_txn(&self, n_writes: usize) -> Result<(u64, u64, u64)> {
-        match self {
-            Self::Network(s) => s.reserve_txn(n_writes),
-            Self::InProcess(s) => s.reserve_txn(n_writes),
-        }
-    }
-
-    async fn commit_pages_reserved(
-        &self,
-        request_id: u64,
-        start_lsn: u64,
-        end_lsn: u64,
-        pages: Vec<(PageId, Page)>,
-    ) -> Result<u64> {
-        match self {
-            Self::Network(s) => {
-                s.commit_reserved_txn_batch(request_id, start_lsn, end_lsn, pages)
-                    .await
-            }
-            Self::InProcess(s) => {
-                s.commit_pages_reserved(request_id, start_lsn, end_lsn, pages)
-                    .await
-            }
-        }
-    }
-}
 
 /// Embedded compute-side API for an Aurora-style KV (page-level redo).
 ///
@@ -218,16 +64,9 @@ pub struct EmbeddedCompute {
     tree: Arc<PageBPlusTree<TxnPageProvider>>,
     secondary_indexes: Arc<SecondaryIndexManager>,
     secondary_posting_log: Arc<Mutex<SecondaryPostingLogState>>,
-    txn_registry: Arc<Mutex<HashMap<u64, PendingTxn>>>,
+    txn_registry: Arc<Mutex<HashMap<u64, PendingTxn<KEY_SIZE>>>>,
     default_rw_txn_timeout: Duration,
     txn_reaper_interval: Duration,
-}
-
-#[derive(Clone, Debug)]
-struct PendingTxn {
-    deadline: Instant,
-    write_keys: BTreeSet<[u8; KEY_SIZE]>,
-    notify: Arc<Notify>,
 }
 
 impl EmbeddedCompute {
@@ -457,7 +296,7 @@ impl EmbeddedCompute {
             PendingTxn {
                 deadline,
                 write_keys: BTreeSet::new(),
-                notify: Arc::new(Notify::new()),
+                notify: Arc::new(tokio::sync::Notify::new()),
             },
         );
     }
@@ -469,7 +308,7 @@ impl EmbeddedCompute {
         }
     }
 
-    async fn remove_pending_txn(&self, txn_id: u64) -> Option<PendingTxn> {
+    async fn remove_pending_txn(&self, txn_id: u64) -> Option<PendingTxn<KEY_SIZE>> {
         let pending = self.txn_registry.lock().await.remove(&txn_id);
         if let Some(p) = &pending {
             p.notify.notify_waiters();
@@ -638,245 +477,6 @@ impl EmbeddedCompute {
             }
         }
         Ok(self.warmed_pages())
-    }
-
-    async fn persist_secondary_index_catalog(&self) -> Result<()> {
-        let defs = self.secondary_indexes.list_indexes();
-        let posting_log = { self.secondary_posting_log.lock().await.clone() };
-        let page = encode_secondary_index_catalog(&SecondaryIndexCatalog { defs, posting_log })?;
-        let _ = self
-            .write_pages_direct(vec![(SECONDARY_INDEX_META_PAGE_ID, page)])
-            .await?;
-        Ok(())
-    }
-
-    async fn load_secondary_index_catalog(&self) -> Result<()> {
-        let Some(page) = self
-            .get_page(SECONDARY_INDEX_META_PAGE_ID, self.durable_lsn())
-            .await
-        else {
-            self.secondary_indexes.replace_definitions(Vec::new())?;
-            *self.secondary_posting_log.lock().await = SecondaryPostingLogState::default();
-            return Ok(());
-        };
-        let catalog = decode_secondary_index_catalog(&page)?;
-        self.secondary_indexes
-            .replace_definitions(catalog.defs.clone())?;
-        *self.secondary_posting_log.lock().await = catalog.posting_log;
-        Ok(())
-    }
-
-    async fn append_secondary_posting_log(
-        &self,
-        commit_lsn: u64,
-        mutations: &[SecondaryIndexMutation],
-    ) -> Result<()> {
-        if mutations.is_empty() {
-            return Ok(());
-        }
-
-        let mut state = self.secondary_posting_log.lock().await;
-        let mut writes: BTreeMap<PageId, Vec<u8>> = BTreeMap::new();
-        let mut tail_page_id = state.tail_page_id;
-        let mut tail_page = if tail_page_id == 0 {
-            let new_id = state.next_page_id;
-            state.next_page_id = state.next_page_id.saturating_add(1);
-            state.head_page_id = new_id;
-            state.tail_page_id = new_id;
-            tail_page_id = new_id;
-            new_log_page().to_vec()
-        } else if let Some(existing) = self.page_cache.get(tail_page_id) {
-            existing.to_vec()
-        } else {
-            self.get_page(tail_page_id, self.durable_lsn())
-                .await
-                .ok_or(Error::InMemoryPageMissing(tail_page_id))?
-                .to_vec()
-        };
-
-        for m in mutations {
-            if append_posting_record(&mut tail_page, commit_lsn, m)? {
-                continue;
-            }
-
-            let new_id = state.next_page_id;
-            state.next_page_id = state.next_page_id.saturating_add(1);
-            write_posting_next_page_id(&mut tail_page, new_id)?;
-            writes.insert(tail_page_id, tail_page);
-
-            tail_page = new_log_page().to_vec();
-            if !append_posting_record(&mut tail_page, commit_lsn, m)? {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "posting mutation record too large",
-                )));
-            }
-            tail_page_id = new_id;
-            state.tail_page_id = new_id;
-        }
-
-        writes.insert(tail_page_id, tail_page);
-        let mut page_writes = writes
-            .into_iter()
-            .map(|(pid, p)| (pid, Page::from(p)))
-            .collect::<Vec<_>>();
-        let defs = self.secondary_indexes.list_indexes();
-        let page = encode_secondary_index_catalog(&SecondaryIndexCatalog {
-            defs,
-            posting_log: state.clone(),
-        })?;
-        page_writes.push((SECONDARY_INDEX_META_PAGE_ID, page));
-        let _ = self.write_pages_direct(page_writes).await?;
-        Ok(())
-    }
-
-    async fn replay_secondary_posting_log(&self) -> Result<usize> {
-        let state = self.secondary_posting_log.lock().await.clone();
-        if state.head_page_id == 0 {
-            return Ok(0);
-        }
-
-        let mut count = 0usize;
-        let mut page_id = state.head_page_id;
-        while page_id != 0 {
-            let page = self
-                .get_page(page_id, self.durable_lsn())
-                .await
-                .ok_or(Error::InMemoryPageMissing(page_id))?;
-            let records = decode_posting_records(&page)?;
-            for (lsn, m) in records {
-                self.secondary_indexes.apply_commit(lsn, &[m]);
-                count += 1;
-            }
-            page_id = read_next_page_id(&page)?;
-        }
-        Ok(count)
-    }
-
-    async fn backfill_secondary_index(&self, index_name: &str) -> Result<usize> {
-        let mut tx = self.begin_tx(true, None);
-        let start = vec![0u8; KEY_SIZE];
-        let end = vec![0xFFu8; KEY_SIZE];
-        let entries = tx.tree_range(&start, &end).await;
-
-        let mut out_count = 0usize;
-        let commit_lsn = self.durable_lsn();
-        let mut chunk: Vec<SecondaryIndexMutation> = Vec::with_capacity(1024);
-
-        for (key, row) in entries {
-            if let Some(value) = tx.read_visible_value_from_scan_entry(&key, row).await? {
-                let key_arr: [u8; KEY_SIZE] = key
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| Error::InvalidKeySize(key.len(), KEY_SIZE))?;
-                let mut value_arr = [0u8; VALUE_SIZE];
-                value_arr.copy_from_slice(&value);
-                let muts = self
-                    .secondary_indexes
-                    .plan_mutations(key_arr, None, Some(&value_arr))?;
-                for m in muts {
-                    if m.index_name == index_name {
-                        chunk.push(m);
-                    }
-                }
-                out_count += 1;
-                if chunk.len() >= 1024 {
-                    self.secondary_indexes.apply_commit(commit_lsn, &chunk);
-                    self.append_secondary_posting_log(commit_lsn, &chunk).await?;
-                    chunk.clear();
-                }
-            }
-        }
-        if !chunk.is_empty() {
-            self.secondary_indexes.apply_commit(commit_lsn, &chunk);
-            self.append_secondary_posting_log(commit_lsn, &chunk).await?;
-        }
-        Ok(out_count)
-    }
-
-    async fn backfill_all_secondary_indexes(&self) -> Result<()> {
-        let defs = self.secondary_indexes.list_indexes();
-        for d in defs {
-            self.backfill_secondary_index(&d.name).await?;
-        }
-        Ok(())
-    }
-
-    async fn recover_or_init(&self) -> Result<()> {
-        // Warmup first (best-effort). If storage is empty, we'll init below.
-        let _ = self.warmup_scan_all(256).await;
-
-        if let Some(global_meta_bytes) = self.page_cache.get(META_PAGE_ID) {
-            let mut meta = MetaPage::decode(&global_meta_bytes)?;
-            self.provider.set_next_page_id(meta.next_bptree_page_id);
-
-            // Backward-compat guard: older meta pages may have next_undo_page_id=0.
-            if meta.next_undo_page_id < 2_000_000 {
-                meta.next_undo_page_id = 2_000_000;
-                // best-effort persist
-                let _ = self.write_page(META_PAGE_ID, meta.encode()).await;
-            }
-
-            // Prefer btree metapage for root.
-            if let Some(btree_meta_bytes) = self.page_cache.get(BTREE_META_PAGE_ID) {
-                let bm = BtreeMeta::decode(&btree_meta_bytes)?;
-                self.provider.set_root_page_id(bm.root_page_id);
-            } else {
-                // Fallback: root in global meta.
-                self.provider.set_root_page_id(meta.root_page_id);
-            }
-            self.load_secondary_index_catalog().await?;
-            let replayed = self.replay_secondary_posting_log().await?;
-            if replayed == 0 {
-                self.backfill_all_secondary_indexes().await?;
-            }
-            return Ok(());
-        }
-
-        // Cold start: create meta + root page as one txn.
-        // PageId plan:
-        // - 0: meta
-        // - 10.. : bptree pages
-        // - 2_000_000.. : undo pages
-
-        const BPTREE_ROOT_ID: PageId = 10;
-        const UNDO_BASE: PageId = 2_000_000;
-
-        let mut tx = self.begin_rw().await;
-
-        // Configure provider root + next_page_id (next after reserved ids).
-        self.provider.set_root_page_id(BPTREE_ROOT_ID);
-        self.provider.set_next_page_id(BPTREE_ROOT_ID + 1);
-
-        // Root leaf page.
-        let root_page = crate::page_bptree::new_page(2, 0);
-        tx.write_page(BPTREE_ROOT_ID, root_page);
-
-        // B-Tree metapage.
-        tx.write_page(
-            BTREE_META_PAGE_ID,
-            BtreeMeta {
-                root_page_id: BPTREE_ROOT_ID,
-            }
-            .encode(),
-        );
-
-        // Meta page.
-        let meta = MetaPage {
-            root_page_id: BPTREE_ROOT_ID,
-            next_bptree_page_id: BPTREE_ROOT_ID + 1,
-            next_data_page_id: 1_000_000,
-            next_undo_page_id: UNDO_BASE,
-            undo_free: Vec::new(),
-            undo_history_head: 0,
-            undo_history_tail: 0,
-        };
-        tx.write_page(META_PAGE_ID, meta.encode());
-
-        tx.commit().await?;
-        self.secondary_indexes.replace_definitions(Vec::new())?;
-        self.persist_secondary_index_catalog().await?;
-        Ok(())
     }
 
     fn begin_tx(&self, read_only: bool, timeout: Option<Duration>) -> EmbeddedTxn {
@@ -1552,169 +1152,6 @@ impl EmbeddedTxn {
         Ok(ptr)
     }
 
-    async fn read_visible_from_undo(&mut self, mut undo: Option<UndoPtr>) -> Result<Option<Bytes>> {
-        while let Some(ptr) = undo {
-            let upage = self
-                .get_page_for_read(ptr.page_id)
-                .await
-                .ok_or(Error::InMemoryPageMissing(ptr.page_id))?;
-            let rec = undo_pg::read_record_ref(&upage, ptr.slot_id)?;
-            if (rec.old_flags & FLAG_INTENT) != 0 {
-                undo = rec.prev;
-                continue;
-            }
-            if rec.old_commit_lsn <= self.read_lsn {
-                if (rec.old_flags & FLAG_TOMBSTONE) != 0 {
-                    return Ok(None);
-                }
-                return Ok(Some(rec.old_value));
-            }
-            undo = rec.prev;
-        }
-        Ok(None)
-    }
-
-    async fn read_visible_exists_from_undo(&mut self, mut undo: Option<UndoPtr>) -> Result<bool> {
-        while let Some(ptr) = undo {
-            let upage = self
-                .get_page_for_read(ptr.page_id)
-                .await
-                .ok_or(Error::InMemoryPageMissing(ptr.page_id))?;
-            let rec = undo_pg::read_record_ref(&upage, ptr.slot_id)?;
-            if (rec.old_flags & FLAG_INTENT) != 0 {
-                undo = rec.prev;
-                continue;
-            }
-            if rec.old_commit_lsn <= self.read_lsn {
-                return Ok((rec.old_flags & FLAG_TOMBSTONE) == 0);
-            }
-            undo = rec.prev;
-        }
-        Ok(false)
-    }
-
-    async fn read_visible_value_from_row(&mut self, key: &[u8]) -> Result<Option<Bytes>> {
-        let intent_wait_grace = Duration::from_millis(50);
-        loop {
-            self.ensure_not_timed_out()?;
-
-            let row = self.tree_get(key).await;
-            let Some(row) = row else {
-                return Ok(None);
-            };
-
-            if (row.meta.flags & FLAG_INTENT) != 0 {
-                if self.undo_txn_id == Some(row.meta.intent_txn_id) {
-                    if (row.meta.flags & FLAG_TOMBSTONE) != 0 {
-                        return Ok(None);
-                    }
-                    return Ok(Some(row.value));
-                }
-                if row.meta.intent_lsn > self.read_lsn {
-                    return self.read_visible_from_undo(row.meta.undo_ptr).await;
-                }
-                self.compute
-                    .wait_on_pending_txn(row.meta.intent_txn_id, intent_wait_grace)
-                    .await?;
-                continue;
-            }
-
-            if row.meta.commit_lsn <= self.read_lsn {
-                if (row.meta.flags & FLAG_TOMBSTONE) != 0 {
-                    return Ok(None);
-                }
-                return Ok(Some(row.value));
-            }
-
-            // Not visible at this snapshot: walk undo chain to find latest visible version.
-            return self.read_visible_from_undo(row.meta.undo_ptr).await;
-        }
-    }
-
-    async fn read_visible_exists_from_row(&mut self, key: &[u8]) -> Result<bool> {
-        let intent_wait_grace = Duration::from_millis(50);
-        loop {
-            self.ensure_not_timed_out()?;
-
-            let row = self.tree_get(key).await;
-            let Some(row) = row else {
-                return Ok(false);
-            };
-
-            if (row.meta.flags & FLAG_INTENT) != 0 {
-                if self.undo_txn_id == Some(row.meta.intent_txn_id) {
-                    return Ok((row.meta.flags & FLAG_TOMBSTONE) == 0);
-                }
-                if row.meta.intent_lsn > self.read_lsn {
-                    return self.read_visible_exists_from_undo(row.meta.undo_ptr).await;
-                }
-                self.compute
-                    .wait_on_pending_txn(row.meta.intent_txn_id, intent_wait_grace)
-                    .await?;
-                continue;
-            }
-
-            if row.meta.commit_lsn <= self.read_lsn {
-                return Ok((row.meta.flags & FLAG_TOMBSTONE) == 0);
-            }
-
-            // Not visible at this snapshot: walk undo chain to find latest visible version.
-            return self.read_visible_exists_from_undo(row.meta.undo_ptr).await;
-        }
-    }
-
-    async fn read_visible_exists_from_scan_entry(
-        &mut self,
-        key: &[u8],
-        row: LeafValueMeta,
-    ) -> Result<bool> {
-        if (row.flags & FLAG_INTENT) != 0 {
-            if self.undo_txn_id == Some(row.intent_txn_id) {
-                return Ok((row.flags & FLAG_TOMBSTONE) == 0);
-            }
-            if row.intent_lsn > self.read_lsn {
-                return self.read_visible_exists_from_undo(row.undo_ptr).await;
-            }
-            self.compute
-                .wait_on_pending_txn(row.intent_txn_id, Duration::from_millis(50))
-                .await?;
-            return self.read_visible_exists_from_row(key).await;
-        }
-        if row.commit_lsn <= self.read_lsn {
-            return Ok((row.flags & FLAG_TOMBSTONE) == 0);
-        }
-        self.read_visible_exists_from_undo(row.undo_ptr).await
-    }
-
-    async fn read_visible_value_from_scan_entry(
-        &mut self,
-        key: &[u8],
-        row: LeafValueRef,
-    ) -> Result<Option<Bytes>> {
-        if (row.meta.flags & FLAG_INTENT) != 0 {
-            if self.undo_txn_id == Some(row.meta.intent_txn_id) {
-                if (row.meta.flags & FLAG_TOMBSTONE) != 0 {
-                    return Ok(None);
-                }
-                return Ok(Some(row.value));
-            }
-            if row.meta.intent_lsn > self.read_lsn {
-                return self.read_visible_from_undo(row.meta.undo_ptr).await;
-            }
-            self.compute
-                .wait_on_pending_txn(row.meta.intent_txn_id, Duration::from_millis(50))
-                .await?;
-            return self.read_visible_value_from_row(key).await;
-        }
-        if row.meta.commit_lsn <= self.read_lsn {
-            if (row.meta.flags & FLAG_TOMBSTONE) != 0 {
-                return Ok(None);
-            }
-            return Ok(Some(row.value));
-        }
-        self.read_visible_from_undo(row.meta.undo_ptr).await
-    }
-
     pub async fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.ensure_not_timed_out()?;
         if self.read_only {
@@ -1940,11 +1377,10 @@ impl EmbeddedTxn {
         if let Some(old) = existing {
             let key_arr: [u8; KEY_SIZE] = key.try_into().unwrap();
             let old_value = Self::value_array_from_ref(&old);
-            let planned_mutations = self.compute.secondary_indexes.plan_mutations(
-                key_arr,
-                Some(&old_value),
-                None,
-            )?;
+            let planned_mutations =
+                self.compute
+                    .secondary_indexes
+                    .plan_mutations(key_arr, Some(&old_value), None)?;
             if (old.meta.flags & FLAG_INTENT) != 0
                 && self.undo_txn_id != Some(old.meta.intent_txn_id)
             {
@@ -2274,3 +1710,7 @@ impl EmbeddedTxn {
         out
     }
 }
+
+#[cfg(test)]
+#[path = "embedded_compute_tests.rs"]
+mod tests;

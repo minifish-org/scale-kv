@@ -1,4 +1,4 @@
-// (no legacy WAL/TXN op constants needed for page-level redo)
+// Page-level redo only needs page image operations.
 use crate::storage_capnp::storage;
 use crate::{Page, Result, StorageMaintenanceConfig, StorageNode};
 use capnp::capability::Promise;

@@ -1,4 +1,4 @@
-use crate::{Error, KEY_SIZE, PAGE_SIZE, Page, PageId, Result, VALUE_SIZE};
+use crate::{Error, KEY_SIZE, PAGE_SIZE, Page, Result, VALUE_SIZE};
 
 const PAGE_HEADER_SIZE: usize = 6;
 const SLOT_ENTRY_SIZE: usize = 4;
@@ -52,6 +52,21 @@ const FLAG_TOMBSTONE: u16 = 1;
 
 fn payload_len() -> usize {
     KEY_SIZE + VALUE_SIZE + MVCC_HEADER_SIZE
+}
+
+fn slot_payload_offset(page: &[u8], slot_id: u16) -> Option<usize> {
+    if page.len() != PAGE_SIZE {
+        return None;
+    }
+    let (pos, len) = read_slot(page, slot_id);
+    if len as usize != payload_len() {
+        return None;
+    }
+    let pos = pos as usize;
+    if pos + payload_len() > PAGE_SIZE {
+        return None;
+    }
+    Some(pos)
 }
 
 pub fn new_page() -> Page {
@@ -152,14 +167,7 @@ pub fn read_value(page: &[u8], slot_id: u16, key: &[u8]) -> Option<Vec<u8>> {
     if page.len() != PAGE_SIZE || key.len() != KEY_SIZE {
         return None;
     }
-    let (pos, len) = read_slot(page, slot_id);
-    if len as usize != payload_len() {
-        return None;
-    }
-    let pos = pos as usize;
-    if pos + payload_len() > PAGE_SIZE {
-        return None;
-    }
+    let pos = slot_payload_offset(page, slot_id)?;
     if &page[pos..pos + KEY_SIZE] != key {
         return None;
     }
@@ -216,14 +224,7 @@ pub fn read_commit_lsn(page: &[u8], slot_id: u16, key: &[u8]) -> Option<u64> {
     if page.len() != PAGE_SIZE || key.len() != KEY_SIZE {
         return None;
     }
-    let (pos, len) = read_slot(page, slot_id);
-    if len as usize != payload_len() {
-        return None;
-    }
-    let pos = pos as usize;
-    if pos + payload_len() > PAGE_SIZE {
-        return None;
-    }
+    let pos = slot_payload_offset(page, slot_id)?;
     if &page[pos..pos + KEY_SIZE] != key {
         return None;
     }
@@ -232,14 +233,10 @@ pub fn read_commit_lsn(page: &[u8], slot_id: u16, key: &[u8]) -> Option<u64> {
 }
 
 pub fn write_commit_lsn(page: &mut [u8], slot_id: u16, commit_lsn: u64) {
-    if page.len() != PAGE_SIZE {
-        return;
-    }
-    let (pos, len) = read_slot(page, slot_id);
-    if len as usize != payload_len() {
-        return;
-    }
-    let pos = pos as usize;
+    let pos = match slot_payload_offset(page, slot_id) {
+        Some(p) => p,
+        None => return,
+    };
     let off = pos + KEY_SIZE + VALUE_SIZE;
     page[off..off + 8].copy_from_slice(&commit_lsn.to_le_bytes());
 }
@@ -248,11 +245,7 @@ pub fn read_undo_ptr(page: &[u8], slot_id: u16, key: &[u8]) -> Option<crate::und
     if page.len() != PAGE_SIZE || key.len() != KEY_SIZE {
         return None;
     }
-    let (pos, len) = read_slot(page, slot_id);
-    if len as usize != payload_len() {
-        return None;
-    }
-    let pos = pos as usize;
+    let pos = slot_payload_offset(page, slot_id)?;
     if &page[pos..pos + KEY_SIZE] != key {
         return None;
     }
@@ -270,14 +263,10 @@ pub fn read_undo_ptr(page: &[u8], slot_id: u16, key: &[u8]) -> Option<crate::und
 }
 
 pub fn write_undo_ptr(page: &mut [u8], slot_id: u16, undo: Option<crate::undo_pg::UndoPtr>) {
-    if page.len() != PAGE_SIZE {
-        return;
-    }
-    let (pos, len) = read_slot(page, slot_id);
-    if len as usize != payload_len() {
-        return;
-    }
-    let pos = pos as usize;
+    let pos = match slot_payload_offset(page, slot_id) {
+        Some(p) => p,
+        None => return,
+    };
     let off = pos + KEY_SIZE + VALUE_SIZE + 8;
     let (pid, sid) = undo.map(|u| (u.page_id, u.slot_id)).unwrap_or((0, 0));
     page[off..off + 8].copy_from_slice(&pid.to_le_bytes());
@@ -288,11 +277,7 @@ pub fn read_flags(page: &[u8], slot_id: u16, key: &[u8]) -> Option<u16> {
     if page.len() != PAGE_SIZE || key.len() != KEY_SIZE {
         return None;
     }
-    let (pos, len) = read_slot(page, slot_id);
-    if len as usize != payload_len() {
-        return None;
-    }
-    let pos = pos as usize;
+    let pos = slot_payload_offset(page, slot_id)?;
     if &page[pos..pos + KEY_SIZE] != key {
         return None;
     }
@@ -301,24 +286,19 @@ pub fn read_flags(page: &[u8], slot_id: u16, key: &[u8]) -> Option<u16> {
 }
 
 pub fn write_flags(page: &mut [u8], slot_id: u16, flags: u16) {
-    if page.len() != PAGE_SIZE {
-        return;
-    }
-    let (pos, len) = read_slot(page, slot_id);
-    if len as usize != payload_len() {
-        return;
-    }
-    let pos = pos as usize;
+    let pos = match slot_payload_offset(page, slot_id) {
+        Some(p) => p,
+        None => return,
+    };
     let off = pos + KEY_SIZE + VALUE_SIZE + 8 + 8 + 2;
     page[off..off + 2].copy_from_slice(&flags.to_le_bytes());
 }
 
 pub fn mark_tombstone(page: &mut [u8], slot_id: u16) {
-    let (pos, len) = read_slot(page, slot_id);
-    if len as usize != payload_len() {
-        return;
-    }
-    let pos = pos as usize;
+    let pos = match slot_payload_offset(page, slot_id) {
+        Some(p) => p,
+        None => return,
+    };
     let off = pos + KEY_SIZE + VALUE_SIZE + 8 + 8 + 2;
     let mut flags = u16::from_le_bytes(page[off..off + 2].try_into().unwrap());
     flags |= FLAG_TOMBSTONE;
@@ -386,7 +366,7 @@ pub fn insert_record(page: &mut [u8], key: &[u8], value: &[u8]) -> Result<u16> {
 }
 
 /// Insert at a specific slot id and verify existing key (if any) matches.
-/// Used by legacy tests/WAL apply.
+/// Used by WAL apply paths.
 pub fn insert_record_at_slot_checked(
     page: &mut [u8],
     slot_id: u16,
@@ -444,5 +424,109 @@ pub fn fixed_key_bytes(input: &[u8]) -> Vec<u8> {
     out
 }
 
-#[allow(dead_code)]
-pub fn _page_id_sanity(_id: PageId) {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_bytes(seed: u8) -> Vec<u8> {
+        fixed_key_bytes(&[seed])
+    }
+
+    fn value_bytes(seed: u8) -> Vec<u8> {
+        vec![seed; VALUE_SIZE]
+    }
+
+    #[test]
+    fn test_mvcc_fields_roundtrip_and_tombstone() {
+        let mut page = new_page().to_vec();
+        let key = key_bytes(1);
+        let value = value_bytes(7);
+        let slot = insert_record(&mut page, &key, &value).unwrap();
+        assert_eq!(read_value(&page, slot, &key).unwrap(), value);
+        assert_eq!(read_commit_lsn(&page, slot, &key), Some(0));
+
+        write_commit_lsn(&mut page, slot, 42);
+        assert_eq!(read_commit_lsn(&page, slot, &key), Some(42));
+
+        let undo = crate::undo_pg::UndoPtr {
+            page_id: 99,
+            slot_id: 3,
+        };
+        write_undo_ptr(&mut page, slot, Some(undo));
+        assert_eq!(read_undo_ptr(&page, slot, &key), Some(undo));
+
+        write_flags(&mut page, slot, 0x20);
+        assert_eq!(read_flags(&page, slot, &key), Some(0x20));
+
+        mark_tombstone(&mut page, slot);
+        assert!(read_value(&page, slot, &key).is_none());
+        assert_eq!(read_flags(&page, slot, &key), Some(0x21));
+    }
+
+    #[test]
+    fn test_slot_reuse_and_defragment_preserve_live_data() {
+        let mut page = new_page().to_vec();
+        let key1 = key_bytes(1);
+        let key2 = key_bytes(2);
+        let key3 = key_bytes(3);
+        let v1 = value_bytes(11);
+        let v2 = value_bytes(22);
+        let v3 = value_bytes(33);
+
+        let s1 = insert_record(&mut page, &key1, &v1).unwrap();
+        let s2 = insert_record(&mut page, &key2, &v2).unwrap();
+        clear_slot(&mut page, s1);
+        let s3 = insert_record(&mut page, &key3, &v3).unwrap();
+        assert_eq!(s3, s1);
+        assert_eq!(read_value(&page, s2, &key2).unwrap(), v2);
+        assert_eq!(read_value(&page, s3, &key3).unwrap(), v3);
+
+        defragment(&mut page).unwrap();
+        assert_eq!(read_value(&page, s2, &key2).unwrap(), v2);
+        assert_eq!(read_value(&page, s3, &key3).unwrap(), v3);
+    }
+
+    #[test]
+    fn test_corrupted_slot_bounds_do_not_panic() {
+        let mut page = new_page().to_vec();
+        let key = key_bytes(9);
+        let value = value_bytes(8);
+        let slot = insert_record(&mut page, &key, &value).unwrap();
+
+        write_slot(
+            &mut page,
+            slot,
+            (PAGE_SIZE - payload_len() + 1) as u16,
+            payload_len() as u16,
+        );
+
+        assert!(read_value(&page, slot, &key).is_none());
+        assert!(read_commit_lsn(&page, slot, &key).is_none());
+        assert!(read_undo_ptr(&page, slot, &key).is_none());
+        assert!(read_flags(&page, slot, &key).is_none());
+
+        write_commit_lsn(&mut page, slot, 1);
+        write_undo_ptr(
+            &mut page,
+            slot,
+            Some(crate::undo_pg::UndoPtr {
+                page_id: 1,
+                slot_id: 1,
+            }),
+        );
+        write_flags(&mut page, slot, 5);
+        mark_tombstone(&mut page, slot);
+    }
+
+    #[test]
+    fn test_insert_record_at_slot_checked_rejects_key_mismatch() {
+        let mut page = new_page().to_vec();
+        let key = key_bytes(1);
+        let value = value_bytes(1);
+        let slot = insert_record(&mut page, &key, &value).unwrap();
+
+        let other_key = key_bytes(2);
+        let err = insert_record_at_slot_checked(&mut page, slot, &other_key, &value).unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+    }
+}

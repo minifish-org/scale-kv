@@ -491,52 +491,20 @@ cargo test --test smoke
 
 ### 6.3 Benchmarks ✅ **COMPLETED**
 
-**Location**: `benches/ycsb.rs`
+The legacy Criterion YCSB benchmark (`benches/ycsb.rs`) was removed because it diverged from the
+current API surface and no longer reflected the actively maintained performance path.
 
-**Workloads**:
-- ✅ Workload A: 50% read, 50% write
-- ✅ Workload B: 95% read, 5% write  
-- ✅ Workload C: 100% read
-- ✅ Workload D: Read latest (Zipfian)
-- ✅ Workload E: Short ranges
-- ✅ Workload F: Read-modify-write
-
-**Status**: Benchmark suite fully implemented and runnable
+**Current benchmark entrypoints**:
+- `src/bin/workload_bench.rs` (workload-oriented benchmark runner)
+- `src/bin/compare_bench.rs` (backend comparison runner)
+- `src/bin/simple_bench.rs` (single-run sanity benchmark)
 
 **Running Benchmarks**:
 ```bash
-cargo bench  # ✅ All benchmarks executable
+cargo run --release --bin workload_bench -- --help
+cargo run --release --bin compare_bench -- --help
+cargo run --release --bin simple_bench -- --help
 ```
-
-**Scale-KV vs Sled Comparison (Aligned Method)**:
-- Same dataset and value sizes: `NUM_RECORDS=10_000`, `VALUE_SIZE=1024`, `OPERATIONS=1_000`
-- Same YCSB mixes and key distribution (Zipfian)
-- Range scans are fully consumed on both sides to avoid lazy-iterator undercounting
-- Scale-KV runs through loopback RPC (compute + storage) with WAL; sled runs embedded (local DB)
-
-**Comparison Controls (Env Vars)**:
-```bash
-# Enable sled benchmarks alongside scale-kv
-SCALE_KV_RUN_SLED=1
-
-# Choose which side to run: scale_kv | sled | both
-SCALE_KV_BENCH_SET=both
-
-# Filter specific workloads (comma-separated)
-SCALE_KV_BENCH_FILTER=workload_a,workload_c
-
-# Benchmark tuning
-SCALE_KV_SAMPLE_SIZE=50
-SCALE_KV_WARMUP_SECS=2
-SCALE_KV_MEASUREMENT_SECS=5
-
-# Scale-KV RPC worker count
-SCALE_KV_RPC_WORKERS=1
-```
-
-**Expected Performance Differences (Interpretation)**:
-- **Sled** should generally show lower latency / higher throughput for single-node workloads due to in-process access and no RPC/WAL batching overhead.
-- **Scale-KV** numbers reflect networked, WAL-backed behavior even on localhost, so absolute throughput will be lower but more representative of distributed deployment characteristics.
 
 ---
 

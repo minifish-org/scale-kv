@@ -58,8 +58,7 @@ pub fn encode_secondary_index_catalog(catalog: &SecondaryIndexCatalog) -> Result
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "secondary index name len must be 1..{}: {}",
-                    NAME_MAX,
-                    def.name
+                    NAME_MAX, def.name
                 ),
             )));
         }
@@ -131,9 +130,21 @@ fn decode_v1(page: &[u8]) -> Result<SecondaryIndexCatalog> {
 
 fn decode_v2(page: &[u8]) -> Result<SecondaryIndexCatalog> {
     let defs = decode_defs(page, OFF_COUNT_V2, OFF_ENTRIES_V2)?;
-    let head_page_id = u64::from_le_bytes(page[OFF_LOG_HEAD_V2..OFF_LOG_HEAD_V2 + 8].try_into().unwrap());
-    let tail_page_id = u64::from_le_bytes(page[OFF_LOG_TAIL_V2..OFF_LOG_TAIL_V2 + 8].try_into().unwrap());
-    let mut next_page_id = u64::from_le_bytes(page[OFF_LOG_NEXT_V2..OFF_LOG_NEXT_V2 + 8].try_into().unwrap());
+    let head_page_id = u64::from_le_bytes(
+        page[OFF_LOG_HEAD_V2..OFF_LOG_HEAD_V2 + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let tail_page_id = u64::from_le_bytes(
+        page[OFF_LOG_TAIL_V2..OFF_LOG_TAIL_V2 + 8]
+            .try_into()
+            .unwrap(),
+    );
+    let mut next_page_id = u64::from_le_bytes(
+        page[OFF_LOG_NEXT_V2..OFF_LOG_NEXT_V2 + 8]
+            .try_into()
+            .unwrap(),
+    );
     if next_page_id < SECONDARY_POSTING_LOG_BASE_PAGE_ID {
         next_page_id = SECONDARY_POSTING_LOG_BASE_PAGE_ID;
     }

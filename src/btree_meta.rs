@@ -46,3 +46,33 @@ impl BtreeMeta {
         Ok(Self { root_page_id: root })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let meta = BtreeMeta { root_page_id: 123 };
+        let page = meta.encode();
+        let decoded = BtreeMeta::decode(&page).unwrap();
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn test_decode_rejects_invalid_size_magic_and_version() {
+        let err = BtreeMeta::decode(&[0u8; 8]).unwrap_err();
+        assert!(matches!(err, Error::InvalidPageSize(_, PAGE_SIZE)));
+
+        let mut page = vec![0u8; PAGE_SIZE];
+        page[0..8].copy_from_slice(b"BADMETA!");
+        let err = BtreeMeta::decode(&page).unwrap_err();
+        assert!(matches!(err, Error::Io(ref ioe) if ioe.kind() == ErrorKind::InvalidData));
+
+        let mut page = BtreeMeta { root_page_id: 1 }.encode().to_vec();
+        page[8..12].copy_from_slice(&999u32.to_le_bytes());
+        let err = BtreeMeta::decode(&page).unwrap_err();
+        assert!(matches!(err, Error::Io(ref ioe) if ioe.kind() == ErrorKind::InvalidData));
+    }
+}

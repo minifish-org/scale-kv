@@ -56,6 +56,7 @@ pub mod compute_sequencer;
 pub use compute_sequencer::ComputeSequencer;
 
 pub mod embedded_compute;
+pub(crate) mod embedded_compute_runtime;
 pub use embedded_compute::{EmbeddedCompute, EmbeddedTxn};
 
 pub mod txn_kv;

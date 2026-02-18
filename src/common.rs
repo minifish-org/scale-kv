@@ -54,7 +54,9 @@ impl Error {
             Error::InMemoryPageMissing(_) => ErrorCategory::Internal,
             Error::Capnp(_) => ErrorCategory::Unavailable,
             Error::Io(err) => match err.kind() {
-                std::io::ErrorKind::InvalidInput => ErrorCategory::InvalidInput,
+                std::io::ErrorKind::InvalidInput
+                | std::io::ErrorKind::AlreadyExists
+                | std::io::ErrorKind::NotFound => ErrorCategory::InvalidInput,
                 std::io::ErrorKind::WouldBlock => ErrorCategory::Backpressure,
                 std::io::ErrorKind::TimedOut => ErrorCategory::Timeout,
                 std::io::ErrorKind::Interrupted
@@ -90,6 +92,10 @@ mod tests {
         let e = Error::Io(std::io::Error::new(std::io::ErrorKind::WouldBlock, "bp"));
         assert_eq!(e.category(), ErrorCategory::Backpressure);
         assert!(e.is_retryable());
+
+        let e = Error::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
+        assert_eq!(e.category(), ErrorCategory::InvalidInput);
+        assert!(!e.is_retryable());
 
         let e = Error::InvalidKeySize(1, 16);
         assert_eq!(e.category(), ErrorCategory::InvalidInput);

@@ -100,3 +100,77 @@ impl AsyncPageProvider for TxnPageProvider {
         self.pages.latch_table()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::page_bptree::DEFAULT_PAGE_CACHE_SHARDS;
+    use crate::{BTREE_META_PAGE_ID, PAGE_SIZE};
+    use std::sync::atomic::AtomicUsize;
+
+    fn make_provider(
+        fetch_count: Arc<AtomicUsize>,
+        fetch_value: u8,
+    ) -> (TxnPageProvider, Arc<PageCache>) {
+        let pages = Arc::new(PageCache::new(DEFAULT_PAGE_CACHE_SHARDS));
+        let next_page_id = Arc::new(AtomicU64::new(100));
+        let fetcher = Arc::new(move |_page_id: PageId| {
+            let fetch_count = Arc::clone(&fetch_count);
+            Box::pin(async move {
+                fetch_count.fetch_add(1, Ordering::SeqCst);
+                Some(vec![fetch_value; PAGE_SIZE].into())
+            }) as LocalBoxFuture<'static, Option<Page>>
+        });
+        let provider = TxnPageProvider::new(
+            Arc::clone(&pages),
+            next_page_id,
+            BTREE_META_PAGE_ID,
+            fetcher,
+        );
+        (provider, pages)
+    }
+
+    #[tokio::test]
+    async fn test_demand_paging_hits_fetcher_once_then_cache() {
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let (provider, _pages) = make_provider(Arc::clone(&fetch_count), 7);
+
+        let p1 = provider.read_page(42).await.unwrap();
+        let p2 = provider.read_page(42).await.unwrap();
+        assert_eq!(p1[0], 7);
+        assert_eq!(p2[0], 7);
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_write_page_and_set_root_track_dirty_in_task_local() {
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let (provider, pages) = make_provider(fetch_count, 1);
+        let dirty = Rc::new(RefCell::new(BTreeMap::<PageId, Page>::new()));
+
+        CURRENT_TXN_DIRTY
+            .scope(Rc::clone(&dirty), async {
+                provider.write_page(5, vec![9; PAGE_SIZE].into()).await;
+                provider.set_root_page_id(77);
+            })
+            .await;
+
+        let dirty = dirty.borrow();
+        assert!(dirty.contains_key(&5));
+        assert!(dirty.contains_key(&BTREE_META_PAGE_ID));
+        assert_eq!(provider.root_page_id(), 77);
+        assert!(pages.contains(BTREE_META_PAGE_ID));
+    }
+
+    #[test]
+    fn test_alloc_and_next_page_id_controls() {
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let (provider, _pages) = make_provider(fetch_count, 1);
+
+        assert_eq!(provider.next_page_id(), 100);
+        assert_eq!(provider.alloc_page_id(), 100);
+        assert_eq!(provider.alloc_page_id(), 101);
+        provider.set_next_page_id(1000);
+        assert_eq!(provider.next_page_id(), 1000);
+    }
+}

@@ -1,10 +1,9 @@
 use bytes::Bytes;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use std::{fs, process};
+use tempfile::TempDir;
 
 use scale_kv::{EmbeddedCompute, ErrorCategory, KEY_SIZE, PAGE_SIZE, StorageServer, VALUE_SIZE};
 
@@ -14,20 +13,12 @@ fn tcp_bind_allowed() -> bool {
     std::net::TcpListener::bind("127.0.0.1:0").is_ok()
 }
 
-fn temp_dir() -> PathBuf {
-    let mut dir = std::env::temp_dir();
+fn temp_dir() -> TempDir {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    dir.push(format!(
-        "scale-kv-embedded-page-redo-e2e-{}-{}",
-        process::id(),
-        id
-    ));
-    fs::create_dir_all(&dir).expect("failed to create temp dir");
-    dir
-}
-
-fn cleanup_dir(dir: &PathBuf) {
-    let _ = fs::remove_dir_all(dir);
+    tempfile::Builder::new()
+        .prefix(&format!("scale-kv-embedded-page-redo-e2e-{id}-"))
+        .tempdir()
+        .expect("failed to create temp dir")
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -41,7 +32,7 @@ async fn test_page_redo_commit_and_recover_by_scan() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
 
@@ -79,8 +70,6 @@ async fn test_page_redo_commit_and_recover_by_scan() {
             assert_eq!(got, page);
         })
         .await;
-
-    cleanup_dir(&dir);
 }
 
 fn test_key(n: u64) -> Vec<u8> {
@@ -110,7 +99,7 @@ async fn test_scan_range_snapshot_inclusive_and_limit() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
             let addrs = vec![server.addr().to_string()];
@@ -148,8 +137,6 @@ async fn test_scan_range_snapshot_inclusive_and_limit() {
             assert_eq!(limited[1], (k2, v2_new));
         })
         .await;
-
-    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -163,7 +150,7 @@ async fn test_secondary_btree_index_create_and_query_eq() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
             let addrs = vec![server.addr().to_string()];
@@ -184,11 +171,17 @@ async fn test_secondary_btree_index_create_and_query_eq() {
             compute.put(&k1, &v1).await.unwrap();
             compute.put(&k2, &v2).await.unwrap();
 
-            let r1 = compute.scan_secondary_index_eq("tag", b"aa", 10).await.unwrap();
+            let r1 = compute
+                .scan_secondary_index_eq("tag", b"aa", 10)
+                .await
+                .unwrap();
             assert_eq!(r1.len(), 1);
             assert_eq!(r1[0], (k1.clone(), v1.clone()));
 
-            let r2 = compute.scan_secondary_index_eq("tag", b"bb", 10).await.unwrap();
+            let r2 = compute
+                .scan_secondary_index_eq("tag", b"bb", 10)
+                .await
+                .unwrap();
             assert_eq!(r2.len(), 1);
             assert_eq!(r2[0], (k2.clone(), v2.clone()));
 
@@ -196,8 +189,6 @@ async fn test_secondary_btree_index_create_and_query_eq() {
             assert!(!compute.drop_secondary_index("tag").await.unwrap());
         })
         .await;
-
-    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -211,7 +202,7 @@ async fn test_secondary_btree_index_snapshot_visibility() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
             let addrs = vec![server.addr().to_string()];
@@ -246,8 +237,6 @@ async fn test_secondary_btree_index_snapshot_visibility() {
             assert_eq!(now_new, vec![(key.clone(), v_new.clone())]);
         })
         .await;
-
-    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -261,7 +250,7 @@ async fn test_secondary_btree_index_backfill_existing_rows() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
             let addrs = vec![server.addr().to_string()];
@@ -278,14 +267,15 @@ async fn test_secondary_btree_index_backfill_existing_rows() {
                 .create_btree_secondary_index("tag", 0, 2)
                 .await
                 .unwrap();
-            let got = compute.scan_secondary_index_eq("tag", b"aa", 10).await.unwrap();
+            let got = compute
+                .scan_secondary_index_eq("tag", b"aa", 10)
+                .await
+                .unwrap();
             assert_eq!(got.len(), 2);
             assert_eq!(got[0], (k1.clone(), v1.clone()));
             assert_eq!(got[1], (k2.clone(), v2.clone()));
         })
         .await;
-
-    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -299,7 +289,7 @@ async fn test_secondary_index_catalog_persist_and_recover() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
             let addrs = vec![server.addr().to_string()];
@@ -327,8 +317,6 @@ async fn test_secondary_index_catalog_persist_and_recover() {
             assert_eq!(got, vec![(key.clone(), val.clone())]);
         })
         .await;
-
-    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -342,7 +330,7 @@ async fn test_concurrent_rw_txns_on_different_keys_both_commit() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
             let addrs = vec![server.addr().to_string()];
@@ -383,8 +371,6 @@ async fn test_concurrent_rw_txns_on_different_keys_both_commit() {
             assert_eq!(compute.get(&k2).await.unwrap(), Some(v2));
         })
         .await;
-
-    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -398,7 +384,7 @@ async fn test_concurrent_rw_txns_on_same_key_conflict_is_retryable() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
             let addrs = vec![server.addr().to_string()];
@@ -439,8 +425,6 @@ async fn test_concurrent_rw_txns_on_same_key_conflict_is_retryable() {
             assert_eq!(compute.get(&key).await.unwrap(), Some(winner));
         })
         .await;
-
-    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -454,7 +438,7 @@ async fn test_timeout_reaper_aborts_dropped_rw_txn_and_resolves_intent() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
             let addrs = vec![server.addr().to_string()];
@@ -476,8 +460,6 @@ async fn test_timeout_reaper_aborts_dropped_rw_txn_and_resolves_intent() {
             assert_eq!(got, Some(old_value));
         })
         .await;
-
-    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -491,7 +473,7 @@ async fn test_reader_waits_on_foreign_intent_until_commit() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
             let addrs = vec![server.addr().to_string()];
@@ -530,8 +512,6 @@ async fn test_reader_waits_on_foreign_intent_until_commit() {
             assert_eq!(got, Some(old_value));
         })
         .await;
-
-    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -545,7 +525,7 @@ async fn test_reader_does_not_wait_when_intent_is_newer_than_snapshot() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
             let addrs = vec![server.addr().to_string()];
@@ -575,8 +555,6 @@ async fn test_reader_does_not_wait_when_intent_is_newer_than_snapshot() {
             tx.abort().await.unwrap();
         })
         .await;
-
-    cleanup_dir(&dir);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -590,7 +568,7 @@ async fn test_reader_times_out_waiting_on_unresolved_foreign_intent() {
     local
         .run_until(async {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let server = StorageServer::start_with_dir(addr, dir.clone())
+            let server = StorageServer::start_with_dir(addr, dir.path().to_path_buf())
                 .await
                 .unwrap();
             let addrs = vec![server.addr().to_string()];
@@ -613,6 +591,4 @@ async fn test_reader_times_out_waiting_on_unresolved_foreign_intent() {
             tx.abort().await.unwrap();
         })
         .await;
-
-    cleanup_dir(&dir);
 }

@@ -170,8 +170,10 @@ impl SecondaryIndexManager {
                     value_offset,
                     value_len,
                 } => {
-                    let old_key = old_value.map(|v| v[value_offset..value_offset + value_len].to_vec());
-                    let new_key = new_value.map(|v| v[value_offset..value_offset + value_len].to_vec());
+                    let old_key =
+                        old_value.map(|v| v[value_offset..value_offset + value_len].to_vec());
+                    let new_key =
+                        new_value.map(|v| v[value_offset..value_offset + value_len].to_vec());
                     if old_key == new_key {
                         continue;
                     }

@@ -372,3 +372,116 @@ pub fn read_record_ref(page: &Page, slot_id: u16) -> Result<UndoRecordRef> {
         old_value,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_record(seed: u8) -> UndoRecord {
+        UndoRecord {
+            data_page_id: 10 + seed as u64,
+            data_slot_id: seed as u16,
+            prev: Some(UndoPtr {
+                page_id: 20 + seed as u64,
+                slot_id: 2,
+            }),
+            txn_id: 30 + seed as u64,
+            txn_next: Some(UndoPtr {
+                page_id: 40 + seed as u64,
+                slot_id: 3,
+            }),
+            old_commit_lsn: 50 + seed as u64,
+            old_flags: seed as u16,
+            old_value: [seed; VALUE_SIZE],
+        }
+    }
+
+    #[test]
+    fn test_segment_header_roundtrip_and_page_next() {
+        let mut page = new_undo_segment_page(7, 123).to_vec();
+        assert_eq!(page_next_id(&page).unwrap(), 0);
+        set_page_next_id(&mut page, 999).unwrap();
+        assert_eq!(page_next_id(&page).unwrap(), 999);
+
+        let mut hdr = read_segment_header(&page).unwrap();
+        assert_eq!(hdr.txn_id, 7);
+        assert_eq!(hdr.first_page_id, 123);
+        assert_eq!(hdr.last_page_id, 123);
+        assert_eq!(hdr.state, SEGMENT_STATE_IN_PROGRESS);
+
+        hdr.begin_lsn = 11;
+        hdr.commit_lsn = 12;
+        hdr.record_count = 13;
+        hdr.state = SEGMENT_STATE_COMMITTED;
+        hdr.history_prev = 1001;
+        hdr.history_next = 1002;
+        write_segment_header(&mut page, hdr).unwrap();
+        assert_eq!(read_segment_header(&page).unwrap(), hdr);
+    }
+
+    #[test]
+    fn test_append_and_read_roundtrip() {
+        let mut page = new_undo_page().to_vec();
+        let rec = sample_record(9);
+        let slot = append_record(&mut page, &rec).unwrap();
+        assert_eq!(slot, 0);
+        assert_eq!(undo_count(&page), 1);
+        assert_eq!(read_record(&page, slot).unwrap(), rec);
+
+        let page_bytes = Page::copy_from_slice(&page);
+        let rec_ref = read_record_ref(&page_bytes, slot).unwrap();
+        assert_eq!(rec_ref.data_page_id, rec.data_page_id);
+        assert_eq!(rec_ref.data_slot_id, rec.data_slot_id);
+        assert_eq!(rec_ref.prev, rec.prev);
+        assert_eq!(rec_ref.txn_id, rec.txn_id);
+        assert_eq!(rec_ref.txn_next, rec.txn_next);
+        assert_eq!(rec_ref.old_commit_lsn, rec.old_commit_lsn);
+        assert_eq!(rec_ref.old_flags, rec.old_flags);
+        assert_eq!(rec_ref.old_value.as_ref(), rec.old_value.as_slice());
+    }
+
+    #[test]
+    fn test_append_until_full_returns_error() {
+        let mut page = new_undo_page().to_vec();
+        let rec = sample_record(1);
+        let mut inserted = 0usize;
+        loop {
+            match append_record(&mut page, &rec) {
+                Ok(_) => inserted += 1,
+                Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::Other => break,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!(undo_count(&page) as usize, inserted);
+        assert!(inserted > 0);
+    }
+
+    #[test]
+    fn test_invalid_page_type_and_slot_errors() {
+        let mut raw = vec![0u8; PAGE_SIZE];
+        raw[OFF_PAGE_TYPE] = 0;
+        assert!(page_next_id(&raw).is_err());
+        assert!(read_segment_header(&raw).is_err());
+        assert!(
+            write_segment_header(
+                &mut raw,
+                UndoSegmentHeader {
+                    txn_id: 0,
+                    begin_lsn: 0,
+                    commit_lsn: 0,
+                    state: SEGMENT_STATE_ABORTED,
+                    first_page_id: 0,
+                    last_page_id: 0,
+                    record_count: 0,
+                    history_prev: 0,
+                    history_next: 0,
+                }
+            )
+            .is_err()
+        );
+
+        let page = new_undo_page();
+        assert!(read_record(&page, 0).is_err());
+        assert!(read_record_ref(&page, 0).is_err());
+    }
+}

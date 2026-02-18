@@ -128,3 +128,62 @@ impl MetaPage {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    fn sample_meta() -> MetaPage {
+        MetaPage {
+            root_page_id: 10,
+            next_bptree_page_id: 11,
+            next_data_page_id: 12,
+            next_undo_page_id: 13,
+            undo_free: vec![21, 22, 0, 23],
+            undo_history_head: 31,
+            undo_history_tail: 32,
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_and_zero_filtering() {
+        let meta = sample_meta();
+        let page = meta.encode();
+        let decoded = MetaPage::decode(&page).unwrap();
+        assert_eq!(decoded.root_page_id, 10);
+        assert_eq!(decoded.next_bptree_page_id, 11);
+        assert_eq!(decoded.next_data_page_id, 12);
+        assert_eq!(decoded.next_undo_page_id, 13);
+        assert_eq!(decoded.undo_free, vec![21, 22, 23]);
+        assert_eq!(decoded.undo_history_head, 31);
+        assert_eq!(decoded.undo_history_tail, 32);
+    }
+
+    #[test]
+    fn test_decode_rejects_invalid_size_magic_and_version() {
+        let err = MetaPage::decode(&[0u8; 8]).unwrap_err();
+        assert!(matches!(err, Error::InvalidPageSize(_, PAGE_SIZE)));
+
+        let mut page = vec![0u8; PAGE_SIZE];
+        page[0..8].copy_from_slice(b"BADMETA!");
+        let err = MetaPage::decode(&page).unwrap_err();
+        assert!(matches!(err, Error::Io(ref ioe) if ioe.kind() == ErrorKind::InvalidData));
+
+        let mut page = sample_meta().encode().to_vec();
+        page[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let err = MetaPage::decode(&page).unwrap_err();
+        assert!(matches!(err, Error::Io(ref ioe) if ioe.kind() == ErrorKind::InvalidData));
+    }
+
+    #[test]
+    fn test_undo_free_cap_and_stack_behavior() {
+        let mut meta = sample_meta();
+        meta.undo_free.clear();
+        for i in 0..(UNDO_FREE_CAP + 10) {
+            meta.push_free_undo((i + 1) as u64);
+        }
+        assert_eq!(meta.undo_free.len(), UNDO_FREE_CAP);
+        assert_eq!(meta.pop_free_undo(), Some(UNDO_FREE_CAP as u64));
+    }
+}
