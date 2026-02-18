@@ -143,7 +143,7 @@ async fn run_with_config(config: BenchConfig, local: &LocalSet) -> anyhow::Resul
                         let key = key_for(key_id);
                         let t0 = Instant::now();
                         if rng.gen_range(0..100) < read_ratio {
-                            let _ = compute.get(&key).await?;
+                            let _ = compute.get_exists(&key).await?;
                             local_reads += 1;
                         } else {
                             // deterministic-ish overwrite pattern to avoid growing key cardinality.
