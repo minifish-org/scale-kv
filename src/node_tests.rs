@@ -215,6 +215,72 @@ async fn test_wal_decode_rejects_truncated_frame_payload() {
 }
 
 #[tokio::test]
+async fn test_append_wal_batch_rejects_out_of_order_start_lsn() {
+    let dir = temp_dir();
+    let node = StorageNode::open(dir.path()).await.unwrap();
+    let durable = node.durable_lsn();
+    let batch = WalBatch {
+        request_id: 0,
+        start_lsn: durable + 1,
+        end_lsn: durable + 2,
+        records: vec![WalRecord {
+            lsn: durable + 1,
+            op: WAL_OP_PAGE_IMAGE,
+            page_id: 1,
+            slot_id: 0,
+            key: vec![],
+            value: vec![0u8; PAGE_SIZE],
+        }],
+    };
+    let err = node.append_wal_batch_sync(batch).await.unwrap_err();
+    assert!(matches!(err, crate::Error::Io(ref ioe) if ioe.kind() == ErrorKind::InvalidInput));
+}
+
+#[tokio::test]
+async fn test_append_wal_batch_rejects_invalid_range_and_length() {
+    let dir = temp_dir();
+    let node = StorageNode::open(dir.path()).await.unwrap();
+    let durable = node.durable_lsn();
+
+    let bad_range = WalBatch {
+        request_id: 0,
+        start_lsn: durable,
+        end_lsn: durable.saturating_sub(1),
+        records: vec![],
+    };
+    let err = node.append_wal_batch_sync(bad_range).await.unwrap_err();
+    assert!(matches!(err, crate::Error::Io(ref ioe) if ioe.kind() == ErrorKind::InvalidInput));
+
+    let bad_len = WalBatch {
+        request_id: 0,
+        start_lsn: durable,
+        end_lsn: durable + 2,
+        records: vec![WalRecord {
+            lsn: durable,
+            op: WAL_OP_PAGE_IMAGE,
+            page_id: 1,
+            slot_id: 0,
+            key: vec![],
+            value: vec![0u8; PAGE_SIZE],
+        }],
+    };
+    let err = node.append_wal_batch_sync(bad_len).await.unwrap_err();
+    assert!(matches!(err, crate::Error::Io(ref ioe) if ioe.kind() == ErrorKind::InvalidInput));
+}
+
+#[tokio::test]
+async fn test_append_txn_batch_rejects_empty_writes() {
+    let dir = temp_dir();
+    let node = StorageNode::open(dir.path()).await.unwrap();
+    let durable = node.durable_lsn();
+    let err = node
+        .append_txn_batch_with_lsn_sync(7, durable, durable, vec![])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::Error::Io(ref ioe) if ioe.kind() == ErrorKind::InvalidInput));
+}
+
+#[tokio::test]
 async fn test_replay_page_records_applies_updates() {
     let dir = temp_dir();
     let page_store = Arc::new(PageStore::open(dir.path()).await.unwrap());

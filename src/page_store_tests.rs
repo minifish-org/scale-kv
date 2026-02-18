@@ -12,6 +12,21 @@ fn make_page(fill: u8) -> Vec<u8> {
     page
 }
 
+async fn wait_until(
+    timeout: Duration,
+    interval: Duration,
+    mut predicate: impl FnMut() -> bool,
+) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if predicate() {
+            return true;
+        }
+        tokio::time::sleep(interval).await;
+    }
+    predicate()
+}
+
 #[tokio::test]
 async fn test_open_empty() {
     let dir = temp_dir();
@@ -287,9 +302,15 @@ async fn test_background_checkpoint() {
         store.put(i, &page, i + 1).unwrap();
     }
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    assert_eq!(store.buffer_stats().dirty_count, 0);
+    let drained = wait_until(Duration::from_secs(2), Duration::from_millis(20), || {
+        store.buffer_stats().dirty_count == 0
+    })
+    .await;
+    assert!(
+        drained,
+        "dirty pages were not checkpointed in time, dirty_count={}",
+        store.buffer_stats().dirty_count
+    );
     assert!(store.checkpoint_lsn() >= 15);
 
     store.shutdown();
@@ -423,15 +444,17 @@ async fn test_background_checkpoint_with_eviction() {
         store.put(i, &page, i + 1).unwrap();
     }
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
+    let converged = wait_until(Duration::from_secs(2), Duration::from_millis(20), || {
+        store.len() <= buffer_config.max_pages + buffer_config.eviction_batch_size
+            && store.buffer_stats().dirty_count == 0
+    })
+    .await;
     assert!(
-        store.len() <= buffer_config.max_pages + buffer_config.eviction_batch_size,
-        "Buffer pool should be evicted to ~max_pages, got {}",
-        store.len()
+        converged,
+        "background checkpoint+eviction did not converge, len={} dirty_count={}",
+        store.len(),
+        store.buffer_stats().dirty_count
     );
-
-    assert_eq!(store.buffer_stats().dirty_count, 0);
 
     store.shutdown();
     handle.await.unwrap();
