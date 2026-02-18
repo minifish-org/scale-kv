@@ -25,13 +25,7 @@ fn parse_arg(args: &[String], key: &str) -> Option<String> {
         .cloned()
 }
 
-fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let input = parse_arg(&args, "--in")
-        .ok_or_else(|| anyhow::anyhow!("missing required --in <jsonl_path>"))?;
-    let output = parse_arg(&args, "--out");
-
-    let content = fs::read_to_string(&input)?;
+fn parse_rows(content: &str) -> anyhow::Result<Vec<Row>> {
     let mut rows = Vec::new();
     for line in content.lines() {
         let line = line.trim();
@@ -40,6 +34,10 @@ fn main() -> anyhow::Result<()> {
         }
         rows.push(serde_json::from_str::<Row>(line)?);
     }
+    Ok(rows)
+}
+
+fn render_report(mut rows: Vec<Row>, input: &str) -> anyhow::Result<String> {
     if rows.is_empty() {
         return Err(anyhow::anyhow!("no benchmark rows found in {}", input));
     }
@@ -111,6 +109,21 @@ fn main() -> anyhow::Result<()> {
     }
     report.push('\n');
 
+    Ok(report)
+}
+
+fn build_report_from_args(args: &[String]) -> anyhow::Result<(String, Option<String>)> {
+    let input = parse_arg(&args, "--in")
+        .ok_or_else(|| anyhow::anyhow!("missing required --in <jsonl_path>"))?;
+    let output = parse_arg(&args, "--out");
+
+    let content = fs::read_to_string(&input)?;
+    let rows = parse_rows(&content)?;
+    let report = render_report(rows, &input)?;
+    Ok((report, output))
+}
+
+fn write_report(report: &str, output: Option<String>) -> anyhow::Result<()> {
     if let Some(path) = output {
         fs::write(&path, report)?;
         eprintln!("wrote report: {}", path);
@@ -119,4 +132,90 @@ fn main() -> anyhow::Result<()> {
         out.write_all(report.as_bytes())?;
     }
     Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let (report, output) = build_report_from_args(&args)?;
+    write_report(&report, output)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_line(read_ratio: u32, concurrency: usize, throughput: f64) -> String {
+        format!(
+            "{{\"records\":1000,\"ops\":5000,\"concurrency\":{},\"read_ratio\":{},\"throughput_ops_per_sec\":{},\"p50_us\":10,\"p95_us\":20,\"p99_us\":30,\"read_ops\":1,\"write_ops\":2}}",
+            concurrency, read_ratio, throughput
+        )
+    }
+
+    #[test]
+    fn test_parse_arg_and_rows() {
+        let args = vec![
+            "perf_report".to_string(),
+            "--in".to_string(),
+            "in.jsonl".to_string(),
+        ];
+        assert_eq!(parse_arg(&args, "--in").as_deref(), Some("in.jsonl"));
+        assert!(parse_arg(&args, "--out").is_none());
+
+        let content = format!(
+            "# comment\n{}\n\n{}\n",
+            row_line(80, 4, 2000.0),
+            row_line(50, 2, 1000.0)
+        );
+        let rows = parse_rows(&content).unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let dangling = vec!["perf_report".to_string(), "--in".to_string()];
+        assert!(parse_arg(&dangling, "--in").is_none());
+    }
+
+    #[test]
+    fn test_render_report_orders_rows_and_has_best_table() {
+        let rows = vec![
+            serde_json::from_str::<Row>(&row_line(80, 8, 3000.0)).unwrap(),
+            serde_json::from_str::<Row>(&row_line(80, 4, 3500.0)).unwrap(),
+            serde_json::from_str::<Row>(&row_line(20, 2, 500.0)).unwrap(),
+        ];
+        let report = render_report(rows, "x.jsonl").unwrap();
+        assert!(report.contains("# Performance Baseline Report"));
+        assert!(report.contains("| 80 | 4 | 3500.00 |"));
+        assert!(report.contains("| 20 | 2 | 500.00 |"));
+    }
+
+    #[test]
+    fn test_render_report_rejects_empty() {
+        assert!(render_report(Vec::new(), "empty.jsonl").is_err());
+    }
+
+    #[test]
+    fn test_parse_rows_rejects_invalid_json() {
+        let err = parse_rows("{bad-json").unwrap_err().to_string();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn test_build_and_write_report_from_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let in_path = dir.path().join("in.jsonl");
+        let out_path = dir.path().join("out.md");
+        let content = format!("{}\n", row_line(80, 4, 2000.0));
+        fs::write(&in_path, content).unwrap();
+
+        let args = vec![
+            "perf_report".to_string(),
+            "--in".to_string(),
+            in_path.display().to_string(),
+            "--out".to_string(),
+            out_path.display().to_string(),
+        ];
+        let (report, output) = build_report_from_args(&args).unwrap();
+        write_report(&report, output).unwrap();
+        let written = fs::read_to_string(out_path).unwrap();
+        assert!(written.contains("Performance Baseline Report"));
+    }
 }

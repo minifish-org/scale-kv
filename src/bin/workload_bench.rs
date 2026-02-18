@@ -68,6 +68,13 @@ fn percentile_us(mut values: Vec<u64>, p: f64) -> u64 {
     values[rank.min(values.len() - 1)]
 }
 
+fn is_transient_by_text(msg: &str) -> bool {
+    msg.contains("quorum not reached")
+        || msg.contains("out of order")
+        || msg.contains("wal backpressure")
+        || msg.contains("WouldBlock")
+}
+
 async fn put_with_retry(compute: &EmbeddedCompute, key: &[u8], value: &[u8]) -> anyhow::Result<()> {
     const MAX_ATTEMPTS: usize = 12;
     let mut backoff = Duration::from_millis(1);
@@ -76,10 +83,7 @@ async fn put_with_retry(compute: &EmbeddedCompute, key: &[u8], value: &[u8]) -> 
             Ok(_) => return Ok(()),
             Err(err) => {
                 let msg = err.to_string();
-                let transient_by_text = msg.contains("quorum not reached")
-                    || msg.contains("out of order")
-                    || msg.contains("wal backpressure")
-                    || msg.contains("WouldBlock");
+                let transient_by_text = is_transient_by_text(&msg);
                 if attempt == MAX_ATTEMPTS || (!err.is_retryable() && !transient_by_text) {
                     return Err(anyhow::anyhow!(
                         "put failed after {attempt} attempts: {err}"
@@ -93,22 +97,8 @@ async fn put_with_retry(compute: &EmbeddedCompute, key: &[u8], value: &[u8]) -> 
     Err(anyhow::anyhow!("put failed unexpectedly"))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let addr: SocketAddr = parse_arg(&args, "--addr")
-        .unwrap_or_else(|| "127.0.0.1:50051".to_string())
-        .parse()?;
-    let config = BenchConfig {
-        addr,
-        records: parse_usize(&args, "--records", 100_000),
-        ops: parse_usize(&args, "--ops", 200_000),
-        concurrency: parse_usize(&args, "--concurrency", 16).max(1),
-        read_ratio: parse_u32(&args, "--read-ratio", 80).min(100),
-    };
-
-    let local = LocalSet::new();
-    let cfg = config.clone();
+async fn run_with_config(config: BenchConfig, local: &LocalSet) -> anyhow::Result<()> {
+    let cfg = config;
     local
         .run_until(async {
             let addrs = vec![cfg.addr.to_string()];
@@ -213,4 +203,87 @@ async fn main() -> anyhow::Result<()> {
     // Let stdout flush in constrained runners.
     tokio::time::sleep(Duration::from_millis(5)).await;
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let addr: SocketAddr = parse_arg(&args, "--addr")
+        .unwrap_or_else(|| "127.0.0.1:50051".to_string())
+        .parse()?;
+    let config = BenchConfig {
+        addr,
+        records: parse_usize(&args, "--records", 100_000),
+        ops: parse_usize(&args, "--ops", 200_000),
+        concurrency: parse_usize(&args, "--concurrency", 16).max(1),
+        read_ratio: parse_u32(&args, "--read-ratio", 80).min(100),
+    };
+
+    let local = LocalSet::new();
+    run_with_config(config, &local).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scale_kv::StorageServer;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_parse_helpers_and_key_value_layout() {
+        let args = vec![
+            "workload_bench".to_string(),
+            "--records".to_string(),
+            "123".to_string(),
+            "--read-ratio".to_string(),
+            "77".to_string(),
+        ];
+        assert_eq!(parse_usize(&args, "--records", 1), 123);
+        assert_eq!(parse_usize(&args, "--missing", 9), 9);
+        assert_eq!(parse_u32(&args, "--read-ratio", 0), 77);
+        assert_eq!(parse_u32(&args, "--none", 11), 11);
+
+        let k = key_for(5);
+        assert_eq!(k.len(), KEY_SIZE);
+        assert_eq!(&k[..8], &5u64.to_le_bytes());
+        let v = value_for(9);
+        assert_eq!(v.len(), VALUE_SIZE);
+        assert_eq!(&v[..8], &9u64.to_le_bytes());
+    }
+
+    #[test]
+    fn test_percentiles_and_transient_message_matcher() {
+        assert_eq!(percentile_us(vec![], 0.5), 0);
+        assert_eq!(percentile_us(vec![1, 100, 10], 0.5), 10);
+        assert_eq!(percentile_us(vec![1, 100, 10], 0.99), 100);
+
+        assert!(is_transient_by_text("wal backpressure"));
+        assert!(is_transient_by_text("WouldBlock"));
+        assert!(is_transient_by_text("quorum not reached"));
+        assert!(!is_transient_by_text("invalid key"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_with_config_smoke() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let dir = tempdir().unwrap();
+                let server = StorageServer::start_with_dir(
+                    "127.0.0.1:0".parse().unwrap(),
+                    dir.path().to_path_buf(),
+                )
+                .await
+                .unwrap();
+                let cfg = BenchConfig {
+                    addr: server.addr(),
+                    records: 32,
+                    ops: 32,
+                    concurrency: 2,
+                    read_ratio: 70,
+                };
+                run_with_config(cfg, &local).await.unwrap();
+            })
+            .await;
+    }
 }

@@ -50,3 +50,69 @@ impl StorageQuorumClient {
         Ok(*lsns.get(self.quorum - 1).unwrap_or(&0))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EmbeddedCompute, KEY_SIZE, StorageServer, VALUE_SIZE};
+    use tempfile::tempdir;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_connect_rejects_empty_and_unreachable_quorum() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                assert!(StorageQuorumClient::connect(&[], 1, &local).await.is_err());
+
+                let dir = tempdir().unwrap();
+                let server = StorageServer::start_with_dir(
+                    "127.0.0.1:0".parse().unwrap(),
+                    dir.path().to_path_buf(),
+                )
+                .await
+                .unwrap();
+                let addrs = vec![server.addr().to_string(), "127.0.0.1:1".to_string()];
+                let err = match StorageQuorumClient::connect(&addrs, 2, &local).await {
+                    Ok(_) => panic!("connect should fail when reachable nodes are below quorum"),
+                    Err(e) => e.to_string(),
+                };
+                assert!(err.contains("not enough reachable storage nodes"));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_quorum_durable_lsn_smoke() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let dir1 = tempdir().unwrap();
+                let dir2 = tempdir().unwrap();
+                let s1 = StorageServer::start_with_dir(
+                    "127.0.0.1:0".parse().unwrap(),
+                    dir1.path().to_path_buf(),
+                )
+                .await
+                .unwrap();
+                let s2 = StorageServer::start_with_dir(
+                    "127.0.0.1:0".parse().unwrap(),
+                    dir2.path().to_path_buf(),
+                )
+                .await
+                .unwrap();
+                let addrs = vec![s1.addr().to_string(), s2.addr().to_string()];
+
+                let compute = EmbeddedCompute::connect(&addrs, 2, &local).await.unwrap();
+                let key = [9u8; KEY_SIZE];
+                let value = vec![7u8; VALUE_SIZE];
+                compute.put(&key, &value).await.unwrap();
+
+                let quorum = StorageQuorumClient::connect(&addrs, 2, &local)
+                    .await
+                    .unwrap();
+                let lsn = quorum.quorum_durable_lsn().await.unwrap();
+                assert!(lsn > 0);
+            })
+            .await;
+    }
+}

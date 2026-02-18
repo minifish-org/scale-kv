@@ -496,14 +496,12 @@ current API surface and no longer reflected the actively maintained performance 
 
 **Current benchmark entrypoints**:
 - `src/bin/workload_bench.rs` (workload-oriented benchmark runner)
-- `src/bin/compare_bench.rs` (backend comparison runner)
-- `src/bin/simple_bench.rs` (single-run sanity benchmark)
+- `src/bin/perf_report.rs` (report generator for benchmark jsonl outputs)
 
 **Running Benchmarks**:
 ```bash
 cargo run --release --bin workload_bench -- --help
-cargo run --release --bin compare_bench -- --help
-cargo run --release --bin simple_bench -- --help
+cargo run --release --bin perf_report -- --help
 ```
 
 ---

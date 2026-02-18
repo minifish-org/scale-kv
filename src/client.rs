@@ -132,3 +132,79 @@ impl StorageClient {
         Ok((out, durable))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PAGE_SIZE, StorageServer};
+    use bytes::Bytes;
+    use tempfile::tempdir;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_connect_rejects_unreachable_address() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                assert!(StorageClient::connect("127.0.0.1:1", &local).await.is_err());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_client_roundtrip_append_get_and_scan() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let dir = tempdir().unwrap();
+                let server = StorageServer::start_with_dir(
+                    "127.0.0.1:0".parse().unwrap(),
+                    dir.path().to_path_buf(),
+                )
+                .await
+                .unwrap();
+                let addr = server.addr().to_string();
+
+                let client = StorageClient::connect(&addr, &local).await.unwrap();
+                let _lsn0 = client.get_durable_lsn().await.unwrap();
+                assert!(client.get_page(42).await.unwrap().is_none());
+
+                let page = Bytes::from(vec![7u8; PAGE_SIZE]);
+                let start_lsn = 1;
+                let end_lsn = 2;
+                let (_commit_lsn, durable_lsn) = client
+                    .append_txn_batch(1, start_lsn, end_lsn, &[(42, page.clone())])
+                    .await
+                    .unwrap();
+                assert!(durable_lsn >= end_lsn);
+
+                let got = client.get_page(42).await.unwrap().unwrap();
+                assert_eq!(got.0, page);
+                assert_eq!(got.1, start_lsn);
+
+                let (pages, durable_after_scan) = client.scan_pages(0, 10).await.unwrap();
+                assert!(!pages.is_empty());
+                assert!(durable_after_scan >= end_lsn);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_connect_local_smoke() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let dir = tempdir().unwrap();
+                let server = StorageServer::start_with_dir(
+                    "127.0.0.1:0".parse().unwrap(),
+                    dir.path().to_path_buf(),
+                )
+                .await
+                .unwrap();
+                let addr = server.addr().to_string();
+
+                let client = StorageClient::connect_local(&addr).await.unwrap();
+                let _ = client.get_durable_lsn().await.unwrap();
+            })
+            .await;
+    }
+}
