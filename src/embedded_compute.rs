@@ -1,3 +1,5 @@
+#![allow(clippy::arc_with_non_send_sync)]
+
 use crate::compute_sequencer::ComputeSequencer;
 use crate::embedded_compute_runtime::{
     InProcessPageStore, InProcessSequencer, PendingTxn, Sequencer,
@@ -106,8 +108,8 @@ impl EmbeddedCompute {
         ));
 
         // Demand page fetcher (cache miss -> storage getPage).
-        let reader0 = readers.get(0).cloned().ok_or_else(|| {
-            Error::Io(std::io::Error::new(std::io::ErrorKind::Other, "no readers"))
+        let reader0 = readers.first().cloned().ok_or_else(|| {
+            Error::Io(std::io::Error::other("no readers"))
         })?;
         let page_fetcher: Arc<
             dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>,
@@ -454,9 +456,8 @@ impl EmbeddedCompute {
             return Ok(self.warmed_pages());
         }
         let limit_per_batch = limit_per_batch.max(1);
-        let reader = self.readers.get(0).ok_or_else(|| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+        let reader = self.readers.first().ok_or_else(|| {
+            Error::Io(std::io::Error::other(
                 "no storage readers",
             ))
         })?;
@@ -1536,14 +1537,14 @@ impl EmbeddedTxn {
             count_meta.next_bptree_page_id = self.compute.provider.next_page_id();
         }
         if let Some(first_pid) = self.undo_segment_first_page_id {
-            if !map.contains_key(&first_pid) {
+            if let std::collections::btree_map::Entry::Vacant(e) = map.entry(first_pid) {
                 let head_page = self
                     .compute
                     .page_cache
                     .get(first_pid)
                     .or_else(|| self.ro_cache.get(&first_pid).map(|p| p.as_ref().clone()))
                     .ok_or(Error::InMemoryPageMissing(first_pid))?;
-                map.insert(first_pid, head_page);
+                e.insert(head_page);
             }
             let old_tail = base_meta.undo_history_tail;
             if old_tail != 0 && !map.contains_key(&old_tail) {
@@ -1696,12 +1697,10 @@ impl EmbeddedTxn {
                 drop(posting_state_guard);
             }
             let _ = self.compute.remove_pending_txn(request_id).await;
-        } else {
-            if let Some(mut posting_state_guard) = posting_state_guard_opt
-                && let Some(posting_state_before) = posting_state_before_opt
-            {
-                *posting_state_guard = posting_state_before;
-            }
+        } else if let Some(mut posting_state_guard) = posting_state_guard_opt
+            && let Some(posting_state_before) = posting_state_before_opt
+        {
+            *posting_state_guard = posting_state_before;
         }
 
         // Mark snapshot inactive before returning.

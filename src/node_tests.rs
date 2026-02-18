@@ -765,8 +765,10 @@ async fn test_metrics_snapshot_exposes_core_fields() {
 #[tokio::test]
 async fn test_invalid_maintenance_config_fails_fast() {
     let dir = temp_dir();
-    let mut cfg = StorageMaintenanceConfig::default();
-    cfg.max_wal_segments = 0;
+    let cfg = StorageMaintenanceConfig {
+        max_wal_segments: 0,
+        ..StorageMaintenanceConfig::default()
+    };
     let err = match StorageNode::open_with_maintenance(dir.path(), cfg).await {
         Ok(_) => panic!("expected invalid config failure"),
         Err(err) => err,
@@ -799,10 +801,12 @@ async fn test_checkpoint_sync_failure_is_reported_and_recovers() {
 #[tokio::test]
 async fn test_wal_backpressure_under_tight_byte_limit() {
     let dir = temp_dir();
-    let mut maintenance = StorageMaintenanceConfig::default();
-    maintenance.max_wal_bytes = 1;
-    maintenance.max_wal_segments = usize::MAX;
-    maintenance.truncate_wal = false;
+    let maintenance = StorageMaintenanceConfig {
+        max_wal_bytes: 1,
+        max_wal_segments: usize::MAX,
+        truncate_wal: false,
+        ..StorageMaintenanceConfig::default()
+    };
 
     let node = StorageNode::open_with_maintenance(dir.path(), maintenance)
         .await

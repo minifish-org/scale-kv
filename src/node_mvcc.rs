@@ -75,13 +75,12 @@ pub(super) fn gc_mvcc_versions(
             }
         }
 
-        if let Some(idx) = last_visible {
-            if idx > 0 {
+        if let Some(idx) = last_visible
+            && idx > 0 {
                 versions.drain(..idx);
                 keys_touched += 1;
                 versions_removed += idx;
             }
-        }
     }
 
     (keys_touched, versions_removed)

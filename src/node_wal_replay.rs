@@ -12,11 +12,12 @@ use std::time::Instant;
 use tokio::fs::File;
 use tokio::sync::mpsc::Receiver;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn wal_replay_loop(
     replay: PageStoreReplay,
     mut rx: Receiver<super::WalBatch>,
     mvcc: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
-    request_index: Arc<std::sync::Mutex<HashMap<u64, u64>>>,
+    request_index: Arc<tokio::sync::RwLock<HashMap<u64, u64>>>,
     active_reads: Arc<ActiveReads>,
     durable_lsn: Arc<std::sync::atomic::AtomicU64>,
     maintenance: StorageMaintenanceConfig,
@@ -28,8 +29,8 @@ pub(super) async fn wal_replay_loop(
         // Build requestId -> commitLsn mapping for idempotent retry.
         if batch.request_id != 0 {
             request_index
-                .lock()
-                .unwrap()
+                .write()
+                .await
                 .insert(batch.request_id, batch.end_lsn);
         }
 
@@ -146,7 +147,7 @@ pub(super) async fn replay_wal_segments_to_store(
     last_applied_lsn: u64,
     page_index: Arc<std::sync::Mutex<HashSet<PageId>>>,
     mvcc: &Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
-    request_index: &Arc<std::sync::Mutex<HashMap<u64, u64>>>,
+    request_index: &Arc<tokio::sync::RwLock<HashMap<u64, u64>>>,
 ) -> Result<()> {
     let mut segments = list_wal_segments(dir).await?;
     segments.sort_unstable();
@@ -172,8 +173,8 @@ pub(super) async fn replay_wal_segments_to_store(
 
             if batch.request_id != 0 {
                 request_index
-                    .lock()
-                    .unwrap()
+                    .write()
+                    .await
                     .insert(batch.request_id, batch.end_lsn);
             }
             apply_txn_batch_to_mvcc(mvcc, &batch);

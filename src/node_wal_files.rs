@@ -26,13 +26,11 @@ pub(super) async fn list_wal_segments(dir: &Path) -> Result<Vec<u64>> {
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(rest) = name.strip_prefix(&format!("{}-", WAL_SEGMENT_PREFIX)) {
-            if let Some(id_part) = rest.strip_suffix(".log") {
-                if let Ok(id) = id_part.parse::<u64>() {
+        if let Some(rest) = name.strip_prefix(&format!("{}-", WAL_SEGMENT_PREFIX))
+            && let Some(id_part) = rest.strip_suffix(".log")
+                && let Ok(id) = id_part.parse::<u64>() {
                     segments.push(id);
                 }
-            }
-        }
     }
     segments.sort_unstable();
     Ok(segments)

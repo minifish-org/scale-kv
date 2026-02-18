@@ -113,9 +113,9 @@ fn render_report(mut rows: Vec<Row>, input: &str) -> anyhow::Result<String> {
 }
 
 fn build_report_from_args(args: &[String]) -> anyhow::Result<(String, Option<String>)> {
-    let input = parse_arg(&args, "--in")
+    let input = parse_arg(args, "--in")
         .ok_or_else(|| anyhow::anyhow!("missing required --in <jsonl_path>"))?;
-    let output = parse_arg(&args, "--out");
+    let output = parse_arg(args, "--out");
 
     let content = fs::read_to_string(&input)?;
     let rows = parse_rows(&content)?;

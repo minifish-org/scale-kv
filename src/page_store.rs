@@ -111,6 +111,7 @@ impl PageFile {
     async fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)
@@ -316,8 +317,10 @@ impl PageStore {
 
     pub fn buffer_stats(&self) -> BufferStats {
         let pool = self.buffer_pool.read().unwrap();
-        let mut stats = BufferStats::default();
-        stats.total_pages = pool.len();
+        let mut stats = BufferStats {
+            total_pages: pool.len(),
+            ..BufferStats::default()
+        };
 
         for bp in pool.values() {
             if bp.dirty {
@@ -440,11 +443,10 @@ impl PageStore {
         {
             let pool = self.buffer_pool.read().unwrap();
             for (page_id, _, is_dirty) in sorted.iter().take(to_evict) {
-                if *is_dirty {
-                    if let Some(bp) = pool.get(page_id) {
+                if *is_dirty
+                    && let Some(bp) = pool.get(page_id) {
                         dirty_to_flush.push((*page_id, bp.data.to_vec()));
                     }
-                }
             }
         }
 

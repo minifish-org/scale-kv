@@ -79,11 +79,11 @@ fn build_maintenance_from_args(args: &[String]) -> StorageMaintenanceConfig {
 }
 
 async fn run_with_args(args: &[String], run_forever: bool) -> anyhow::Result<()> {
-    let addr: SocketAddr = parse_arg(&args, "--addr")
+    let addr: SocketAddr = parse_arg(args, "--addr")
         .unwrap_or_else(|| "127.0.0.1:0".to_string())
         .parse()?;
 
-    let dir: PathBuf = match parse_arg(&args, "--dir") {
+    let dir: PathBuf = match parse_arg(args, "--dir") {
         Some(v) => PathBuf::from(v),
         None => {
             let port = addr.port();
@@ -91,9 +91,9 @@ async fn run_with_args(args: &[String], run_forever: bool) -> anyhow::Result<()>
         }
     };
 
-    let maintenance = build_maintenance_from_args(&args);
-    let metrics_interval_secs = parse_u64_or_default(&args, "--metrics-interval-secs", 0);
-    let metrics_format = parse_arg(&args, "--metrics-format").unwrap_or_else(|| "json".to_string());
+    let maintenance = build_maintenance_from_args(args);
+    let metrics_interval_secs = parse_u64_or_default(args, "--metrics-interval-secs", 0);
+    let metrics_format = parse_arg(args, "--metrics-format").unwrap_or_else(|| "json".to_string());
 
     eprintln!(
         "storage_server effective_config: {}",

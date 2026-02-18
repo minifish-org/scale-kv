@@ -257,7 +257,7 @@ pub struct StorageNode {
     // MVCC store for txnGet/appendTxnBatch. Key is raw bytes.
     mvcc: Arc<std::sync::Mutex<BTreeMap<Vec<u8>, Vec<MvccVersion>>>>,
     // requestId -> commitLsn (end_lsn) for idempotent retry
-    request_index: Arc<std::sync::Mutex<HashMap<u64, u64>>>,
+    request_index: Arc<tokio::sync::RwLock<HashMap<u64, u64>>>,
     // Active read snapshots for MVCC GC watermark.
     active_reads: Arc<ActiveReads>,
     maintenance: StorageMaintenanceConfig,
@@ -449,7 +449,7 @@ impl StorageNode {
         let page_store = Arc::new(page_store);
         let page_index = Arc::new(std::sync::Mutex::new(HashSet::new()));
         let mvcc = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-        let request_index = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let request_index = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
         let active_reads = Arc::new(ActiveReads::new());
         let metrics = Arc::new(StorageMetricsInner::default());
         replay_wal_segments_to_store(
@@ -769,11 +769,10 @@ impl StorageNode {
         writes: Vec<(PageId, Page)>,
     ) -> Result<u64> {
         // Idempotent retry: if we've already committed this request_id, return the same commit_lsn.
-        if request_id != 0 {
-            if let Some(lsn) = self.request_index.lock().unwrap().get(&request_id).copied() {
+        if request_id != 0
+            && let Some(lsn) = self.request_index.read().await.get(&request_id).copied() {
                 return Ok(lsn);
             }
-        }
 
         if writes.is_empty() {
             return Err(crate::Error::Io(Error::new(
@@ -819,8 +818,8 @@ impl StorageNode {
         let commit_lsn = self.append_wal_batch_sync(batch).await?;
         if request_id != 0 {
             self.request_index
-                .lock()
-                .unwrap()
+                .write()
+                .await
                 .insert(request_id, commit_lsn);
         }
         Ok(commit_lsn)

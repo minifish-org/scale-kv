@@ -163,7 +163,7 @@ async fn test_shared_page_provider() {
     tree.insert(key.clone(), slot.clone()).await.unwrap();
     assert_leaf_matches(tree.get(&key).await, Some(&slot));
 
-    assert!(pages.len() >= 1);
+    assert!(!pages.is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]

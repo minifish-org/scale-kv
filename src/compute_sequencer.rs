@@ -41,8 +41,7 @@ impl ComputeSequencer {
                 quorum,
                 errs.join(" | ")
             );
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::Io(std::io::Error::other(
                 msg,
             )));
         }
@@ -216,8 +215,7 @@ impl ComputeSequencer {
                 }
                 msg.push(']');
             }
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::Io(std::io::Error::other(
                 msg,
             )));
         }

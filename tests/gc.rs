@@ -70,7 +70,7 @@ async fn test_gc_respects_active_read_lsn() {
             // Ensure undo freelist is populated (best-effort).
             let meta_bytes = compute.cached_page(scale_kv::META_PAGE_ID).unwrap();
             let meta = scale_kv::MetaPage::decode(&meta_bytes).unwrap();
-            assert!(meta.undo_free.len() > 0);
+            assert!(!meta.undo_free.is_empty());
         })
         .await;
 

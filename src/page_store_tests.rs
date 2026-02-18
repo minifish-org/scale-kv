@@ -277,14 +277,14 @@ async fn test_maybe_checkpoint() {
 
     let page = make_page(1);
     store.put(1, &page, 100).unwrap();
-    assert_eq!(store.maybe_checkpoint(&config).await.unwrap(), false);
+    assert!(!store.maybe_checkpoint(&config).await.unwrap());
     assert_eq!(store.buffer_stats().dirty_count, 1);
 
     let page = make_page(2);
     store.put(2, &page, 101).unwrap();
     let page = make_page(3);
     store.put(3, &page, 102).unwrap();
-    assert_eq!(store.maybe_checkpoint(&config).await.unwrap(), true);
+    assert!(store.maybe_checkpoint(&config).await.unwrap());
     assert_eq!(store.buffer_stats().dirty_count, 0);
     assert_eq!(store.checkpoint_lsn(), 102);
 }

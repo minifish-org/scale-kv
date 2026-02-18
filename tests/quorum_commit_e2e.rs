@@ -1,3 +1,5 @@
+#![allow(clippy::arc_with_non_send_sync)]
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -129,9 +131,11 @@ async fn test_quorum_commit_succeeds_with_one_backpressured_node() {
                 .await
                 .unwrap();
 
-            let mut bad_cfg = StorageMaintenanceConfig::default();
-            bad_cfg.max_wal_bytes = 1;
-            bad_cfg.truncate_wal = false;
+            let bad_cfg = StorageMaintenanceConfig {
+                max_wal_bytes: 1,
+                truncate_wal: false,
+                ..StorageMaintenanceConfig::default()
+            };
             let s3 = StorageServer::start_with_dir_and_maintenance(addr, dir3.clone(), bad_cfg)
                 .await
                 .unwrap();
@@ -192,9 +196,11 @@ async fn test_quorum_commit_fails_when_quorum_requires_backpressured_node() {
                 .await
                 .unwrap();
 
-            let mut bad_cfg = StorageMaintenanceConfig::default();
-            bad_cfg.max_wal_bytes = 1;
-            bad_cfg.truncate_wal = false;
+            let bad_cfg = StorageMaintenanceConfig {
+                max_wal_bytes: 1,
+                truncate_wal: false,
+                ..StorageMaintenanceConfig::default()
+            };
             let s3 = StorageServer::start_with_dir_and_maintenance(addr, dir3.clone(), bad_cfg)
                 .await
                 .unwrap();

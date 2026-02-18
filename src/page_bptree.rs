@@ -217,7 +217,7 @@ impl PageCache {
 
         let count = shards.max(1);
         let cap = capacity_pages.max(1);
-        let per = (cap + count - 1) / count;
+        let per = cap.div_ceil(count);
         let per = NonZeroUsize::new(per.max(1)).unwrap();
 
         let mut out = Vec::with_capacity(count);
@@ -267,6 +267,10 @@ impl PageCache {
             .iter()
             .map(|shard| shard.lock().unwrap().len())
             .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn latch_table(&self) -> Arc<PageLatchTable> {
@@ -442,6 +446,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
     /// - Writers use top-down split/merge-before-descend with write-latch coupling.
     /// - The parent is always write-latched while fixing an unsafe child.
     /// - We never upgrade from child to parent, avoiding upgrade deadlocks.
+    ///
     /// Known limits:
     /// - Range/key gap locks are not implemented, so phantom protection is not provided.
     /// - Readers are lock-coupled for physical safety, but are not a serializable snapshot.
@@ -461,7 +466,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 .provider
                 .read_page(current_id)
                 .await
-                .ok_or_else(|| Error::InvalidPageSize(current_id as usize, PAGE_SIZE))?
+                .ok_or(Error::InvalidPageSize(current_id as usize, PAGE_SIZE))?
                 .to_vec();
             let current_header = page_header(&current_page);
 
@@ -469,7 +474,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 let (found, pos) = find_key_pos(&current_page, &key).unwrap_or((false, 0));
                 if found {
                     let offset = entry_offset_at(&current_page, pos)
-                        .ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
+                        .ok_or(Error::InvalidPageSize(pos, PAGE_SIZE))?;
                     let value_offset = offset + KEY_SIZE;
                     current_page[value_offset..value_offset + LEAF_VALUE_SIZE]
                         .copy_from_slice(&encoded);
@@ -495,7 +500,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 .provider
                 .read_page(child_id)
                 .await
-                .ok_or_else(|| Error::InvalidPageSize(child_id as usize, PAGE_SIZE))?;
+                .ok_or(Error::InvalidPageSize(child_id as usize, PAGE_SIZE))?;
             let child_header = page_header(&child_page);
 
             if page_is_full_for_insert(child_header) {
@@ -599,7 +604,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 .provider
                 .read_page(descend_id)
                 .await
-                .ok_or_else(|| Error::InvalidPageSize(descend_id as usize, PAGE_SIZE))?
+                .ok_or(Error::InvalidPageSize(descend_id as usize, PAGE_SIZE))?
                 .to_vec();
             let mut child_header = page_header(&child_page);
             let min_keys = min_keys_non_root(child_header.page_type);
@@ -615,7 +620,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                         .provider
                         .read_page(left_id)
                         .await
-                        .ok_or_else(|| Error::InvalidPageSize(left_id as usize, PAGE_SIZE))?;
+                        .ok_or(Error::InvalidPageSize(left_id as usize, PAGE_SIZE))?;
                     Some((left_id, left_guard, left_page))
                 } else {
                     None
@@ -627,7 +632,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                         let mut left_entries = collect_entries(&left_page);
                         let mut child_entries = collect_entries(&child_page);
                         if child_type == PAGE_TYPE_LEAF {
-                            let borrowed = left_entries.pop().ok_or_else(|| {
+                            let borrowed = left_entries.pop().ok_or({
                                 Error::InvalidPageSize(left_id as usize, PAGE_SIZE)
                             })?;
                             child_entries.insert(0, borrowed);
@@ -647,7 +652,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                         } else {
                             let sep_idx = child_pos - 1;
                             let parent_sep = parent_entries[sep_idx].0.clone();
-                            let (up_key, up_right_child) = left_entries.pop().ok_or_else(|| {
+                            let (up_key, up_right_child) = left_entries.pop().ok_or({
                                 Error::InvalidPageSize(left_id as usize, PAGE_SIZE)
                             })?;
                             let old_left = child_header.left_child;
@@ -688,7 +693,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                         .provider
                         .read_page(right_id)
                         .await
-                        .ok_or_else(|| Error::InvalidPageSize(right_id as usize, PAGE_SIZE))?;
+                        .ok_or(Error::InvalidPageSize(right_id as usize, PAGE_SIZE))?;
                     Some((right_id, right_guard, right_page))
                 } else {
                     None
@@ -793,7 +798,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                         .provider
                         .read_page(left_id)
                         .await
-                        .ok_or_else(|| Error::InvalidPageSize(left_id as usize, PAGE_SIZE))?
+                        .ok_or(Error::InvalidPageSize(left_id as usize, PAGE_SIZE))?
                         .to_vec();
                     let mut left_entries = collect_entries(&left_page);
                     if child_type == PAGE_TYPE_LEAF {
@@ -837,8 +842,8 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 if found {
                     let rebuilt = rebuild_page_with_remove(&child_page, child_header, pos)?;
                     self.provider.write_page(descend_id, rebuilt.clone()).await;
-                    if child_pos > 0 && pos == 0 {
-                        if let Some(new_first) = entry_key_at(&rebuilt, 0) {
+                    if child_pos > 0 && pos == 0
+                        && let Some(new_first) = entry_key_at(&rebuilt, 0) {
                             let mut parent_entries = collect_entries(&current_page);
                             parent_entries[child_pos - 1].0 = new_first.to_vec();
                             let mut parent_rebuilt = current_page.to_vec();
@@ -861,7 +866,6 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                                     .await;
                             }
                         }
-                    }
                     self.len
                         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                             Some(v.saturating_sub(1))
@@ -1310,7 +1314,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
             .provider
             .read_page(root_id)
             .await
-            .ok_or_else(|| Error::InvalidPageSize(root_id as usize, PAGE_SIZE))?;
+            .ok_or(Error::InvalidPageSize(root_id as usize, PAGE_SIZE))?;
         let root_header = page_header(&root);
         if !page_is_full_for_insert(root_header) {
             return Ok(());
@@ -1362,6 +1366,7 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn split_child_and_update_parent(
         &self,
         parent_id: PageId,
@@ -1417,9 +1422,9 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
 
     #[cfg(test)]
     pub async fn validate(&self) -> std::result::Result<(), String> {
+        type ValidateFrame = (PageId, Option<Vec<u8>>, Option<Vec<u8>>);
         let root_id = self.provider.root_page_id();
-        let mut stack: Vec<(PageId, Option<Vec<u8>>, Option<Vec<u8>>)> =
-            vec![(root_id, None, None)];
+        let mut stack: Vec<ValidateFrame> = vec![(root_id, None, None)];
         let mut seen = HashSet::new();
         let mut leaves = HashSet::new();
 
@@ -1695,7 +1700,7 @@ fn write_u16(page: &mut [u8], offset: usize, value: u16) {
     page[offset..offset + 2].copy_from_slice(&bytes);
 }
 
-fn entry_key_at<'a>(page: &'a [u8], index: usize) -> Option<&'a [u8]> {
+fn entry_key_at(page: &[u8], index: usize) -> Option<&[u8]> {
     let header = page_header(page);
     if index >= header.key_count as usize {
         return None;
@@ -1711,7 +1716,7 @@ fn entry_key_at<'a>(page: &'a [u8], index: usize) -> Option<&'a [u8]> {
     Some(&page[entry_offset..key_end])
 }
 
-fn entry_value_at<'a>(page: &'a [u8], index: usize) -> Option<&'a [u8]> {
+fn entry_value_at(page: &[u8], index: usize) -> Option<&[u8]> {
     let (key_end, value_end) = entry_value_bounds(page, index)?;
     Some(&page[key_end..value_end])
 }
@@ -1863,9 +1868,9 @@ fn rebuild_page_with_insert(
         } else {
             let idx = if pos < insert_pos { pos } else { pos - 1 };
             let k =
-                entry_key_at(page, idx).ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
+                entry_key_at(page, idx).ok_or(Error::InvalidPageSize(pos, PAGE_SIZE))?;
             let v =
-                entry_value_at(page, idx).ok_or_else(|| Error::InvalidPageSize(pos, PAGE_SIZE))?;
+                entry_value_at(page, idx).ok_or(Error::InvalidPageSize(pos, PAGE_SIZE))?;
             (k, v)
         };
 
@@ -1898,8 +1903,8 @@ fn rebuild_page_with_remove(page: &[u8], header: PageHeader, remove_pos: usize) 
         if idx == remove_pos {
             continue;
         }
-        let k = entry_key_at(page, idx).ok_or_else(|| Error::InvalidPageSize(idx, PAGE_SIZE))?;
-        let v = entry_value_at(page, idx).ok_or_else(|| Error::InvalidPageSize(idx, PAGE_SIZE))?;
+        let k = entry_key_at(page, idx).ok_or(Error::InvalidPageSize(idx, PAGE_SIZE))?;
+        let v = entry_value_at(page, idx).ok_or(Error::InvalidPageSize(idx, PAGE_SIZE))?;
         let offset_pos = HEADER_SIZE + out_pos * OFFSET_ENTRY_SIZE;
         let rel = (cursor - start) as u16;
         write_u16(&mut out, offset_pos, rel);

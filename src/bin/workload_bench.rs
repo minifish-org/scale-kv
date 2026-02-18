@@ -102,7 +102,7 @@ async fn run_with_config(config: BenchConfig, local: &LocalSet) -> anyhow::Resul
     local
         .run_until(async {
             let addrs = vec![cfg.addr.to_string()];
-            let compute = EmbeddedCompute::connect(&addrs, 1, &local).await?;
+            let compute = EmbeddedCompute::connect(&addrs, 1, local).await?;
 
             let load_start = Instant::now();
             let mut i = 0u64;
