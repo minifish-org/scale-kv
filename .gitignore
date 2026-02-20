@@ -26,3 +26,9 @@ target
 /target
 # Storage data directory
 data/
+
+# macOS Finder metadata
+.DS_Store
+
+# wasm-pack build output
+wasm-pkg/

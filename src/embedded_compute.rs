@@ -36,9 +36,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::LocalSet;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 #[path = "embedded_compute_recovery.rs"]
 mod embedded_compute_recovery;
@@ -72,6 +76,24 @@ pub struct EmbeddedCompute {
 }
 
 impl EmbeddedCompute {
+    async fn sleep_ms(ms: u64) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            gloo_timers::future::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_duration_env_ms(name: &str, default_ms: u64) -> Duration {
+        let _ = name;
+        Duration::from_millis(default_ms)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn read_duration_env_ms(name: &str, default_ms: u64) -> Duration {
         let ms = std::env::var(name)
             .ok()
@@ -79,6 +101,21 @@ impl EmbeddedCompute {
             .filter(|v| *v > 0)
             .unwrap_or(default_ms);
         Duration::from_millis(ms)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_usize_env(name: &str, default_value: usize) -> usize {
+        let _ = name;
+        default_value
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_usize_env(name: &str, default_value: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default_value)
     }
 
     pub async fn connect(addrs: &[String], quorum: usize, local: &LocalSet) -> Result<Self> {
@@ -96,11 +133,7 @@ impl EmbeddedCompute {
         // Our page size is 16KB, so 128MB ~= 8192 pages.
         // Override via env SCALE_KV_PAGE_CACHE_PAGES.
         let default_pages: usize = 8 * 1024;
-        let capacity_pages: usize = std::env::var("SCALE_KV_PAGE_CACHE_PAGES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(default_pages);
+        let capacity_pages: usize = Self::read_usize_env("SCALE_KV_PAGE_CACHE_PAGES", default_pages);
 
         let page_cache = Arc::new(PageCache::new_with_capacity(
             DEFAULT_PAGE_CACHE_SHARDS,
@@ -127,7 +160,7 @@ impl EmbeddedCompute {
                         Ok(None) => return None,
                         Err(_) => {}
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    Self::sleep_ms(backoff_ms).await;
                     backoff_ms = (backoff_ms * 2).min(50);
                 }
                 None
@@ -182,11 +215,7 @@ impl EmbeddedCompute {
         // Our page size is 16KB, so 128MB ~= 8192 pages.
         // Override via env SCALE_KV_PAGE_CACHE_PAGES.
         let default_pages: usize = 8 * 1024;
-        let capacity_pages: usize = std::env::var("SCALE_KV_PAGE_CACHE_PAGES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(default_pages);
+        let capacity_pages: usize = Self::read_usize_env("SCALE_KV_PAGE_CACHE_PAGES", default_pages);
 
         let page_cache = Arc::new(PageCache::new_with_capacity(
             DEFAULT_PAGE_CACHE_SHARDS,
@@ -243,6 +272,7 @@ impl EmbeddedCompute {
         Ok(this)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn spawn_txn_reaper(&self, _local: &LocalSet) {
         let compute = self.clone();
         tokio::task::spawn_local(async move {
@@ -286,6 +316,9 @@ impl EmbeddedCompute {
             }
         });
     }
+
+    #[cfg(target_arch = "wasm32")]
+    fn spawn_txn_reaper(&self, _local: &LocalSet) {}
 
     pub(crate) fn begin_ro(&self) -> u64 {
         self.sequencer.begin_ro()
@@ -337,8 +370,8 @@ impl EmbeddedCompute {
                 )));
             }
 
-            let sleep_until = tokio::time::Instant::from_std(deadline);
-            match tokio::time::timeout_at(sleep_until, pending.notify.notified()).await {
+            let remaining = deadline.saturating_duration_since(now);
+            match tokio::time::timeout(remaining, pending.notify.notified()).await {
                 Ok(_) => {}
                 Err(_) => {
                     return Err(Error::Io(std::io::Error::new(

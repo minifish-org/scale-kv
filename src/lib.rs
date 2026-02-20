@@ -65,6 +65,11 @@ pub mod embedded_compute;
 pub(crate) mod embedded_compute_runtime;
 pub use embedded_compute::{EmbeddedCompute, EmbeddedTxn};
 
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_compute;
+#[cfg(target_arch = "wasm32")]
+pub use wasm_compute::WasmComputeClient;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod txn_kv;
 #[cfg(not(target_arch = "wasm32"))]

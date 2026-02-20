@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>scale-kv HTTP Manual Test</title>
+    <style>
+      body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 840px; margin: 24px auto; padding: 0 16px; }
+      input, button { font: inherit; padding: 6px 8px; margin: 4px 0; }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      pre { background: #111; color: #eaeaea; padding: 12px; border-radius: 8px; overflow: auto; min-height: 120px; }
+    </style>
+  </head>
+  <body>
+    <h2>scale-kv HTTP Manual Test</h2>
+    <div class="row">
+      <label>Base URL:</label>
+      <input id="base" size="32" value="http://127.0.0.1:4001" />
+      <button id="durable">Get durable_lsn</button>
+    </div>
+    <div class="row">
+      <label>Page ID:</label>
+      <input id="pageId" type="number" value="42" />
+      <label>Byte:</label>
+      <input id="byteVal" type="number" min="0" max="255" value="7" />
+      <button id="append">Append txn batch (1 page)</button>
+      <button id="get">Get page</button>
+    </div>
+    <pre id="out"></pre>
+    <script>
+      const PAGE_SIZE = 16 * 1024;
+      const out = document.getElementById("out");
+      const log = (v) => out.textContent = typeof v === "string" ? v : JSON.stringify(v, null, 2);
+
+      const base = () => document.getElementById("base").value.replace(/\/+$/, "");
+      const pageId = () => Number(document.getElementById("pageId").value);
+      const byteVal = () => Number(document.getElementById("byteVal").value);
+
+      document.getElementById("durable").onclick = async () => {
+        try {
+          const r = await fetch(`${base()}/v1/storage/durable_lsn`);
+          log(await r.json());
+        } catch (e) { log(String(e)); }
+      };
+
+      document.getElementById("append").onclick = async () => {
+        try {
+          const d = await fetch(`${base()}/v1/storage/durable_lsn`).then(r => r.json());
+          const start = Number(d.durable_lsn || 0);
+          const page = new Uint8Array(PAGE_SIZE).fill(byteVal());
+          const payload = {
+            request_id: Date.now(),
+            start_lsn: start,
+            end_lsn: start + 1,
+            writes: [{ page_id: pageId(), page: Array.from(page) }]
+          };
+          const r = await fetch(`${base()}/v1/storage/append_txn_batch`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          log(await r.json());
+        } catch (e) { log(String(e)); }
+      };
+
+      document.getElementById("get").onclick = async () => {
+        try {
+          const r = await fetch(`${base()}/v1/storage/page/${pageId()}`);
+          const j = await r.json();
+          if (j.found) {
+            j.page_len = j.page.length;
+            j.page_head = j.page.slice(0, 16);
+            delete j.page;
+          }
+          log(j);
+        } catch (e) { log(String(e)); }
+      };
+    </script>
+  </body>
+  </html>

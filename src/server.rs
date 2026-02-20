@@ -9,6 +9,7 @@ use axum::{Json, Router};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 struct AppState {
@@ -71,6 +72,7 @@ fn build_router(data: Arc<StorageNode>) -> Router {
         .route("/v1/storage/append_txn_batch", post(append_txn_batch))
         .route("/v1/storage/page/{page_id}", get(get_page))
         .route("/v1/storage/scan_pages", post(scan_pages))
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 

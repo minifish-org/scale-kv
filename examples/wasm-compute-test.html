@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>scale-kv WASM Compute Test</title>
+    <style>
+      body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 900px; margin: 24px auto; padding: 0 16px; }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+      input, button { font: inherit; padding: 6px 8px; }
+      pre { background: #111; color: #eaeaea; padding: 12px; border-radius: 8px; min-height: 140px; overflow: auto; }
+    </style>
+  </head>
+  <body>
+    <h2>scale-kv WASM Compute (put/get)</h2>
+    <p>key/value are UTF-8, zero-padded to fixed sizes inside WASM.</p>
+
+    <div class="row">
+      <label>Storage URL:</label>
+      <input id="url" size="32" value="http://127.0.0.1:4001" />
+      <label>Quorum:</label>
+      <input id="quorum" type="number" value="1" min="1" />
+      <button id="connect">Connect WASM Compute</button>
+    </div>
+
+    <div class="row">
+      <label>Key:</label>
+      <input id="key" size="20" value="demo-key" />
+      <label>Value:</label>
+      <input id="value" size="40" value="hello-from-wasm-compute" />
+      <button id="put">putUtf8</button>
+      <button id="get">getUtf8</button>
+      <button id="del">deleteUtf8</button>
+    </div>
+
+    <pre id="out"></pre>
+
+    <script type="module">
+      import init, { WasmComputeClient } from "../wasm-pkg/scale_kv.js";
+
+      const out = document.getElementById("out");
+      const log = (v) => {
+        if (typeof v === "string") {
+          out.textContent = v;
+          return;
+        }
+        out.textContent = JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x.toString() : x), 2);
+      };
+      let client = null;
+      let wasmReady = false;
+
+      const withTimeout = (promise, ms, label) => {
+        let t = null;
+        const timeout = new Promise((_, reject) => {
+          t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+        });
+        return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+      };
+
+      try {
+        await init("../wasm-pkg/scale_kv_bg.wasm");
+        wasmReady = true;
+        log({ status: "wasm loaded", keySize: WasmComputeClient.keySize(), valueSize: WasmComputeClient.valueSize() });
+      } catch (e) {
+        log(`wasm init error: ${e}`);
+      }
+
+      document.getElementById("connect").onclick = async () => {
+        if (!wasmReady) return log("wasm not ready");
+        log("connecting...");
+        try {
+          const url = document.getElementById("url").value.trim();
+          const quorum = Number(document.getElementById("quorum").value || "1");
+          client = await withTimeout(WasmComputeClient.connect(url, quorum), 10000, "connect");
+          log({ status: "connected", url, quorum });
+        } catch (e) {
+          log(`connect error: ${e}`);
+        }
+      };
+
+      document.getElementById("put").onclick = async () => {
+        if (!client) return log("not connected");
+        try {
+          const key = document.getElementById("key").value;
+          const value = document.getElementById("value").value;
+          const lsn = await client.putUtf8(key, value);
+          log({ op: "putUtf8", key, lsn });
+        } catch (e) {
+          log(`put error: ${e}`);
+        }
+      };
+
+      document.getElementById("get").onclick = async () => {
+        if (!client) return log("not connected");
+        try {
+          const key = document.getElementById("key").value;
+          const value = await client.getUtf8(key);
+          log({ op: "getUtf8", key, value });
+        } catch (e) {
+          log(`get error: ${e}`);
+        }
+      };
+
+      document.getElementById("del").onclick = async () => {
+        if (!client) return log("not connected");
+        try {
+          const key = document.getElementById("key").value;
+          const lsn = await client.deleteUtf8(key);
+          log({ op: "deleteUtf8", key, lsn });
+        } catch (e) {
+          log(`delete error: ${e}`);
+        }
+      };
+
+      window.addEventListener("error", (e) => {
+        log(`window error: ${e.message}`);
+      });
+      window.addEventListener("unhandledrejection", (e) => {
+        log(`unhandled rejection: ${e.reason}`);
+      });
+    </script>
+  </body>
+  </html>
