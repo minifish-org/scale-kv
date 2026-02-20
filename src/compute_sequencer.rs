@@ -30,7 +30,10 @@ impl ComputeSequencer {
         let mut errs = Vec::new();
         for addr in addrs {
             match StorageClient::connect(addr, local).await {
-                Ok(c) => clients.push(c),
+                Ok(c) => match c.get_durable_lsn().await {
+                    Ok(_) => clients.push(c),
+                    Err(e) => errs.push(format!("{addr}: {e}")),
+                },
                 Err(e) => errs.push(format!("{addr}: {e}")),
             }
         }

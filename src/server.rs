@@ -1,169 +1,38 @@
-// Page-level redo only needs page image operations.
-use crate::storage_capnp::storage;
-use crate::{Page, Result, StorageMaintenanceConfig, StorageNode};
-use capnp::capability::Promise;
-use capnp_rpc::RpcSystem;
-use capnp_rpc::rpc_twoparty_capnp::Side;
-use capnp_rpc::twoparty::VatNetwork;
+use crate::http_protocol::{
+    AppendTxnBatchRequest, AppendTxnBatchResponse, DurableLsnResponse, GetPageResponse,
+    ScanPageItem, ScanPagesRequest, ScanPagesResponse,
+};
+use crate::{Page, StorageMaintenanceConfig, StorageNode};
+use axum::extract::{Path, State};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::{TcpListener, TcpStream};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+#[derive(Clone)]
+struct AppState {
+    data: Arc<StorageNode>,
+}
 
 pub struct StorageServer {
     data: Arc<StorageNode>,
     addr: SocketAddr,
 }
 
-struct StorageService {
-    data: Arc<StorageNode>,
-}
-
-impl storage::Server for StorageService {
-    fn get_durable_lsn(
-        &mut self,
-        _params: storage::GetDurableLsnParams,
-        mut results: storage::GetDurableLsnResults,
-    ) -> Promise<(), capnp::Error> {
-        let data = self.data.clone();
-        Promise::from_future(async move {
-            results.get().set_durable_lsn(data.durable_lsn());
-            Ok(())
-        })
-    }
-
-    fn append_txn_batch(
-        &mut self,
-        params: storage::AppendTxnBatchParams,
-        mut results: storage::AppendTxnBatchResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(err) => return Promise::err(err),
-        };
-        let batch = match params.get_batch() {
-            Ok(b) => b,
-            Err(err) => return Promise::err(err),
-        };
-
-        let request_id = batch.get_request_id();
-        let start_lsn = batch.get_start_lsn();
-        let end_lsn = batch.get_end_lsn();
-        let writes = match batch.get_writes() {
-            Ok(w) => w,
-            Err(err) => return Promise::err(err),
-        };
-
-        let mut page_writes: Vec<(u64, Page)> = Vec::with_capacity(writes.len() as usize);
-        for w in writes.iter() {
-            let page_id = w.get_page_id();
-            let page = match w.get_page() {
-                Ok(p) => Page::copy_from_slice(p),
-                Err(err) => return Promise::err(err),
-            };
-            page_writes.push((page_id, page));
-        }
-
-        let data = self.data.clone();
-        Promise::from_future(async move {
-            let commit_lsn = data
-                .append_txn_batch_with_lsn_sync(request_id, start_lsn, end_lsn, page_writes)
-                .await
-                .map_err(|err| capnp::Error::failed(err.to_string()))?;
-            let mut res = results.get();
-            res.set_commit_lsn(commit_lsn);
-            res.set_durable_lsn(data.durable_lsn());
-            Ok(())
-        })
-    }
-
-    fn get_page(
-        &mut self,
-        params: storage::GetPageParams,
-        mut results: storage::GetPageResults,
-    ) -> Promise<(), capnp::Error> {
-        let page_id = match params.get() {
-            Ok(p) => p.get_page_id(),
-            Err(err) => return Promise::err(err),
-        };
-        let data = self.data.clone();
-        Promise::from_future(async move {
-            let mut res = results.get();
-            res.set_durable_lsn(data.durable_lsn());
-            match data.get_page_latest(page_id).await {
-                Some((page, page_lsn)) => {
-                    res.set_found(true);
-                    res.set_page(&page);
-                    res.set_page_lsn(page_lsn);
-                }
-                None => {
-                    res.set_found(false);
-                }
-            }
-            Ok(())
-        })
-    }
-
-    fn scan_pages(
-        &mut self,
-        params: storage::ScanPagesParams,
-        mut results: storage::ScanPagesResults,
-    ) -> Promise<(), capnp::Error> {
-        let params = match params.get() {
-            Ok(p) => p,
-            Err(err) => return Promise::err(err),
-        };
-        let start_page_id = params.get_start_page_id();
-        let limit = params.get_limit();
-
-        let data = self.data.clone();
-        Promise::from_future(async move {
-            let pages = data.scan_pages_latest(start_page_id, limit as usize).await;
-
-            let mut res = results.get();
-            res.set_durable_lsn(data.durable_lsn());
-            let mut out = res.init_pages(pages.len() as u32);
-            for (i, (page_id, page_lsn, page)) in pages.into_iter().enumerate() {
-                let mut item = out.reborrow().get(i as u32);
-                item.set_page_id(page_id);
-                item.set_page_lsn(page_lsn);
-                item.set_page(&page);
-            }
-            Ok(())
-        })
-    }
-}
-
 impl StorageServer {
-    pub async fn start(addr: SocketAddr) -> Result<Self> {
-        let listener = TcpListener::bind(addr).await?;
+    pub async fn start(addr: SocketAddr) -> crate::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         let data = Arc::new(StorageNode::new().await);
-
-        let data_clone = data.clone();
-        tokio::task::spawn(async move {
-            loop {
-                let accept = listener.accept().await;
-                let (stream, _) = match accept {
-                    Ok(pair) => pair,
-                    Err(_) => break,
-                };
-                let data = data_clone.clone();
-                // Use spawn_blocking because RPC system is not Send
-                tokio::task::spawn_blocking(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let _ = handle_connection(stream, data).await;
-                    });
-                });
-            }
+        let app = build_router(data.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
         });
-
         Ok(Self { data, addr })
     }
 
-    pub async fn start_with_dir(addr: SocketAddr, dir: PathBuf) -> Result<Self> {
+    pub async fn start_with_dir(addr: SocketAddr, dir: PathBuf) -> crate::Result<Self> {
         Self::start_with_dir_and_maintenance(addr, dir, StorageMaintenanceConfig::default()).await
     }
 
@@ -171,30 +40,14 @@ impl StorageServer {
         addr: SocketAddr,
         dir: PathBuf,
         maintenance: StorageMaintenanceConfig,
-    ) -> Result<Self> {
-        let listener = TcpListener::bind(addr).await?;
+    ) -> crate::Result<Self> {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
         let data = Arc::new(StorageNode::open_with_maintenance(dir, maintenance).await?);
-
-        let data_clone = data.clone();
-        tokio::task::spawn(async move {
-            loop {
-                let accept = listener.accept().await;
-                let (stream, _) = match accept {
-                    Ok(pair) => pair,
-                    Err(_) => break,
-                };
-                let data = data_clone.clone();
-                // Use spawn_blocking because RPC system is not Send
-                tokio::task::spawn_blocking(move || {
-                    let rt = tokio::runtime::Runtime::new().unwrap();
-                    rt.block_on(async {
-                        let _ = handle_connection(stream, data).await;
-                    });
-                });
-            }
+        let app = build_router(data.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
         });
-
         Ok(Self { data, addr })
     }
 
@@ -211,14 +64,88 @@ impl StorageServer {
     }
 }
 
-pub async fn handle_connection(stream: TcpStream, data: Arc<StorageNode>) -> Result<()> {
-    let (reader, writer) = stream.into_split();
-    let reader = reader.compat();
-    let writer = writer.compat_write();
+fn build_router(data: Arc<StorageNode>) -> Router {
+    let state = AppState { data };
+    Router::new()
+        .route("/v1/storage/durable_lsn", get(get_durable_lsn))
+        .route("/v1/storage/append_txn_batch", post(append_txn_batch))
+        .route("/v1/storage/page/{page_id}", get(get_page))
+        .route("/v1/storage/scan_pages", post(scan_pages))
+        .with_state(state)
+}
 
-    let network = VatNetwork::new(reader, writer, Side::Server, Default::default());
-    let client: storage::Client = capnp_rpc::new_client(StorageService { data });
-    let rpc_system = RpcSystem::new(Box::new(network), Some(client.client));
+async fn get_durable_lsn(State(state): State<AppState>) -> Json<DurableLsnResponse> {
+    Json(DurableLsnResponse {
+        durable_lsn: state.data.durable_lsn(),
+    })
+}
 
-    rpc_system.await.map_err(|err| err.into())
+async fn append_txn_batch(
+    State(state): State<AppState>,
+    Json(req): Json<AppendTxnBatchRequest>,
+) -> std::result::Result<Json<AppendTxnBatchResponse>, (axum::http::StatusCode, String)> {
+    let writes: Vec<(u64, Page)> = req
+        .writes
+        .into_iter()
+        .map(|w| (w.page_id, Page::from(w.page)))
+        .collect();
+
+    let commit_lsn = match state
+        .data
+        .append_txn_batch_with_lsn_sync(req.request_id, req.start_lsn, req.end_lsn, writes)
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => return Err(internal_error(err)),
+    };
+
+    Ok(Json(AppendTxnBatchResponse {
+        commit_lsn,
+        durable_lsn: state.data.durable_lsn(),
+    }))
+}
+
+async fn get_page(
+    State(state): State<AppState>,
+    Path(page_id): Path<u64>,
+) -> Json<GetPageResponse> {
+    if let Some((page, page_lsn)) = state.data.get_page_latest(page_id).await {
+        return Json(GetPageResponse {
+            durable_lsn: state.data.durable_lsn(),
+            found: true,
+            page_lsn,
+            page: page.to_vec(),
+        });
+    }
+    Json(GetPageResponse {
+        durable_lsn: state.data.durable_lsn(),
+        found: false,
+        page_lsn: 0,
+        page: Vec::new(),
+    })
+}
+
+async fn scan_pages(
+    State(state): State<AppState>,
+    Json(req): Json<ScanPagesRequest>,
+) -> Json<ScanPagesResponse> {
+    let pages = state
+        .data
+        .scan_pages_latest(req.start_page_id, req.limit as usize)
+        .await
+        .into_iter()
+        .map(|(page_id, page_lsn, page)| ScanPageItem {
+            page_id,
+            page_lsn,
+            page: page.to_vec(),
+        })
+        .collect();
+    Json(ScanPagesResponse {
+        durable_lsn: state.data.durable_lsn(),
+        pages,
+    })
+}
+
+fn internal_error(err: crate::Error) -> (axum::http::StatusCode, String) {
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
 }

@@ -15,7 +15,9 @@ pub use page_bptree::{
 pub mod active_reads;
 pub use active_reads::{ActiveReadInfo, ActiveReads, ReadGuard};
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod page_store;
+#[cfg(not(target_arch = "wasm32"))]
 pub use page_store::{BufferPoolConfig, BufferStats, CheckpointConfig, PageStore};
 
 pub mod meta_page;
@@ -32,16 +34,20 @@ pub use undo_pg::{UNDO_RECORD_SIZE, UndoPtr};
 pub mod txn_page_provider;
 pub use txn_page_provider::TxnPageProvider;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod node;
+#[cfg(not(target_arch = "wasm32"))]
 pub use node::{MvccReadHandle, StorageMaintenanceConfig, StorageMetricsSnapshot, StorageNode};
 
 pub mod client;
 pub use client::StorageClient;
 
-pub mod server;
-pub use server::StorageServer;
+pub mod http_protocol;
 
-pub mod storage_capnp;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod server;
+#[cfg(not(target_arch = "wasm32"))]
+pub use server::StorageServer;
 
 pub mod quorum_client;
 pub use quorum_client::StorageQuorumClient;
@@ -59,5 +65,7 @@ pub mod embedded_compute;
 pub(crate) mod embedded_compute_runtime;
 pub use embedded_compute::{EmbeddedCompute, EmbeddedTxn};
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod txn_kv;
+#[cfg(not(target_arch = "wasm32"))]
 pub use txn_kv::{Txn, TxnError, TxnErrorCategory, TxnManager};

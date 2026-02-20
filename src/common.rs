@@ -24,8 +24,6 @@ pub enum ErrorCategory {
 pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("capnp error: {0}")]
-    Capnp(String),
     #[error("invalid page size: {0} (expected {1})")]
     InvalidPageSize(usize, usize),
     #[error("invalid value size: {0} (max {1})")]
@@ -38,12 +36,6 @@ pub enum Error {
     TxnTimeout,
 }
 
-impl From<capnp::Error> for Error {
-    fn from(err: capnp::Error) -> Self {
-        Error::Capnp(err.to_string())
-    }
-}
-
 impl Error {
     pub fn category(&self) -> ErrorCategory {
         match self {
@@ -52,7 +44,6 @@ impl Error {
             | Error::InvalidKeySize(_, _) => ErrorCategory::InvalidInput,
             Error::TxnTimeout => ErrorCategory::Timeout,
             Error::InMemoryPageMissing(_) => ErrorCategory::Internal,
-            Error::Capnp(_) => ErrorCategory::Unavailable,
             Error::Io(err) => match err.kind() {
                 std::io::ErrorKind::InvalidInput
                 | std::io::ErrorKind::AlreadyExists

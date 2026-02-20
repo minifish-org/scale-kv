@@ -1,60 +1,40 @@
-use crate::storage_capnp::storage;
+use crate::http_protocol::{
+    AppendTxnBatchRequest, AppendTxnBatchResponse, DurableLsnResponse, GetPageResponse, PageWrite,
+    ScanPagesRequest, ScanPagesResponse,
+};
 use crate::{Page, PageId, Result};
-use capnp_rpc::RpcSystem;
-use capnp_rpc::rpc_twoparty_capnp::Side;
-use capnp_rpc::twoparty::VatNetwork;
-use futures::FutureExt;
-use tokio::net::TcpStream;
+use reqwest::StatusCode;
 use tokio::task::LocalSet;
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-/// Cap'n Proto RPC client for talking to a storage node.
+/// HTTP client for talking to a storage node.
 ///
-/// Note: This is a low-level storage client. Compute-side APIs live elsewhere.
+/// The transport protocol is unified HTTP for native and wasm targets.
 pub struct StorageClient {
-    client: storage::Client,
-    _task: tokio::task::JoinHandle<()>,
+    client: reqwest::Client,
+    base_url: String,
 }
 
 impl StorageClient {
-    pub async fn connect(addr: &str, local: &LocalSet) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        let (reader, writer) = stream.into_split();
-        let reader = reader.compat();
-        let writer = writer.compat_write();
-
-        let network = VatNetwork::new(reader, writer, Side::Client, Default::default());
-        let mut rpc_system = RpcSystem::new(Box::new(network), None);
-        let client: storage::Client = rpc_system.bootstrap(Side::Server);
-        let task = local.spawn_local(rpc_system.map(|_| ()));
-
+    pub async fn connect(addr: &str, _local: &LocalSet) -> Result<Self> {
         Ok(Self {
-            client,
-            _task: task,
+            client: reqwest::Client::new(),
+            base_url: normalize_base_url(addr),
         })
     }
 
     pub async fn connect_local(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        let (reader, writer) = stream.into_split();
-        let reader = reader.compat();
-        let writer = writer.compat_write();
-
-        let network = VatNetwork::new(reader, writer, Side::Client, Default::default());
-        let mut rpc_system = RpcSystem::new(Box::new(network), None);
-        let client: storage::Client = rpc_system.bootstrap(Side::Server);
-        let task = tokio::task::spawn_local(rpc_system.map(|_| ()));
-
         Ok(Self {
-            client,
-            _task: task,
+            client: reqwest::Client::new(),
+            base_url: normalize_base_url(addr),
         })
     }
 
     pub async fn get_durable_lsn(&self) -> Result<u64> {
-        let request = self.client.get_durable_lsn_request();
-        let response = request.send().promise.await?;
-        Ok(response.get()?.get_durable_lsn())
+        let url = format!("{}/v1/storage/durable_lsn", self.base_url);
+        let response = self.client.get(url).send().await.map_err(http_err)?;
+        ensure_http_success(response.status())?;
+        let body: DurableLsnResponse = response.json().await.map_err(http_err)?;
+        Ok(body.durable_lsn)
     }
 
     /// Append a txn batch with compute-assigned LSN range.
@@ -67,42 +47,46 @@ impl StorageClient {
         end_lsn: u64,
         writes: &[(PageId, Page)],
     ) -> Result<(u64, u64)> {
-        let mut request = self.client.append_txn_batch_request();
-        {
-            let p = request.get();
-            let mut b = p.init_batch();
-            b.set_request_id(request_id);
-            b.set_start_lsn(start_lsn);
-            b.set_end_lsn(end_lsn);
-            let mut list = b.init_writes(writes.len() as u32);
-            for (i, (page_id, page)) in writes.iter().enumerate() {
-                let mut w = list.reborrow().get(i as u32);
-                w.set_page_id(*page_id);
-                w.set_page(page);
-            }
-        }
-        let response = request.send().promise.await?;
-        let r = response.get()?;
-        Ok((r.get_commit_lsn(), r.get_durable_lsn()))
+        let payload = AppendTxnBatchRequest {
+            request_id,
+            start_lsn,
+            end_lsn,
+            writes: writes
+                .iter()
+                .map(|(page_id, page)| PageWrite {
+                    page_id: *page_id,
+                    page: page.to_vec(),
+                })
+                .collect(),
+        };
+        let url = format!("{}/v1/storage/append_txn_batch", self.base_url);
+        let response = self
+            .client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(http_err)?;
+        ensure_http_success(response.status())?;
+        let body: AppendTxnBatchResponse = response.json().await.map_err(http_err)?;
+        Ok((body.commit_lsn, body.durable_lsn))
     }
 
     /// Fetch a raw page by id (latest only).
     /// Returns (page, page_lsn, durable_lsn).
     pub async fn get_page(&self, page_id: PageId) -> Result<Option<(Page, u64, u64)>> {
-        let mut request = self.client.get_page_request();
-        request.get().set_page_id(page_id);
-        let response = request.send().promise.await?;
-        let r = response.get()?;
-        let durable = r.get_durable_lsn();
-        if r.get_found() {
-            Ok(Some((
-                Page::copy_from_slice(r.get_page()?),
-                r.get_page_lsn(),
-                durable,
-            )))
-        } else {
-            Ok(None)
+        let url = format!("{}/v1/storage/page/{page_id}", self.base_url);
+        let response = self.client.get(url).send().await.map_err(http_err)?;
+        ensure_http_success(response.status())?;
+        let body: GetPageResponse = response.json().await.map_err(http_err)?;
+        if !body.found {
+            return Ok(None);
         }
+        Ok(Some((
+            Page::copy_from_slice(&body.page),
+            body.page_lsn,
+            body.durable_lsn,
+        )))
     }
 
     /// Bulk scan pages for warmup.
@@ -111,26 +95,47 @@ impl StorageClient {
         start_page_id: PageId,
         limit: u32,
     ) -> Result<(Vec<(PageId, u64, Page)>, u64)> {
-        let mut request = self.client.scan_pages_request();
-        {
-            let mut p = request.get();
-            p.set_start_page_id(start_page_id);
-            p.set_limit(limit);
+        let payload = ScanPagesRequest {
+            start_page_id,
+            limit,
+        };
+        let url = format!("{}/v1/storage/scan_pages", self.base_url);
+        let response = self
+            .client
+            .post(url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(http_err)?;
+        ensure_http_success(response.status())?;
+        let body: ScanPagesResponse = response.json().await.map_err(http_err)?;
+        let mut out = Vec::with_capacity(body.pages.len());
+        for item in body.pages {
+            out.push((item.page_id, item.page_lsn, Page::copy_from_slice(&item.page)));
         }
-        let response = request.send().promise.await?;
-        let r = response.get()?;
-        let durable = r.get_durable_lsn();
-        let pages = r.get_pages()?;
-        let mut out = Vec::with_capacity(pages.len() as usize);
-        for item in pages.iter() {
-            out.push((
-                item.get_page_id(),
-                item.get_page_lsn(),
-                Page::copy_from_slice(item.get_page()?),
-            ));
-        }
-        Ok((out, durable))
+        Ok((out, body.durable_lsn))
     }
+}
+
+fn normalize_base_url(addr: &str) -> String {
+    let trimmed = addr.trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+    format!("http://{trimmed}")
+}
+
+fn http_err(err: reqwest::Error) -> crate::Error {
+    crate::Error::Io(std::io::Error::other(format!("http transport error: {err}")))
+}
+
+fn ensure_http_success(status: StatusCode) -> Result<()> {
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(crate::Error::Io(std::io::Error::other(format!(
+        "http status error: {status}"
+    ))))
 }
 
 #[cfg(test)]
@@ -139,13 +144,15 @@ mod tests {
     use crate::{PAGE_SIZE, StorageServer};
     use bytes::Bytes;
     use tempfile::tempdir;
+    use tokio::task::LocalSet;
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_connect_rejects_unreachable_address() {
         let local = LocalSet::new();
         local
             .run_until(async {
-                assert!(StorageClient::connect("127.0.0.1:1", &local).await.is_err());
+                let client = StorageClient::connect("127.0.0.1:1", &local).await.unwrap();
+                assert!(client.get_durable_lsn().await.is_err());
             })
             .await;
     }
@@ -190,21 +197,14 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_connect_local_smoke() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let dir = tempdir().unwrap();
-                let server = StorageServer::start_with_dir(
-                    "127.0.0.1:0".parse().unwrap(),
-                    dir.path().to_path_buf(),
-                )
+        let dir = tempdir().unwrap();
+        let server =
+            StorageServer::start_with_dir("127.0.0.1:0".parse().unwrap(), dir.path().to_path_buf())
                 .await
                 .unwrap();
-                let addr = server.addr().to_string();
+        let addr = server.addr().to_string();
 
-                let client = StorageClient::connect_local(&addr).await.unwrap();
-                let _ = client.get_durable_lsn().await.unwrap();
-            })
-            .await;
+        let client = StorageClient::connect_local(&addr).await.unwrap();
+        let _ = client.get_durable_lsn().await.unwrap();
     }
 }
