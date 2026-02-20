@@ -3,7 +3,7 @@ use crate::http_protocol::{
     ScanPageItem, ScanPagesRequest, ScanPagesResponse,
 };
 use crate::{Page, StorageMaintenanceConfig, StorageNode};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use std::net::SocketAddr;
@@ -72,6 +72,7 @@ fn build_router(data: Arc<StorageNode>) -> Router {
         .route("/v1/storage/append_txn_batch", post(append_txn_batch))
         .route("/v1/storage/page/{page_id}", get(get_page))
         .route("/v1/storage/scan_pages", post(scan_pages))
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
