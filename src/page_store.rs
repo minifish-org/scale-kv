@@ -443,10 +443,9 @@ impl PageStore {
         {
             let pool = self.buffer_pool.read().unwrap();
             for (page_id, _, is_dirty) in sorted.iter().take(to_evict) {
-                if *is_dirty
-                    && let Some(bp) = pool.get(page_id) {
-                        dirty_to_flush.push((*page_id, bp.data.to_vec()));
-                    }
+                if *is_dirty && let Some(bp) = pool.get(page_id) {
+                    dirty_to_flush.push((*page_id, bp.data.to_vec()));
+                }
             }
         }
 

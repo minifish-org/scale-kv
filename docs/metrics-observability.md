@@ -4,7 +4,7 @@ This document describes the current structured metrics output for storage nodes.
 
 ## StorageNode metrics snapshot API
 
-Path: `/Users/yusp/work/scale-kv/src/node.rs`
+Path: `src/node.rs`
 
 - `StorageNode::metrics_snapshot() -> StorageMetricsSnapshot`
 - `StorageMetricsSnapshot::render_json() -> String`
@@ -35,7 +35,7 @@ Current fields:
 
 ## storage_server structured output
 
-Path: `/Users/yusp/work/scale-kv/src/bin/storage_server.rs`
+Path: `src/bin/storage_server.rs`
 
 Flags:
 

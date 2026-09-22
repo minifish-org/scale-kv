@@ -4,7 +4,7 @@ Status: active
 
 ## Benchmark runner
 
-Path: `/Users/yusp/work/scale-kv/src/bin/workload_bench.rs`
+Path: `src/bin/workload_bench.rs`
 
 CLI:
 
@@ -24,7 +24,7 @@ Output:
 
 ## Baseline matrix automation
 
-Path: `/Users/yusp/work/scale-kv/scripts/run_perf_baseline.sh`
+Path: `scripts/run_perf_baseline.sh`
 
 Default matrix:
 
@@ -77,4 +77,4 @@ This generates:
 
 Latest committed snapshot:
 
-- `/Users/yusp/work/scale-kv/docs/performance-baseline-snapshot-2026-02-12.md`
+- `docs/performance-baseline-snapshot-2026-02-12.md`

@@ -4,7 +4,7 @@ This document tracks automated failure/recovery drills for storage.
 
 ## Current automated drills
 
-Path: `/Users/yusp/work/scale-kv/src/node.rs`
+Path: `src/node.rs`
 
 - `test_wal_backpressure_under_tight_byte_limit`
   - Uses `max_wal_bytes=1` to force deterministic WAL backpressure.
@@ -23,7 +23,7 @@ Path: `/Users/yusp/work/scale-kv/src/node.rs`
 
 ## Existing quorum/failure coverage
 
-Path: `/Users/yusp/work/scale-kv/tests/quorum_commit_e2e.rs`
+Path: `tests/quorum_commit_e2e.rs`
 
 - `test_quorum_commit_with_one_ahead_node`
   - Exercises partial storage inconsistency where one node is ahead.
@@ -40,7 +40,7 @@ Path: `/Users/yusp/work/scale-kv/tests/quorum_commit_e2e.rs`
 - `test_connect_fails_if_reachable_nodes_below_quorum`
   - Verifies startup fails fast when reachable replicas are below quorum.
 
-Path: `/Users/yusp/work/scale-kv/tests/txn_kv.rs`
+Path: `tests/txn_kv.rs`
 
 - `test_quorum_staggered_restart_preserves_latest_value`
   - Simulates staged restart where one replica is temporarily out of the write path.

@@ -15,7 +15,7 @@ internal-only interfaces.
 
 ## 2. Compute API (Rust)
 
-Type: `EmbeddedCompute` (`/Users/yusp/work/scale-kv/src/embedded_compute.rs`)
+Type: `EmbeddedCompute` (`src/embedded_compute.rs`)
 
 ### Stable
 
@@ -43,7 +43,7 @@ Type: `EmbeddedCompute` (`/Users/yusp/work/scale-kv/src/embedded_compute.rs`)
 
 ## 3. Transaction KV API (Rust)
 
-Type: `TxnManager` (`/Users/yusp/work/scale-kv/src/txn_kv.rs`)
+Type: `TxnManager` (`src/txn_kv.rs`)
 
 ### Stable
 
@@ -68,7 +68,7 @@ Design rule:
 
 ## 4. Storage RPC API (Cap'n Proto)
 
-Schema: `/Users/yusp/work/scale-kv/schema/storage.capnp`
+Schema: `schema/storage.capnp`
 
 ### Stable
 
@@ -83,7 +83,7 @@ Schema: `/Users/yusp/work/scale-kv/schema/storage.capnp`
 
 ## 5. Storage Node Admin API (Rust local)
 
-Type: `StorageNode` (`/Users/yusp/work/scale-kv/src/node.rs`)
+Type: `StorageNode` (`src/node.rs`)
 
 ### Stable (operational)
 

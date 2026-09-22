@@ -263,10 +263,7 @@ impl PageCache {
     }
 
     pub fn len(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| shard.lock().len())
-            .sum()
+        self.shards.iter().map(|shard| shard.lock().len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -629,9 +626,9 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                         let mut left_entries = collect_entries(&left_page);
                         let mut child_entries = collect_entries(&child_page);
                         if child_type == PAGE_TYPE_LEAF {
-                            let borrowed = left_entries.pop().ok_or({
-                                Error::InvalidPageSize(left_id as usize, PAGE_SIZE)
-                            })?;
+                            let borrowed = left_entries
+                                .pop()
+                                .ok_or(Error::InvalidPageSize(left_id as usize, PAGE_SIZE))?;
                             child_entries.insert(0, borrowed);
                             let new_sep = child_entries[0].0.clone();
                             parent_entries[child_pos - 1].0 = new_sep.clone();
@@ -649,9 +646,9 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                         } else {
                             let sep_idx = child_pos - 1;
                             let parent_sep = parent_entries[sep_idx].0.clone();
-                            let (up_key, up_right_child) = left_entries.pop().ok_or({
-                                Error::InvalidPageSize(left_id as usize, PAGE_SIZE)
-                            })?;
+                            let (up_key, up_right_child) = left_entries
+                                .pop()
+                                .ok_or(Error::InvalidPageSize(left_id as usize, PAGE_SIZE))?;
                             let old_left = child_header.left_child;
                             child_header.left_child = decode_child_id(&up_right_child);
                             child_entries.insert(0, (parent_sep, encode_child_id(old_left)));
@@ -839,30 +836,31 @@ impl<P: AsyncPageProvider> PageBPlusTree<P> {
                 if found {
                     let rebuilt = rebuild_page_with_remove(&child_page, child_header, pos)?;
                     self.provider.write_page(descend_id, rebuilt.clone()).await;
-                    if child_pos > 0 && pos == 0
-                        && let Some(new_first) = entry_key_at(&rebuilt, 0) {
-                            let mut parent_entries = collect_entries(&current_page);
-                            parent_entries[child_pos - 1].0 = new_first.to_vec();
-                            let mut parent_rebuilt = current_page.to_vec();
-                            encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
-                            self.provider
-                                .write_page(current_id, Bytes::from(parent_rebuilt))
-                                .await;
+                    if child_pos > 0
+                        && pos == 0
+                        && let Some(new_first) = entry_key_at(&rebuilt, 0)
+                    {
+                        let mut parent_entries = collect_entries(&current_page);
+                        parent_entries[child_pos - 1].0 = new_first.to_vec();
+                        let mut parent_rebuilt = current_page.to_vec();
+                        encode_entries(&mut parent_rebuilt, &parent_entries, current_header)?;
+                        self.provider
+                            .write_page(current_id, Bytes::from(parent_rebuilt))
+                            .await;
 
-                            let left_id =
-                                child_id_at_pos(&current_page, current_header, child_pos - 1);
-                            let _left_guard = self.provider.acquire_write_latch(left_id).await;
-                            if let Some(mut left_page) =
-                                self.provider.read_page(left_id).await.map(|p| p.to_vec())
-                            {
-                                let mut left_header = leaf_page_header(&left_page);
-                                left_header.high_key = key_to_high_key(new_first);
-                                write_header(&mut left_page, left_header);
-                                self.provider
-                                    .write_page(left_id, Bytes::from(left_page))
-                                    .await;
-                            }
+                        let left_id = child_id_at_pos(&current_page, current_header, child_pos - 1);
+                        let _left_guard = self.provider.acquire_write_latch(left_id).await;
+                        if let Some(mut left_page) =
+                            self.provider.read_page(left_id).await.map(|p| p.to_vec())
+                        {
+                            let mut left_header = leaf_page_header(&left_page);
+                            left_header.high_key = key_to_high_key(new_first);
+                            write_header(&mut left_page, left_header);
+                            self.provider
+                                .write_page(left_id, Bytes::from(left_page))
+                                .await;
                         }
+                    }
                     self.len
                         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
                             Some(v.saturating_sub(1))
@@ -1864,10 +1862,8 @@ fn rebuild_page_with_insert(
             (key, value)
         } else {
             let idx = if pos < insert_pos { pos } else { pos - 1 };
-            let k =
-                entry_key_at(page, idx).ok_or(Error::InvalidPageSize(pos, PAGE_SIZE))?;
-            let v =
-                entry_value_at(page, idx).ok_or(Error::InvalidPageSize(pos, PAGE_SIZE))?;
+            let k = entry_key_at(page, idx).ok_or(Error::InvalidPageSize(pos, PAGE_SIZE))?;
+            let v = entry_value_at(page, idx).ok_or(Error::InvalidPageSize(pos, PAGE_SIZE))?;
             (k, v)
         };
 

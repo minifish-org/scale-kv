@@ -1,6 +1,6 @@
 use super::*;
-use bytes::Bytes;
 use crate::KEY_SIZE;
+use bytes::Bytes;
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -14,7 +14,9 @@ fn key(byte: u8) -> [u8; KEY_SIZE] {
 async fn test_wal_roundtrip() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
     let mut tx = manager.begin_rw_timeout(Duration::from_secs(30));
     tx.put(&key(1), b"v1").unwrap();
     tx.delete(&key(2)).unwrap();
@@ -22,7 +24,9 @@ async fn test_wal_roundtrip() {
     assert!(ts > 0);
     drop(manager);
 
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
     let tx = manager.begin_ro_timeout(Duration::from_secs(30));
     assert_eq!(tx.get(&key(1)).unwrap(), Some(Bytes::from_static(b"v1")));
     assert_eq!(tx.get(&key(2)).unwrap(), None);
@@ -32,7 +36,9 @@ async fn test_wal_roundtrip() {
 async fn test_txn_timeout() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
     let mut tx = manager.begin_rw_timeout(Duration::from_millis(1));
     tokio::time::sleep(Duration::from_millis(5)).await;
     let err = tx.put(&key(1), b"v1").unwrap_err();

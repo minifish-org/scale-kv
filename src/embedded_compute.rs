@@ -108,9 +108,10 @@ impl EmbeddedCompute {
         ));
 
         // Demand page fetcher (cache miss -> storage getPage).
-        let reader0 = readers.first().cloned().ok_or_else(|| {
-            Error::Io(std::io::Error::other("no readers"))
-        })?;
+        let reader0 = readers
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::Io(std::io::Error::other("no readers")))?;
         let page_fetcher: Arc<
             dyn Fn(PageId, u64) -> futures::future::LocalBoxFuture<'static, Option<Page>>,
         > = Arc::new(move |pid, need| {
@@ -456,11 +457,10 @@ impl EmbeddedCompute {
             return Ok(self.warmed_pages());
         }
         let limit_per_batch = limit_per_batch.max(1);
-        let reader = self.readers.first().ok_or_else(|| {
-            Error::Io(std::io::Error::other(
-                "no storage readers",
-            ))
-        })?;
+        let reader = self
+            .readers
+            .first()
+            .ok_or_else(|| Error::Io(std::io::Error::other("no storage readers")))?;
 
         let mut start: PageId = 0;
         loop {
@@ -1167,11 +1167,11 @@ impl EmbeddedTxn {
         let mut new_value = [0u8; VALUE_SIZE];
         new_value.copy_from_slice(value);
         let key_arr: [u8; KEY_SIZE] = key.try_into().unwrap();
-        let planned_mutations = self.compute.secondary_indexes.plan_mutations(
-            key_arr,
-            old_value.as_ref(),
-            Some(&new_value),
-        ).await?;
+        let planned_mutations = self
+            .compute
+            .secondary_indexes
+            .plan_mutations(key_arr, old_value.as_ref(), Some(&new_value))
+            .await?;
 
         let mut row = LeafValue {
             value: new_value,
@@ -1316,12 +1316,11 @@ impl EmbeddedTxn {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let pks = self.compute.secondary_indexes.query_equal(
-            index_name,
-            secondary_key,
-            self.read_lsn,
-            limit,
-        ).await?;
+        let pks = self
+            .compute
+            .secondary_indexes
+            .query_equal(index_name, secondary_key, self.read_lsn, limit)
+            .await?;
         let mut out = Vec::with_capacity(pks.len());
         for pk in pks {
             let key = pk.to_vec();

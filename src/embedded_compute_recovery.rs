@@ -16,7 +16,9 @@ impl EmbeddedCompute {
             .get_page(SECONDARY_INDEX_META_PAGE_ID, self.durable_lsn())
             .await
         else {
-            self.secondary_indexes.replace_definitions(Vec::new()).await?;
+            self.secondary_indexes
+                .replace_definitions(Vec::new())
+                .await?;
             *self.secondary_posting_log.lock().await = SecondaryPostingLogState::default();
             return Ok(());
         };
@@ -133,10 +135,10 @@ impl EmbeddedCompute {
                     .map_err(|_| Error::InvalidKeySize(key.len(), KEY_SIZE))?;
                 let mut value_arr = [0u8; VALUE_SIZE];
                 value_arr.copy_from_slice(&value);
-                let muts =
-                    self.secondary_indexes
-                        .plan_mutations(key_arr, None, Some(&value_arr))
-                        .await?;
+                let muts = self
+                    .secondary_indexes
+                    .plan_mutations(key_arr, None, Some(&value_arr))
+                    .await?;
                 for m in muts {
                     if m.index_name == index_name {
                         chunk.push(m);
@@ -144,7 +146,9 @@ impl EmbeddedCompute {
                 }
                 out_count += 1;
                 if chunk.len() >= 1024 {
-                    self.secondary_indexes.apply_commit(commit_lsn, &chunk).await;
+                    self.secondary_indexes
+                        .apply_commit(commit_lsn, &chunk)
+                        .await;
                     self.append_secondary_posting_log(commit_lsn, &chunk)
                         .await?;
                     chunk.clear();
@@ -152,7 +156,9 @@ impl EmbeddedCompute {
             }
         }
         if !chunk.is_empty() {
-            self.secondary_indexes.apply_commit(commit_lsn, &chunk).await;
+            self.secondary_indexes
+                .apply_commit(commit_lsn, &chunk)
+                .await;
             self.append_secondary_posting_log(commit_lsn, &chunk)
                 .await?;
         }
@@ -239,7 +245,9 @@ impl EmbeddedCompute {
         tx.write_page(META_PAGE_ID, meta.encode());
 
         tx.commit().await?;
-        self.secondary_indexes.replace_definitions(Vec::new()).await?;
+        self.secondary_indexes
+            .replace_definitions(Vec::new())
+            .await?;
         self.persist_secondary_index_catalog().await?;
         Ok(())
     }

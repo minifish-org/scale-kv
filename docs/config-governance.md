@@ -10,7 +10,7 @@ Status: active
 
 ## Storage maintenance config
 
-Path: `/Users/yusp/work/scale-kv/src/node.rs`
+Path: `src/node.rs`
 
 Type:
 
@@ -28,7 +28,7 @@ Effective config rendering:
 
 ## storage_server startup behavior
 
-Path: `/Users/yusp/work/scale-kv/src/bin/storage_server.rs`
+Path: `src/bin/storage_server.rs`
 
 - CLI arguments build `StorageMaintenanceConfig`.
 - Startup prints:

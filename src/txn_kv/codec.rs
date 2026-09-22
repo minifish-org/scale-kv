@@ -11,7 +11,10 @@ const SNAPSHOT_VERSION: u32 = 1;
 type WalOp = (Key, Option<Value>);
 type WalOps = Vec<WalOp>;
 
-pub(super) fn encode_payload(commit_ts: u64, writes: &HashMap<Key, Option<Value>>) -> Result<Vec<u8>> {
+pub(super) fn encode_payload(
+    commit_ts: u64,
+    writes: &HashMap<Key, Option<Value>>,
+) -> Result<Vec<u8>> {
     if writes.len() > u32::MAX as usize {
         return Err(TxnError::CorruptWal("too many ops".to_string()));
     }
@@ -169,9 +172,10 @@ pub(super) async fn write_snapshot_file(
     let mut entries: Vec<(Key, Vec<u8>)> = Vec::new();
     for (key, versions) in store {
         if let Some(version) = versions.last()
-            && let Some(value) = &version.value {
-                entries.push((*key, value.clone()));
-            }
+            && let Some(value) = &version.value
+        {
+            entries.push((*key, value.clone()));
+        }
     }
 
     if entries.len() > u32::MAX as usize {
@@ -203,9 +207,10 @@ pub(super) async fn write_snapshot_file(
     }
     tokio::fs::rename(&tmp_path, path).await?;
     if let Some(parent) = path.parent()
-        && let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
+        && let Ok(dir) = tokio::fs::File::open(parent).await
+    {
+        let _ = dir.sync_all().await;
+    }
     Ok(())
 }
 

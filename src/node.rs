@@ -350,7 +350,8 @@ impl PageStoreReplay {
     }
 
     fn last_applied(&self) -> u64 {
-        self.last_applied_lsn.load(std::sync::atomic::Ordering::Acquire)
+        self.last_applied_lsn
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     async fn update_last_applied(&self, lsn: u64) {
@@ -628,7 +629,11 @@ impl StorageNode {
         }
     }
 
-    pub async fn mvcc_get(&self, handle: &mut MvccReadHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub async fn mvcc_get(
+        &self,
+        handle: &mut MvccReadHandle,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
         if handle.is_timed_out() {
             handle.close();
             return Err(crate::Error::TxnTimeout);
@@ -639,7 +644,9 @@ impl StorageNode {
                 "mvcc read handle aborted or closed",
             )));
         }
-        Ok(mvcc_get_at(&self.mvcc, key, handle.read_lsn).await.unwrap_or(None))
+        Ok(mvcc_get_at(&self.mvcc, key, handle.read_lsn)
+            .await
+            .unwrap_or(None))
     }
 
     async fn wal_usage_exceeds(&self, incoming_bytes: u64) -> Result<Option<(usize, u64)>> {
@@ -764,9 +771,10 @@ impl StorageNode {
     ) -> Result<u64> {
         // Idempotent retry: if we've already committed this request_id, return the same commit_lsn.
         if request_id != 0
-            && let Some(lsn) = self.request_index.read().await.get(&request_id).copied() {
-                return Ok(lsn);
-            }
+            && let Some(lsn) = self.request_index.read().await.get(&request_id).copied()
+        {
+            return Ok(lsn);
+        }
 
         if writes.is_empty() {
             return Err(crate::Error::Io(Error::new(

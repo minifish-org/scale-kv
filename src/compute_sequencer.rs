@@ -41,9 +41,7 @@ impl ComputeSequencer {
                 quorum,
                 errs.join(" | ")
             );
-            return Err(Error::Io(std::io::Error::other(
-                msg,
-            )));
+            return Err(Error::Io(std::io::Error::other(msg)));
         }
         let mut lsns = Vec::with_capacity(clients.len());
         for c in &clients {
@@ -215,9 +213,7 @@ impl ComputeSequencer {
                 }
                 msg.push(']');
             }
-            return Err(Error::Io(std::io::Error::other(
-                msg,
-            )));
+            return Err(Error::Io(std::io::Error::other(msg)));
         }
 
         // Quorum-durable point is the quorum-th largest durable among acks.

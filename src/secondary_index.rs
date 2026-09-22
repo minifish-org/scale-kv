@@ -47,7 +47,10 @@ pub struct SecondaryIndexManager {
 }
 
 impl SecondaryIndexManager {
-    pub async fn replace_definitions(&self, defs: Vec<SecondaryIndexDefinition>) -> crate::Result<()> {
+    pub async fn replace_definitions(
+        &self,
+        defs: Vec<SecondaryIndexDefinition>,
+    ) -> crate::Result<()> {
         let mut new_map: HashMap<String, SecondaryIndexState> = HashMap::new();
         for def in defs {
             if def.name.is_empty() {

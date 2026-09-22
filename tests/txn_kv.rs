@@ -22,7 +22,9 @@ fn value(byte: u8) -> Bytes {
 async fn test_snapshot_reads() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
 
     let mut tx1 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx1.put(&key(1), &value(1)).unwrap();
@@ -41,7 +43,9 @@ async fn test_snapshot_reads() {
 async fn test_write_write_conflict() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
 
     let mut tx1 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     let mut tx2 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
@@ -58,7 +62,9 @@ async fn test_write_write_conflict() {
 async fn test_delete_visibility() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
 
     let mut tx1 = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx1.put(&key(3), &value(3)).unwrap();
@@ -80,7 +86,9 @@ async fn test_delete_visibility() {
 async fn test_multi_key_atomicity() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
 
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(4), &value(4)).unwrap();
@@ -102,14 +110,18 @@ async fn test_recovery_from_wal() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
     {
-        let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+        let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+            .await
+            .unwrap();
         let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
         tx.put(&key(6), &value(6)).unwrap();
         tx.put(&key(7), &value(7)).unwrap();
         tx.commit().await.unwrap();
     }
 
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
     let tx = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx.get(&key(6)).unwrap(), Some(value(6)));
     assert_eq!(tx.get(&key(7)).unwrap(), Some(value(7)));
@@ -120,7 +132,9 @@ async fn test_checkpoint_and_recovery() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
     {
-        let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+        let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+            .await
+            .unwrap();
         let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
         tx.put(&key(10), &value(10)).unwrap();
         tx.put(&key(11), &value(11)).unwrap();
@@ -128,7 +142,9 @@ async fn test_checkpoint_and_recovery() {
         manager.checkpoint().await.unwrap();
     }
 
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
     let tx = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx.get(&key(10)).unwrap(), Some(value(10)));
     assert_eq!(tx.get(&key(11)).unwrap(), Some(value(11)));
@@ -138,7 +154,9 @@ async fn test_checkpoint_and_recovery() {
 async fn test_wal_truncation_reduces_size() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
 
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(20), &value(20)).unwrap();
@@ -158,7 +176,9 @@ async fn test_wal_truncation_reduces_size() {
 async fn test_scan_basic_ordering() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
 
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(3), &value(3)).unwrap();
@@ -176,7 +196,9 @@ async fn test_scan_basic_ordering() {
 async fn test_scan_respects_snapshot() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
 
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(1), &value(1)).unwrap();
@@ -199,7 +221,9 @@ async fn test_scan_respects_snapshot() {
 async fn test_scan_overlays_writes_and_deletes() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("wal.log");
-    let manager = TxnManager::open_quorum(vec![path.clone()], 1).await.unwrap();
+    let manager = TxnManager::open_quorum(vec![path.clone()], 1)
+        .await
+        .unwrap();
 
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(1), &value(1)).unwrap();
@@ -229,7 +253,9 @@ async fn test_quorum_commit_survives_one_replica_down() {
         replica_dirs.push(path);
     }
 
-    let manager = TxnManager::open_quorum(replica_dirs.clone(), 2).await.unwrap();
+    let manager = TxnManager::open_quorum(replica_dirs.clone(), 2)
+        .await
+        .unwrap();
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(42), &value(42)).unwrap();
     tx.commit().await.unwrap();
@@ -260,7 +286,9 @@ async fn test_quorum_commit_fails_if_not_enough_replicas() {
     perms.set_mode(0o500);
     std::fs::set_permissions(bad_dir, perms).unwrap();
 
-    let manager = TxnManager::open_quorum(replica_dirs.clone(), 3).await.unwrap();
+    let manager = TxnManager::open_quorum(replica_dirs.clone(), 3)
+        .await
+        .unwrap();
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(9), &value(9)).unwrap();
     assert!(tx.commit().await.is_err());
@@ -288,13 +316,17 @@ async fn test_quorum_commit_succeeds_with_one_replica_error() {
     perms.set_mode(0o500);
     std::fs::set_permissions(bad_dir, perms).unwrap();
 
-    let manager = TxnManager::open_quorum(replica_dirs.clone(), 2).await.unwrap();
+    let manager = TxnManager::open_quorum(replica_dirs.clone(), 2)
+        .await
+        .unwrap();
     let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
     tx.put(&key(7), &value(7)).unwrap();
     tx.commit().await.unwrap();
     drop(manager);
 
-    let manager = TxnManager::open_quorum(replica_dirs.clone(), 2).await.unwrap();
+    let manager = TxnManager::open_quorum(replica_dirs.clone(), 2)
+        .await
+        .unwrap();
     let tx = manager.begin_ro_timeout(std::time::Duration::from_secs(30));
     assert_eq!(tx.get(&key(7)).unwrap(), Some(value(7)));
 
@@ -315,7 +347,9 @@ async fn test_quorum_staggered_restart_preserves_latest_value() {
 
     // Initial write with all replicas.
     {
-        let manager = TxnManager::open_quorum(replica_dirs.clone(), 2).await.unwrap();
+        let manager = TxnManager::open_quorum(replica_dirs.clone(), 2)
+            .await
+            .unwrap();
         let mut tx = manager.begin_rw_timeout(std::time::Duration::from_secs(30));
         tx.put(&key(60), &value(1)).unwrap();
         tx.commit().await.unwrap();

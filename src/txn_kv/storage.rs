@@ -6,9 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::mpsc;
 
-use super::codec::{
-    load_snapshot_file, replay_wal_with_base, snapshot_path, write_snapshot_file,
-};
+use super::codec::{load_snapshot_file, replay_wal_with_base, snapshot_path, write_snapshot_file};
 
 #[async_trait::async_trait]
 pub trait TxnStorage: Send + Sync + std::fmt::Debug {
@@ -70,7 +68,8 @@ impl TxnStorage for LocalFileStorage {
         base_ts: u64,
     ) -> Result<(BTreeMap<Key, Vec<Version>>, u64)> {
         let mut wal = self.wal.lock().await;
-        let (store, max_ts, valid_len) = replay_wal_with_base(&mut wal, base_store, base_ts).await?;
+        let (store, max_ts, valid_len) =
+            replay_wal_with_base(&mut wal, base_store, base_ts).await?;
         let file_len = wal.metadata().await?.len();
         if valid_len < file_len {
             wal.set_len(valid_len).await?;
@@ -213,7 +212,10 @@ impl QuorumStorage {
     }
 }
 
-async fn with_replica(replicas: &Arc<Vec<QuorumReplica>>, index: usize) -> Result<Arc<LocalFileStorage>> {
+async fn with_replica(
+    replicas: &Arc<Vec<QuorumReplica>>,
+    index: usize,
+) -> Result<Arc<LocalFileStorage>> {
     let replica = &replicas[index];
     let mut guard = replica.storage.lock().await;
     if guard.is_none() {

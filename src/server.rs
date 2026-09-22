@@ -22,10 +22,10 @@ struct StorageService {
 
 impl storage::Server for StorageService {
     fn get_durable_lsn(
-        &mut self,
+        self: std::rc::Rc<Self>,
         _params: storage::GetDurableLsnParams,
         mut results: storage::GetDurableLsnResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> {
         let data = self.data.clone();
         Promise::from_future(async move {
             results.get().set_durable_lsn(data.durable_lsn());
@@ -34,10 +34,10 @@ impl storage::Server for StorageService {
     }
 
     fn append_txn_batch(
-        &mut self,
+        self: std::rc::Rc<Self>,
         params: storage::AppendTxnBatchParams,
         mut results: storage::AppendTxnBatchResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> {
         let params = match params.get() {
             Ok(p) => p,
             Err(err) => return Promise::err(err),
@@ -79,10 +79,10 @@ impl storage::Server for StorageService {
     }
 
     fn get_page(
-        &mut self,
+        self: std::rc::Rc<Self>,
         params: storage::GetPageParams,
         mut results: storage::GetPageResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> {
         let page_id = match params.get() {
             Ok(p) => p.get_page_id(),
             Err(err) => return Promise::err(err),
@@ -106,10 +106,10 @@ impl storage::Server for StorageService {
     }
 
     fn scan_pages(
-        &mut self,
+        self: std::rc::Rc<Self>,
         params: storage::ScanPagesParams,
         mut results: storage::ScanPagesResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> impl std::future::Future<Output = std::result::Result<(), capnp::Error>> {
         let params = match params.get() {
             Ok(p) => p,
             Err(err) => return Promise::err(err),

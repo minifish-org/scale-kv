@@ -9,7 +9,7 @@ Goal: finalize stable external API and internal boundary.
 
 Tasks:
 
-- Finalize `/Users/yusp/work/scale-kv/docs/api-v1-draft.md`.
+- Finalize `docs/api-v1-draft.md`.
 - Mark internal APIs with doc comments / hidden visibility where possible.
 - Add API contract tests for stable behaviors.
 

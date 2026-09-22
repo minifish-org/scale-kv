@@ -1,19 +1,19 @@
-use crate::Value;
 use crate::KEY_SIZE;
+use crate::Value;
 
 pub type Key = [u8; KEY_SIZE];
 pub use error::{Result, TxnError, TxnErrorCategory};
 
-#[path = "txn_kv/error.rs"]
-mod error;
 #[path = "txn_kv/codec.rs"]
 mod codec;
-#[path = "txn_kv/storage.rs"]
-mod storage;
+#[path = "txn_kv/error.rs"]
+mod error;
 #[path = "txn_kv/manager.rs"]
 mod manager;
-pub use storage::TxnStorage;
+#[path = "txn_kv/storage.rs"]
+mod storage;
 pub use manager::{Txn, TxnManager};
+pub use storage::TxnStorage;
 
 #[derive(Debug, Clone)]
 pub struct Version {

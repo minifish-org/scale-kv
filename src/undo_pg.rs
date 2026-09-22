@@ -218,9 +218,7 @@ pub fn append_record(page: &mut [u8], rec: &UndoRecord) -> Result<u16> {
     let mut count = read_u16(page, OFF_COUNT);
     let dir_bytes = hdr_size + (count as usize + 1) * 2;
     if free_end < dir_bytes + UNDO_RECORD_SIZE {
-        return Err(Error::Io(std::io::Error::other(
-            "undo page full",
-        )));
+        return Err(Error::Io(std::io::Error::other("undo page full")));
     }
 
     free_end -= UNDO_RECORD_SIZE;

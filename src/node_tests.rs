@@ -424,7 +424,10 @@ async fn test_mvcc_get_at_snapshot_boundaries() {
     }
 
     assert_eq!(mvcc_get_at(&mvcc, b"k", 9).await, None);
-    assert_eq!(mvcc_get_at(&mvcc, b"k", 10).await, Some(Some(b"v1".to_vec())));
+    assert_eq!(
+        mvcc_get_at(&mvcc, b"k", 10).await,
+        Some(Some(b"v1".to_vec()))
+    );
     assert_eq!(mvcc_get_at(&mvcc, b"k", 25).await, Some(None));
 }
 

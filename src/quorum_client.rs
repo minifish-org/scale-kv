@@ -30,9 +30,7 @@ impl StorageQuorumClient {
                 quorum,
                 errs.join(" | ")
             );
-            return Err(Error::Io(std::io::Error::other(
-                msg,
-            )));
+            return Err(Error::Io(std::io::Error::other(msg)));
         }
         Ok(Self { clients, quorum })
     }

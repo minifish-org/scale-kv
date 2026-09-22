@@ -26,3 +26,8 @@ target
 /target
 # Storage data directory
 data/
+
+.DS_Store
+artifacts/
+.env
+.env.*

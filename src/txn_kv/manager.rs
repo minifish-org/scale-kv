@@ -39,9 +39,7 @@ impl TxnManager {
         Self::open_with_storage(storage).await
     }
 
-    pub async fn open_with_storage(
-        storage: impl TxnStorage + 'static,
-    ) -> Result<Self> {
+    pub async fn open_with_storage(storage: impl TxnStorage + 'static) -> Result<Self> {
         let snapshot = storage.load_snapshot().await?;
         let (base_store, base_ts) = snapshot.unwrap_or_default();
         let (store, max_ts) = storage.replay_wal(base_store, base_ts).await?;
@@ -62,7 +60,10 @@ impl TxnManager {
             let store = self.inner.store.read().unwrap();
             store.clone()
         };
-        self.inner.storage.write_snapshot(commit_ts, &snapshot).await?;
+        self.inner
+            .storage
+            .write_snapshot(commit_ts, &snapshot)
+            .await?;
         self.inner.storage.truncate_wal().await?;
         Ok(())
     }
@@ -90,9 +91,10 @@ impl TxnManager {
 impl Txn {
     fn ensure_not_timed_out(&self) -> Result<()> {
         if let Some(timeout) = self.timeout
-            && self.started_at.elapsed() > timeout {
-                return Err(TxnError::TxnTimeout);
-            }
+            && self.started_at.elapsed() > timeout
+        {
+            return Err(TxnError::TxnTimeout);
+        }
         Ok(())
     }
 
@@ -188,9 +190,10 @@ impl Txn {
             for key in self.write_set.keys() {
                 if let Some(versions) = store.get(key)
                     && let Some(last) = versions.last()
-                        && last.commit_ts > self.read_ts {
-                            return Err(TxnError::WriteWriteConflict);
-                        }
+                    && last.commit_ts > self.read_ts
+                {
+                    return Err(TxnError::WriteWriteConflict);
+                }
             }
         }
 

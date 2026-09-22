@@ -95,7 +95,7 @@ Tuning:
 
 ## Baseline workflow
 
-1. Run `/Users/yusp/work/scale-kv/scripts/run_perf_baseline.sh`.
+1. Run `scripts/run_perf_baseline.sh`.
 2. Record throughput and p95/p99 for each matrix point.
 3. Collect metrics snapshot:
    - WAL bytes/segments
