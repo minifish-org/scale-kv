@@ -47,12 +47,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "capnp"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93f7ce2b1b49d58b2b754f9146ef07e3244f9b67e7563bc1292fbd5f01b142f0"
+dependencies = [
+ "embedded-io",
+]
+
+[[package]]
 name = "capnp-futures"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea18fe7b0b0ee3a52914e9269dd97fea83119d6003771a35a807b600980290f0"
 dependencies = [
- "capnp",
+ "capnp 0.24.1",
  "futures-channel",
  "futures-util",
 ]
@@ -63,18 +72,18 @@ version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "089dea70b5f64476710708453fda2d366cd0e063aa823be39b62bf23482f0197"
 dependencies = [
- "capnp",
+ "capnp 0.24.1",
  "capnp-futures",
  "futures",
 ]
 
 [[package]]
 name = "capnpc"
-version = "0.24.1"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "642d771bf5096ad1963fdbb9839f22e7bb1e308a2d1456fb1ad6cc99bb691115"
+checksum = "82ca16312ddb64529d31c8dc46148671c22e57b80134fa5f17811ad5a6a79492"
 dependencies = [
- "capnp",
+ "capnp 0.27.2",
 ]
 
 [[package]]
@@ -459,7 +468,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
- "capnp",
+ "capnp 0.24.1",
  "capnp-rpc",
  "capnpc",
  "crc32fast",
